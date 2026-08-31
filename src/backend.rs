@@ -216,6 +216,8 @@ impl PostgresBackend {
             if facade_stale(&client).await {
                 if let Err(e) = client.batch_execute(SYS_CATALOG_FACADE).await {
                     tracing::warn!("sys catalog facade failed: {}", pg_error_detail(&e));
+                } else if let Err(e) = client.batch_execute(DBMS_METADATA_FACADE).await {
+                    tracing::warn!("dbms_metadata facade failed: {}", pg_error_detail(&e));
                 } else {
                     let _ = client
                         .batch_execute(&format!(
@@ -881,7 +883,7 @@ const PERSISTENT_SETUP: &str = "
 /// Bump on any change to [`SYS_CATALOG_FACADE`]. Connects re-apply the facade
 /// (an ACCESS EXCLUSIVE `CREATE OR REPLACE VIEW` storm) only when the value
 /// stored in `pgsaci.facade_ver` differs from this.
-const SYS_CATALOG_FACADE_VERSION: &str = "2026-09-01.2";
+const SYS_CATALOG_FACADE_VERSION: &str = "2026-09-01.3";
 
 /// Schema-qualified `SYS.ALL_*` / `SYS.USER_*` data-dictionary views that IDE
 /// schema browsers (DataGrip/IntelliJ, SQL Developer, DBeaver) query directly by
@@ -1199,6 +1201,80 @@ const SYS_CATALOG_FACADE: &str = "
       SELECT name, type, referenced_owner, referenced_name, referenced_type
       FROM sys.all_dependencies WHERE false;
 ";
+
+/// `DBMS_METADATA.GET_DDL('TABLE', name, schema)` — IDEs offer a "copy original
+/// DDL" action that calls it. Reconstructs a readable `CREATE …` from
+/// `pg_catalog` (PostgreSQL syntax, not Oracle's). Raw string so `E'\n'` etc.
+/// reach PostgreSQL intact. Applied under the same version guard as
+/// [`SYS_CATALOG_FACADE`].
+const DBMS_METADATA_FACADE: &str = r#"
+CREATE SCHEMA IF NOT EXISTS dbms_metadata;
+CREATE OR REPLACE FUNCTION dbms_metadata.get_ddl(
+  object_type text, name text, schema text DEFAULT NULL)
+RETURNS text LANGUAGE plpgsql STABLE AS
+$fn$
+DECLARE
+  nsp  text := lower(coalesce(nullif(schema, ''), current_schema()));
+  rel  text := lower(name);
+  q    text := quote_ident(nsp) || '.' || quote_ident(rel);
+  oid_ oid;
+  body text; cons text; idx text;
+BEGIN
+  SELECT c.oid INTO oid_
+  FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+  WHERE n.nspname = nsp AND c.relname = rel;
+
+  IF upper(object_type) IN ('TABLE') THEN
+    IF oid_ IS NULL THEN RETURN '-- table ' || q || ' not found'; END IF;
+    SELECT string_agg('  ' || quote_ident(a.attname) || ' '
+             || format_type(a.atttypid, a.atttypmod)
+             || CASE WHEN a.attnotnull THEN ' NOT NULL' ELSE '' END
+             || COALESCE(' DEFAULT ' || pg_get_expr(ad.adbin, ad.adrelid), ''),
+             E',\n' ORDER BY a.attnum)
+      INTO body
+      FROM pg_catalog.pg_attribute a
+      LEFT JOIN pg_catalog.pg_attrdef ad ON ad.adrelid = a.attrelid AND ad.adnum = a.attnum
+      WHERE a.attrelid = oid_ AND a.attnum > 0 AND NOT a.attisdropped;
+    SELECT string_agg(E',\n  CONSTRAINT ' || quote_ident(conname) || ' '
+                      || pg_get_constraintdef(c.oid), '' ORDER BY c.contype DESC, conname)
+      INTO cons FROM pg_catalog.pg_constraint c WHERE c.conrelid = oid_;
+    SELECT string_agg(E'\n' || pg_get_indexdef(i.indexrelid) || ';', '')
+      INTO idx FROM pg_catalog.pg_index i
+      WHERE i.indrelid = oid_ AND NOT i.indisprimary
+        AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_constraint c WHERE c.conindid = i.indexrelid);
+    RETURN E'\n  CREATE TABLE ' || q || E' (\n' || body || COALESCE(cons, '')
+           || E'\n);\n' || COALESCE(idx, '');
+  ELSIF upper(object_type) IN ('VIEW') THEN
+    IF oid_ IS NULL THEN RETURN '-- view ' || q || ' not found'; END IF;
+    RETURN E'\n  CREATE VIEW ' || q || E' AS\n' || pg_get_viewdef(oid_, true);
+  ELSIF upper(object_type) IN ('MATERIALIZED_VIEW', 'MATERIALIZED VIEW') THEN
+    RETURN E'\n  CREATE MATERIALIZED VIEW ' || q || E' AS\n' || pg_get_viewdef(oid_, true);
+  ELSIF upper(object_type) IN ('INDEX') THEN
+    IF oid_ IS NULL THEN RETURN '-- index ' || q || ' not found'; END IF;
+    RETURN E'\n  ' || pg_get_indexdef(oid_) || ';';
+  ELSIF upper(object_type) IN ('SEQUENCE') THEN
+    RETURN E'\n  CREATE SEQUENCE ' || q || ';';
+  ELSIF upper(object_type) IN ('TRIGGER') THEN
+    RETURN (SELECT E'\n  ' || pg_get_triggerdef(t.oid) || ';'
+            FROM pg_catalog.pg_trigger t WHERE t.tgname = rel AND NOT t.tgisinternal LIMIT 1);
+  ELSIF upper(object_type) IN ('FUNCTION', 'PROCEDURE') THEN
+    RETURN (SELECT E'\n  ' || pg_get_functiondef(p.oid)
+            FROM pg_catalog.pg_proc p JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
+            WHERE n.nspname = nsp AND p.proname = rel LIMIT 1);
+  ELSE
+    RETURN '-- DBMS_METADATA.GET_DDL is not implemented for object type ' || object_type;
+  END IF;
+END
+$fn$;
+CREATE OR REPLACE FUNCTION dbms_metadata.set_transform_param(
+  transform_handle numeric, name text, value boolean DEFAULT true,
+  object_type text DEFAULT NULL) RETURNS void LANGUAGE sql AS $$ SELECT $$;
+CREATE OR REPLACE FUNCTION dbms_metadata.set_transform_param(
+  transform_handle numeric, name text, value numeric,
+  object_type text DEFAULT NULL) RETURNS void LANGUAGE sql AS $$ SELECT $$;
+CREATE OR REPLACE FUNCTION dbms_metadata.session_transform() RETURNS numeric
+  LANGUAGE sql IMMUTABLE AS $$ SELECT (-1)::numeric $$;
+"#;
 
 #[derive(Debug)]
 pub struct QueryResult {
