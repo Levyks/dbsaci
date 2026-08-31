@@ -874,8 +874,8 @@ pub struct DescribeCaps {
     /// native `TIMESTAMP` would return `oracle.sql.TIMESTAMP` and break a
     /// `(java.sql.Timestamp)` cast (exactly as against real Oracle, but pgSaci
     /// can't tell DATE-origin from TIMESTAMP-origin PG `timestamp` apart).
-    /// Limitation (COMPATIBILITY.md): an Oracle `TIMESTAMP(n>0)` column queried
-    /// over ojdbc/ODP.NET comes back with second precision and
+    /// Known limitation: an Oracle `TIMESTAMP(n>0)` column queried over
+    /// ojdbc/ODP.NET comes back with second precision and
     /// `getColumnTypeName() == "DATE"`. OCI thick and the thin drivers keep the
     /// native types.
     pub datetime_as_date: bool,
@@ -1193,7 +1193,7 @@ fn pg_column_to_oracle_meta(
         // right default. A column *declared* `BINARY_FLOAT`/`BINARY_DOUBLE` is
         // also reported as NUMBER (value-exact, not the native IEEE wire form) —
         // the PostgreSQL wire protocol does not tell the client which `float8`s
-        // came from a `BINARY_DOUBLE` column. Documented in COMPATIBILITY.md.
+        // came from a `BINARY_DOUBLE` column.
         ColumnMeta::number(name, 38, 0)
     } else if *ty == Type::BYTEA {
         ColumnMeta {
