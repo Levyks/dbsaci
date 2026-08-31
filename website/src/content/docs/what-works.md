@@ -25,15 +25,25 @@ Everything below has golden-corpus coverage. See the
   statement re-run with new binds (`REEXECUTE`) is handled. Results stream
   batch by batch, including results past 1M rows or one 64 MiB packet.
 
-## SQL
-
-- `SELECT ... FROM DUAL`, `ROWNUM` (→ `LIMIT`), Oracle legacy `(+)` outer joins,
-  `CONNECT BY` hierarchical queries (incl. `NOCYCLE`, `CONNECT_BY_ISCYCLE` /
-  `_ISLEAF`), `MERGE` (incl. `WHEN MATCHED ... DELETE`), `INSERT ALL` /
-  `INSERT FIRST`, `PIVOT` / `UNPIVOT`, analytic/window functions, recursive CTEs.
+- `SELECT ... FROM DUAL`, `ROWNUM` (→ `LIMIT`), `FETCH FIRST n ROWS ONLY`,
+  Oracle legacy `(+)` outer joins, `CONNECT BY` hierarchical queries
+  (`NOCYCLE`, `CONNECT_BY_ISCYCLE` / `_ISLEAF` / `_ROOT`, `SYS_CONNECT_BY_PATH`),
+  `MERGE` (incl. `WHEN MATCHED ... DELETE`), `INSERT ALL` / `INSERT FIRST`,
+  `PIVOT` / `UNPIVOT`, analytic/window functions, recursive CTEs.
 - `NVL` / `DECODE` / `NVL2` / `SYSDATE` / `ADD_MONTHS` / `TO_CHAR` / `SUBSTR` and
   the rest of the common Oracle scalar library, via `orafce`.
+- `REGEXP_LIKE` / `REGEXP_REPLACE` (incl. back-references) / `REGEXP_SUBSTR`
+  (nth match, capture group) / `REGEXP_INSTR` / `REGEXP_COUNT`.
 - **Sequences** (`seq.NEXTVAL` / `.CURRVAL`), identity columns.
+- `SYS_CONTEXT('USERENV', …)`, `USER`, `UID`.
+
+## Data dictionary
+
+Read-only catalog views the tooling and ORMs probe: `USER_TABLES` /
+`ALL_TABLES`, `USER_TAB_COLUMNS` / `ALL_TAB_COLUMNS`, `USER_OBJECTS`,
+`USER_CONSTRAINTS`, `USER_INDEXES`, `USER_SEQUENCES` / `ALL_SEQUENCES`,
+`USER_TAB_COMMENTS`, `V$VERSION`, and `NLS_SESSION_PARAMETERS` (which reflects
+the session's `NLS_*` settings).
 
 ## Transactions
 
@@ -68,11 +78,12 @@ semantics). `DBMS_OUTPUT.PUT_LINE` → `RAISE NOTICE`.
 
 ## Errors
 
-~35 PostgreSQL `SQLSTATE` classes map to real `ORA-` numbers — deadlock,
-serialization failure, unique / foreign-key / not-null / check violations, lock
-timeout, statement cancellation, connection loss, and more. The PostgreSQL
-statement character position is carried into the TTC `error_pos` field
-(`python-oracledb` `error.offset`).
+~40 PostgreSQL `SQLSTATE`s map to real `ORA-` numbers — deadlock, serialization
+failure, unique / foreign-key / not-null / check violations, `NOWAIT`
+resource-busy, statement cancellation, connection loss, invalid number/date,
+single-row subquery returning many rows, and more. The PostgreSQL statement
+character position is carried into the TTC `error_pos` field (`python-oracledb`
+`error.offset`).
 
 ## Operations
 

@@ -132,7 +132,7 @@ PostgreSQL connection.
   assignment, an audit `INSERT`, or `RAISE_APPLICATION_ERROR` — lowered to a
   PostgreSQL trigger function.
 - **Anonymous PL/SQL blocks** and basic standalone function/procedure bodies.
-- **Errors**: ~35 PostgreSQL `SQLSTATE` classes map to real `ORA-` numbers
+- **Errors**: ~40 PostgreSQL `SQLSTATE`s map to real `ORA-` numbers
   (deadlock, serialization failure, unique/foreign-key/not-null/check
   violations, lock timeout, statement cancellation, connection loss, …).
 - **Operations**: TCP keepalive, idle-session reaping, per-statement timeout →
@@ -151,17 +151,20 @@ Roughly most-likely-to-bite first.
   `WHERE CURRENT OF`, statement `CASE`, `WHILE`/`LOOP`, exception handlers, and
   `PRAGMA EXCEPTION_INIT` — but the further a body strays from that, the more
   likely the translation is to be wrong rather than merely rejected.
-- **OUT binds and `SYS_REFCURSOR`.** Scalar and array *input* binds are passed
-  through; anything that returns data through a bind (incl. `RETURNING ... INTO`)
-  is unsupported.
+- **OUT binds and `SYS_REFCURSOR`.** `RETURNING <cols> INTO :out` DML works for
+  `python-oracledb` thin (ojdbc / ODP.NET get `ORA-03001`). PL/SQL OUT
+  parameters (`BEGIN :x := … END`) and `SYS_REFCURSOR` are not implemented.
 - **LOB streaming.** `CLOB`/`BLOB` values are delivered inline and capped at one
   ~64 MiB TTC packet. There are no TTC LOB locators and no multi-gigabyte
   streaming. `DBMS_LOB.GETLENGTH/SUBSTR/INSTR` exist as plain SQL functions.
-- **Declared `NUMBER` precision/scale in result metadata.** Every `NUMBER`
-  column is described as `(38,0)` (a limitation of the Rust PostgreSQL client
-  that does not expose the type modifier). Values are still exact.
-- **Native TTC encodings for `INTERVAL`, `BINARY_FLOAT` / `BINARY_DOUBLE`, and
-  typed `TIMESTAMP WITH TIME ZONE`** result columns are incomplete.
+- **Declared `NUMBER(p,s)` precision/scale in result metadata for ojdbc /
+  ODP.NET.** Those two drivers see every `NUMBER` as `(38,0)` (their
+  column-metadata parser desyncs on a non-zero scale field);
+  `python-oracledb` thin and `oracle-rs` get the real precision/scale. Values
+  are always exact.
+- **Native TTC encodings for `INTERVAL`, `BINARY_FLOAT` / `BINARY_DOUBLE`** on
+  result columns are complete for `python-oracledb` thin; other drivers get
+  `NUMBER` / an Oracle-style interval text rendering.
 - **Full Oracle implicit type conversion / NLS behaviour**, autonomous
   transactions.
 - **Non-UTF-8 wire character sets.** The server side is AL32UTF8 only.
