@@ -189,9 +189,34 @@ impl PostgresBackend {
             tracing::warn!("persistent setup failed: {}", pg_error_detail(&e));
         }
         // Cross-session `SYS.ALL_*` catalog views for IDE schema browsers.
-        // Best-effort: a failure here only degrades introspection.
-        if let Err(e) = client.batch_execute(SYS_CATALOG_FACADE).await {
-            tracing::warn!("sys catalog facade failed: {}", pg_error_detail(&e));
+        // `CREATE OR REPLACE VIEW` takes ACCESS EXCLUSIVE, and IDE clients leave
+        // transactions open (`idle in transaction`) holding a read lock on these
+        // views — so re-running the whole batch on *every* connect eventually
+        // deadlocks a wave of connects behind one idle client. Run it only when
+        // the stored version marker is stale (i.e. first connect after a deploy
+        // that changed the facade).
+        let facade_current = client
+            .query_opt(
+                "SELECT ver = $1 FROM pgsaci.facade_ver",
+                &[&SYS_CATALOG_FACADE_VERSION],
+            )
+            .await
+            .ok()
+            .flatten()
+            .and_then(|r| r.try_get::<_, bool>(0).ok())
+            .unwrap_or(false);
+        if !facade_current {
+            if let Err(e) = client.batch_execute(SYS_CATALOG_FACADE).await {
+                tracing::warn!("sys catalog facade failed: {}", pg_error_detail(&e));
+            } else {
+                let _ = client
+                    .batch_execute(&format!(
+                        "INSERT INTO pgsaci.facade_ver(only_one, ver) VALUES (true, '{v}')
+                           ON CONFLICT (only_one) DO UPDATE SET ver = '{v}'",
+                        v = SYS_CATALOG_FACADE_VERSION
+                    ))
+                    .await;
+            }
         }
 
         // Session init is on the hot path of every connect. The read-only
@@ -834,7 +859,15 @@ const PERSISTENT_SETUP: &str = "
       EXCEPTION WHEN duplicate_object THEN NULL; END $b$;
     DO $b$ BEGIN CREATE DOMAIN pgsaci.binary_float AS real;
       EXCEPTION WHEN duplicate_object THEN NULL; END $b$;
+    CREATE TABLE IF NOT EXISTS pgsaci.facade_ver (
+      only_one boolean PRIMARY KEY DEFAULT true CHECK (only_one),
+      ver      text NOT NULL);
 ";
+
+/// Bump on any change to [`SYS_CATALOG_FACADE`]. Connects re-apply the facade
+/// (an ACCESS EXCLUSIVE `CREATE OR REPLACE VIEW` storm) only when the value
+/// stored in `pgsaci.facade_ver` differs from this.
+const SYS_CATALOG_FACADE_VERSION: &str = "2026-09-01.1";
 
 /// Schema-qualified `SYS.ALL_*` / `SYS.USER_*` data-dictionary views that IDE
 /// schema browsers (DataGrip/IntelliJ, SQL Developer, DBeaver) query directly by
