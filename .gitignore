@@ -1,0 +1,6 @@
+/target
+/clients/dotnet/bin
+/clients/dotnet/obj
+/clients/java/*.class
+/clients/java/lib/
+/kimi-session-*/

@@ -1,0 +1,9 @@
+# DUAL is Oracle's one-row pseudo-table; PostgreSQL selects with no FROM.
+SELECT 1 FROM DUAL => SELECT 1
+SELECT 1 FROM dual => SELECT 1
+SELECT 1 FROM Dual => SELECT 1
+SELECT 1 FROM dual WHERE 1 = 1 => SELECT 1 WHERE 1 = 1
+SELECT 'x', 2 + 3 FROM DUAL => SELECT 'x', 2 + 3
+# A real table named dual-ish or an alias must be left alone.
+SELECT d.x FROM dual d => SELECT d.x FROM dual AS d
+SELECT x FROM dual_audit => SELECT x FROM dual_audit

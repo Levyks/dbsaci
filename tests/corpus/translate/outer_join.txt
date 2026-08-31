@@ -1,0 +1,6 @@
+# Legacy Oracle (+) outer-join marker -> ANSI OUTER JOIN. The (+) sits on the
+# side that may be null-extended, so `a = b(+)` keeps all `a` rows -> LEFT JOIN.
+SELECT a.id, b.name FROM a, b WHERE a.id = b.a_id (+) => SELECT a.id, b.name FROM a LEFT JOIN b ON a.id = b.a_id
+SELECT p.name FROM people p, teams t WHERE p.team_id = t.id (+) AND p.id > 1 ORDER BY p.id => SELECT p.name FROM people AS p LEFT JOIN teams AS t ON p.team_id = t.id WHERE p.id > 1 ORDER BY p.id
+# Marker on the left of the equality -> the other table is preserved -> RIGHT JOIN.
+SELECT a.id, b.name FROM a, b WHERE a.id (+) = b.a_id => SELECT a.id, b.name FROM a RIGHT JOIN b ON a.id = b.a_id

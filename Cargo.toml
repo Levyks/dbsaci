@@ -1,0 +1,46 @@
+[package]
+name = "pgsaci"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+tokio-postgres = { version = "0.7", features = ["with-chrono-0_4"] }
+bytes = "1"
+thiserror = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+sqlparser = "0.47"
+sha1 = "0.10"
+sha2 = "0.10"
+md-5 = "0.10"
+aes = "0.8"
+cbc = { version = "0.1", features = ["block-padding", "alloc"] }
+pbkdf2 = { version = "0.12", features = ["simple"] }
+hmac = "0.12"
+hex = "0.4"
+rand = "0.8"
+chrono = "0.4"
+futures-util = { version = "0.3.34", default-features = false, features = ["std"] }
+socket2 = "0.6"
+clap = { version = "4", features = ["derive", "env"] }
+
+[dev-dependencies]
+testcontainers = "0.23"
+tokio-test = "0.4"
+oracle-rs = "0.1"
+libtest-mimic = "0.8"
+
+# End-to-end compatibility corpus. Custom harness: one PostgreSQL/orafce
+# container and one PgSaci proxy are started once, then every golden-file case
+# is streamed across TNS through a single worker connection. See
+# `tests/corpus/README.md` for the file format.
+[[test]]
+name = "corpus"
+harness = false
+
+# Pure SQL-translation goldens (`translate::oracle_to_postgres`). No container,
+# ordinary libtest harness.
+[[test]]
+name = "translate_golden"
+harness = true

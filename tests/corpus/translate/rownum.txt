@@ -1,0 +1,14 @@
+# ROWNUM predicates lift to LIMIT. Oracle ROWNUM is 1-based, so `< n` is `LIMIT n-1`.
+SELECT name FROM people WHERE ROWNUM <= 2 => SELECT name FROM people LIMIT 2
+SELECT name FROM people WHERE ROWNUM < 3 => SELECT name FROM people LIMIT 2
+SELECT name FROM people WHERE team_id = 1 AND ROWNUM <= 2 => SELECT name FROM people WHERE team_id = 1 LIMIT 2
+SELECT name FROM people WHERE ROWNUM <= 1 AND team_id = 1 => SELECT name FROM people WHERE team_id = 1 LIMIT 1
+# Oracle applies ROWNUM before ORDER BY: limit the unordered body in a derived
+# table, then sort.
+SELECT name FROM people WHERE ROWNUM <= 2 ORDER BY id => SELECT name FROM (SELECT * FROM people LIMIT 2) AS __rownum_sub ORDER BY id
+# ROWNUM = 1 -> LIMIT 1; a ROWNUM reference left in the projection becomes a row number.
+SELECT name FROM people WHERE ROWNUM = 1 => SELECT name FROM people LIMIT 1
+SELECT ROWNUM, name FROM people WHERE ROWNUM <= 2 => SELECT ROW_NUMBER() OVER (), name FROM people LIMIT 2
+SELECT name FROM people WHERE ROWNUM > 1 => SELECT name FROM people LIMIT 0
+# ROWNUM inside a set operation still needs an explicit nested query.
+SELECT id FROM people WHERE ROWNUM < 2 UNION SELECT id FROM teams => !

@@ -1,0 +1,9 @@
+# DECODE / NVL2 / LNNVL are lowered to CASE against the Oracle AST (not text).
+SELECT DECODE(2, 1, 'one', 2, 'two', 'other') FROM DUAL => SELECT CASE WHEN 2 IS NOT DISTINCT FROM 1 THEN 'one' WHEN 2 IS NOT DISTINCT FROM 2 THEN 'two' ELSE 'other' END
+SELECT DECODE(x, 1, 'a') FROM t => SELECT CASE WHEN x IS NOT DISTINCT FROM 1 THEN 'a' END FROM t
+SELECT NVL2(NULL, 'yes', 'no') FROM DUAL => SELECT CASE WHEN NULL IS NOT NULL THEN 'yes' ELSE 'no' END
+SELECT NVL2(x, y, z) FROM t => SELECT CASE WHEN x IS NOT NULL THEN y ELSE z END FROM t
+SELECT LNNVL(1 = 1) FROM DUAL => SELECT 1 = 1 IS NOT TRUE
+SELECT LNNVL(a > b) FROM t => SELECT a > b IS NOT TRUE FROM t
+# Oracle expression rewrites reach into every clause of the query.
+SELECT p.team_id, COUNT(*) FROM people p JOIN teams t ON NVL(p.team_id, 0) = t.id GROUP BY p.team_id HAVING LNNVL(COUNT(*) = 0) ORDER BY DECODE(p.team_id, 1, 0, 1) => SELECT p.team_id, COUNT(*) FROM people AS p JOIN teams AS t ON COALESCE(p.team_id, 0) = t.id GROUP BY p.team_id HAVING COUNT(*) = 0 IS NOT TRUE ORDER BY CASE WHEN p.team_id IS NOT DISTINCT FROM 1 THEN 0 ELSE 1 END

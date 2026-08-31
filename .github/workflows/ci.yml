@@ -1,0 +1,91 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # fmt + clippy + the container-free Rust tests. Runs once; nothing here
+  # depends on the PostgreSQL major.
+  lint:
+    name: rust — fmt + clippy + unit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test --lib
+      - run: cargo test --test translate_golden
+
+  # The end-to-end corpus (real container + real TNS) against every supported
+  # PostgreSQL major. Same test binary, three backends.
+  corpus:
+    name: rust — corpus (PG ${{ matrix.pg }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        pg: ["18", "16", "13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: build postgres ${{ matrix.pg }} + orafce image
+        run: docker build --build-arg PG_VERSION=${{ matrix.pg }} -t pgsaci-test-pg:${{ matrix.pg }} testcontainers
+      - name: corpus
+        env:
+          PGSACI_TEST_PG_IMAGE: pgsaci-test-pg:${{ matrix.pg }}
+        run: cargo test --test corpus -- --test-threads=1
+
+  # Real third-party Oracle drivers, end to end, against PG 18. Each probe runs
+  # against both the 19c and the 11g persona.
+  client-python:
+    name: client — python-oracledb (thin)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install oracledb
+      - run: docker build -t pgsaci-test-pg:18 testcontainers
+      - run: bash clients/run.sh python
+      - run: bash clients/run.sh python 11
+
+  client-java:
+    name: client — ojdbc11 (thin)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+      - run: docker build -t pgsaci-test-pg:18 testcontainers
+      - run: bash clients/run.sh java
+      - run: bash clients/run.sh java 11
+
+  client-dotnet:
+    name: client — ODP.NET Core (managed)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "10.0.x"
+      - run: docker build -t pgsaci-test-pg:18 testcontainers
+      - run: bash clients/run.sh dotnet
+      - run: bash clients/run.sh dotnet 11
