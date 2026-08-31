@@ -1,5 +1,10 @@
 # Data-dictionary / catalog views. ORMs, migration tools, admin scripts and
 # "does this object exist?" guards hit these on almost every connection.
+#
+# Names come back UPPERCASE, as on a real Oracle database: Oracle folds unquoted
+# identifiers to upper case, so its whole catalog is upper case and Oracle
+# tooling expects that. (The objects themselves are lower case in PostgreSQL;
+# the query path still resolves either case.)
 
 # Fixtures run on a direct PostgreSQL connection (no translation), so they use
 # PostgreSQL DDL; the cases below still query through PgSaci with Oracle names.
@@ -15,64 +20,64 @@ SELECT COUNT(*) FROM DUAL
 -- end
 
 -- case: user_tables_lists_table
-SELECT table_name FROM user_tables WHERE table_name = 'dd_demo'
+SELECT table_name FROM user_tables WHERE table_name = 'DD_DEMO'
 -- expect:
-dd_demo
+DD_DEMO
 -- end
 
 -- case: all_tables_has_owner
-SELECT owner FROM all_tables WHERE table_name = 'dd_demo'
+SELECT owner FROM all_tables WHERE table_name = 'DD_DEMO'
 -- expect:
-public
+PUBLIC
 -- end
 
 -- case: user_tab_columns_names
-SELECT column_name FROM user_tab_columns WHERE table_name = 'dd_demo' ORDER BY column_id
+SELECT column_name FROM user_tab_columns WHERE table_name = 'DD_DEMO' ORDER BY column_id
 -- expect:
-id
-label
-amount
+ID
+LABEL
+AMOUNT
 -- end
 
 -- case: all_tab_columns_alias
-SELECT column_name FROM all_tab_columns WHERE table_name = 'dd_demo' AND column_name = 'amount'
+SELECT column_name FROM all_tab_columns WHERE table_name = 'DD_DEMO' AND column_name = 'AMOUNT'
 -- expect:
-amount
+AMOUNT
 -- end
 
 -- case: user_objects_lists_table
-SELECT object_type FROM user_objects WHERE object_name = 'dd_demo' AND object_type = 'TABLE'
+SELECT object_type FROM user_objects WHERE object_name = 'DD_DEMO' AND object_type = 'TABLE'
 -- expect:
 TABLE
 -- end
 
 -- case: user_constraints_has_primary_key
-SELECT constraint_type FROM user_constraints WHERE table_name = 'dd_demo' AND constraint_type = 'P'
+SELECT constraint_type FROM user_constraints WHERE table_name = 'DD_DEMO' AND constraint_type = 'P'
 -- expect:
 P
 -- end
 
 -- case: user_indexes_lists_index
-SELECT index_name FROM user_indexes WHERE table_name = 'dd_demo' AND index_name = 'dd_demo_label_ix'
+SELECT index_name FROM user_indexes WHERE table_name = 'DD_DEMO' AND index_name = 'DD_DEMO_LABEL_IX'
 -- expect:
-dd_demo_label_ix
+DD_DEMO_LABEL_IX
 -- end
 
 -- case: user_sequences_lists_sequence
-SELECT sequence_name FROM user_sequences WHERE sequence_name = 'dd_demo_seq'
+SELECT sequence_name FROM user_sequences WHERE sequence_name = 'DD_DEMO_SEQ'
 -- expect:
-dd_demo_seq
+DD_DEMO_SEQ
 -- end
 
 # Hibernate's Oracle dialect probes all_sequences on startup; it must exist.
 -- case: all_sequences_lists_sequence
-SELECT sequence_name FROM all_sequences WHERE sequence_name = 'dd_demo_seq'
+SELECT sequence_name FROM all_sequences WHERE sequence_name = 'DD_DEMO_SEQ'
 -- expect:
-dd_demo_seq
+DD_DEMO_SEQ
 -- end
 
 -- case: user_tab_comments
-SELECT comments FROM user_tab_comments WHERE table_name = 'dd_demo'
+SELECT comments FROM user_tab_comments WHERE table_name = 'DD_DEMO'
 -- expect:
 demo table
 -- end
@@ -104,20 +109,20 @@ NLS_NUMERIC_CHARACTERS=,.
 -- end
 
 -- case: user_tables_absent_object
-SELECT COUNT(*) FROM user_tables WHERE table_name = 'does_not_exist_xyz'
+SELECT COUNT(*) FROM user_tables WHERE table_name = 'DOES_NOT_EXIST_XYZ'
 -- expect:
 0
 -- end
 
 -- case: user_tables_sees_new_table_created_in_session
 -- setup: CREATE TABLE catalog_probe (id NUMBER)
-SELECT table_name FROM user_tables WHERE table_name = 'catalog_probe'
+SELECT table_name FROM user_tables WHERE table_name = 'CATALOG_PROBE'
 -- expect:
-catalog_probe
+CATALOG_PROBE
 -- end
 
 -- case: user_tab_columns_counts_people_columns
-SELECT COUNT(*) FROM user_tab_columns WHERE table_name = 'people'
+SELECT COUNT(*) FROM user_tab_columns WHERE table_name = 'PEOPLE'
 -- expect:
 3
 -- end

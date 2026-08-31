@@ -230,7 +230,7 @@ Linus
 -- case: drop_synonym
 -- setup: CREATE SYNONYM gone_syn FOR people
 -- setup: DROP SYNONYM gone_syn
-SELECT COUNT(*) FROM user_tables WHERE table_name = 'gone_syn'
+SELECT COUNT(*) FROM user_tables WHERE table_name = 'GONE_SYN'
 -- expect:
 0
 -- end

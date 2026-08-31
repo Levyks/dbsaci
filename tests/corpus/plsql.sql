@@ -19,9 +19,9 @@ DECLARE v NUMBER; BEGIN v := 1 + 1; END;
 
 -- case: execute_immediate_ddl
 -- setup: BEGIN EXECUTE IMMEDIATE 'CREATE TABLE ei_tbl (id INT)'; END;
-SELECT table_name FROM user_tables WHERE table_name = 'ei_tbl'
+SELECT table_name FROM user_tables WHERE table_name = 'EI_TBL'
 -- expect:
-ei_tbl
+EI_TBL
 -- end
 
 -- case: create_and_call_function
