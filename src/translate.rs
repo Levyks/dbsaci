@@ -3759,12 +3759,25 @@ fn rewrite_decode(args: Vec<Expr>) -> Result<Expr> {
     } else {
         args.len()
     };
+    // Oracle DECODE compares for equality with implicit type coercion (it
+    // converts the selector and every search value to the type of the *first*
+    // search value). PostgreSQL's `=` has no such coercion, so
+    // `DECODE(sys_context(...), 0, ...)` — text selector, integer search value —
+    // is `operator does not exist: text = integer`. Compare both operands as
+    // text: equality is preserved for the string / enum / small-integer cases
+    // DECODE is actually used for.
+    let as_text = |e: &Expr| Expr::Cast {
+        kind: sqlparser::ast::CastKind::Cast,
+        expr: Box::new(e.clone()),
+        data_type: sqlparser::ast::DataType::Text,
+        format: None,
+    };
     let mut conditions = Vec::new();
     let mut results = Vec::new();
     for [cond, result] in args[1..pair_end].as_chunks::<2>().0 {
         conditions.push(Expr::IsNotDistinctFrom(
-            Box::new(input.clone()),
-            Box::new(cond.clone()),
+            Box::new(as_text(&input)),
+            Box::new(as_text(cond)),
         ));
         results.push(result.clone());
     }
@@ -4422,7 +4435,7 @@ mod tests {
     fn ports_orafce_decode_nvl2_and_lnnvl_cases() {
         assert_eq!(
             oracle_to_postgres("SELECT DECODE(2, 1, 'one', 2, 'two', 'other') FROM DUAL").unwrap(),
-            "SELECT CASE WHEN 2 IS NOT DISTINCT FROM 1 THEN 'one' WHEN 2 IS NOT DISTINCT FROM 2 THEN 'two' ELSE 'other' END"
+            "SELECT CASE WHEN CAST(2 AS TEXT) IS NOT DISTINCT FROM CAST(1 AS TEXT) THEN 'one' WHEN CAST(2 AS TEXT) IS NOT DISTINCT FROM CAST(2 AS TEXT) THEN 'two' ELSE 'other' END"
         );
         assert_eq!(
             oracle_to_postgres("SELECT NVL2(NULL, 'yes', 'no') FROM DUAL").unwrap(),
@@ -4441,7 +4454,7 @@ mod tests {
                 "SELECT p.team_id, COUNT(*) FROM people p JOIN teams t ON NVL(p.team_id, 0) = t.id GROUP BY p.team_id HAVING LNNVL(COUNT(*) = 0) ORDER BY DECODE(p.team_id, 1, 0, 1)"
             )
             .unwrap(),
-            "SELECT p.team_id, COUNT(*) FROM people AS p JOIN teams AS t ON COALESCE(p.team_id, 0) = t.id GROUP BY p.team_id HAVING COUNT(*) = 0 IS NOT TRUE ORDER BY CASE WHEN p.team_id IS NOT DISTINCT FROM 1 THEN 0 ELSE 1 END"
+            "SELECT p.team_id, COUNT(*) FROM people AS p JOIN teams AS t ON COALESCE(p.team_id, 0) = t.id GROUP BY p.team_id HAVING COUNT(*) = 0 IS NOT TRUE ORDER BY CASE WHEN CAST(p.team_id AS TEXT) IS NOT DISTINCT FROM CAST(1 AS TEXT) THEN 0 ELSE 1 END"
         );
     }
 

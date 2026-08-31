@@ -827,6 +827,14 @@ const PERSISTENT_SETUP: &str = "
       EXCEPTION WHEN duplicate_object THEN NULL; END $b$;
     DO $b$ BEGIN CREATE DOMAIN pgsaci.binary_float AS real;
       EXCEPTION WHEN duplicate_object THEN NULL; END $b$;
+
+    -- A few schema-qualified Oracle catalog views IDE introspectors probe for
+    -- privilege detection. Empty is a correct answer for the proxy's own role
+    -- model (it has no Oracle roles/privileges) and lets the introspector fall
+    -- back to the ordinary USER_*/ALL_* views.
+    CREATE SCHEMA IF NOT EXISTS sys;
+    CREATE OR REPLACE VIEW sys.session_roles AS SELECT NULL::varchar AS role       WHERE false;
+    CREATE OR REPLACE VIEW sys.session_privs AS SELECT NULL::varchar AS privilege  WHERE false;
 ";
 
 #[derive(Debug)]
