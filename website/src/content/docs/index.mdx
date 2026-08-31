@@ -57,15 +57,20 @@ of its SQL. Nothing about the database it actually talks to is Oracle.
 ## How this differs from IvorySQL
 
 [IvorySQL](https://github.com/IvorySQL/IvorySQL) is a **fork of the PostgreSQL
-server** that builds Oracle compatibility — an Oracle parse mode, PL/iSQL,
-packages, `NUMBER`/`DATE` semantics — into the engine. You deploy IvorySQL as
-your database.
+server** that builds Oracle SQL / PL-SQL compatibility — an Oracle parse mode,
+PL/iSQL, packages, `NUMBER`/`DATE` semantics — into the engine. It goes deep on
+the *dialect*, but it still speaks the **PostgreSQL wire protocol**: the
+application connects with a PostgreSQL driver, not its Oracle one.
 
-pgSaci changes nothing in the database. It is a **man-in-the-middle process** in
-front of an ordinary PostgreSQL release. Smaller blast radius (your DB is just
-Postgres), and Oracle *drivers* connect unchanged — but pgSaci only supports what
-its translation layer plus `orafce` can express, a much narrower slice of Oracle
-than IvorySQL's engine-level compatibility.
+pgSaci is the other way round. It speaks Oracle's **TNS/TTC wire protocol**, so
+the unmodified Oracle driver — ojdbc, ODP.NET, `python-oracledb` — connects to it
+exactly as it would to Oracle, and the database behind it is stock PostgreSQL.
+The trade is the SQL/PL-SQL surface: pgSaci only covers what its translation
+layer plus `orafce` can express.
+
+They solve different problems. Reach for IvorySQL if you can repoint the app at a
+new database and want broad Oracle SQL semantics; reach for pgSaci if the app and
+its Oracle client have to stay exactly as they are.
 
 <CardGrid>
 	<LinkCard title="What works" href="/pgsaci/what-works/" description="Drivers, SQL, DDL, triggers, transactions, operations." />

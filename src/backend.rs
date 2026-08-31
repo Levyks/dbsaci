@@ -290,21 +290,17 @@ impl PostgresBackend {
         binds: &[BindValue],
         caps: DescribeCaps,
     ) -> Result<RowCursor> {
-        // For the OCI thick client the PostgreSQL `statement_timeout` GUC is NOT
-        // set on the streamed-cursor path: it counts wall-clock across the whole
-        // portal, so a large result pulled batch-by-batch trips it mid-stream →
-        // ORA-01013 → the thick client re-drives the Execute → wedge. Instead
-        // the cap is enforced below, around `query_raw` only: a genuinely
-        // blocking query (`SELECT pg_sleep(3)`) produces no rows until it
-        // finishes, so `query_raw` stays pending and the cap fires; a query that
-        // merely streams a lot of rows returns from `query_raw` immediately and
-        // is never cancelled.
-        self.begin_statement_ex(!caps.oci).await?;
-        let oci_open_cap = if caps.oci {
-            self.statement_timeout
-        } else {
-            None
-        };
+        // The PostgreSQL `statement_timeout` GUC is NOT set on the streamed-cursor
+        // path (for any client): it counts wall-clock across the whole portal, so
+        // a large result pulled batch-by-batch over several seconds trips it
+        // mid-stream → a cancel error partway through the rows → the client
+        // desyncs on the wire. Instead the cap is enforced below, around
+        // `query_raw` only: a genuinely blocking query (`SELECT pg_sleep(3)`)
+        // produces no rows until it finishes, so `query_raw` stays pending and
+        // the cap fires (→ ORA-01013); a query that merely streams a lot of rows
+        // returns from `query_raw` immediately and is never cancelled.
+        self.begin_statement_ex(false).await?;
+        let open_cap = self.statement_timeout;
         let params: Vec<PostgresBind> = binds
             .iter()
             .map(PostgresBind::from_oracle)
@@ -337,7 +333,7 @@ impl PostgresBackend {
             let query_fut = self
                 .client
                 .query_raw(&statement, params.iter().map(PostgresBind::as_sql));
-            let query_result = match oci_open_cap {
+            let query_result = match open_cap {
                 Some(cap) => {
                     tokio::pin!(query_fut);
                     match tokio::time::timeout(cap, &mut query_fut).await {
@@ -619,14 +615,12 @@ impl PostgresBackend {
             .batch_execute("SAVEPOINT pgsaci_statement")
             .await
             .map_err(|e| Error::Postgres(pg_error_detail(&e)))?;
-        if apply_timeout {
-            if let Some(timeout) = self.statement_timeout {
-                let millis = timeout.as_millis().max(1);
-                self.client
-                    .batch_execute(&format!("SET LOCAL statement_timeout = '{millis}ms'"))
-                    .await
-                    .map_err(|e| Error::Postgres(pg_error_detail(&e)))?;
-            }
+        if apply_timeout && let Some(timeout) = self.statement_timeout {
+            let millis = timeout.as_millis().max(1);
+            self.client
+                .batch_execute(&format!("SET LOCAL statement_timeout = '{millis}ms'"))
+                .await
+                .map_err(|e| Error::Postgres(pg_error_detail(&e)))?;
         }
         Ok(())
     }

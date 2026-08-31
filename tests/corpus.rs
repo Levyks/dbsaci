@@ -309,10 +309,10 @@ impl TestBackend {
 
         // `ROLLBACK` above also dropped the per-session catalog-facade temp
         // views, so a mutating case still needs a fresh session for the next run.
-        if crashed || case_mutates(case) {
-            if let Ok(fresh) = connect_oracle(self.proxy_port).await {
-                *conn = fresh;
-            }
+        if (crashed || case_mutates(case))
+            && let Ok(fresh) = connect_oracle(self.proxy_port).await
+        {
+            *conn = fresh;
         }
 
         result

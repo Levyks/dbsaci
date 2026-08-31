@@ -39,13 +39,27 @@ cid=$(docker run -d -e POSTGRES_PASSWORD=postgres -e POSTGRES_DB=postgres -P "$p
 pg_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "5432/tcp") 0).HostPort}}' "$cid")
 
 echo "== waiting for postgres =="
-for _ in $(seq 1 60); do
-  docker exec "$cid" pg_isready -U postgres >/dev/null 2>&1 && break
-  sleep 0.5
+# The official postgres image runs a throwaway server for its init scripts, then
+# restarts. `pg_isready` (and a lone `psql`) can succeed against the throwaway
+# one and then the socket vanishes mid-statement. Require several *consecutive*
+# real connections over TCP so we only proceed once the final server is up.
+ok=0
+for _ in $(seq 1 120); do
+  if docker exec "$cid" psql -h 127.0.0.1 -U postgres -tAc 'SELECT 1' postgres >/dev/null 2>&1; then
+    ok=$((ok + 1))
+    [ "$ok" -ge 5 ] && break
+  else
+    ok=0
+  fi
+  sleep 1
 done
 
 echo "== seeding baseline schema =="
-docker exec -i "$cid" psql -U postgres -v ON_ERROR_STOP=1 postgres <<'SQL'
+# Retry the whole (idempotent) seed: DDL is transactional, so a connection drop
+# mid-statement rolls back cleanly and the next attempt re-runs it.
+seeded=0
+for attempt in $(seq 1 15); do
+  if docker exec -i "$cid" psql -h 127.0.0.1 -U postgres -v ON_ERROR_STOP=1 postgres <<'SQL'
 CREATE EXTENSION IF NOT EXISTS orafce;
 DROP ROLE IF EXISTS corpus;
 CREATE ROLE corpus WITH LOGIN PASSWORD 'corpus' SUPERUSER;
@@ -55,6 +69,14 @@ CREATE TABLE people (id INTEGER PRIMARY KEY, name TEXT NOT NULL, team_id INTEGER
 INSERT INTO teams  (id, name)          VALUES (1,'Engineering'),(2,'Sales'),(3,'Marketing');
 INSERT INTO people (id, name, team_id) VALUES (1,'Ada',1),(2,'Grace',1),(3,'Linus',2),(4,'Margaret',NULL);
 SQL
+  then
+    seeded=1
+    break
+  fi
+  echo "   seed attempt $attempt failed; retrying"
+  sleep 2
+done
+[ "$seeded" = 1 ] || { echo "!! could not seed schema" >&2; exit 1; }
 
 echo "== building + starting pgsaci =="
 cargo build --quiet --bin pgsaci

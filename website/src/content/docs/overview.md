@@ -31,20 +31,22 @@ that its SQL translation layer plus `orafce` can express — see
 ### How this differs from IvorySQL
 
 [IvorySQL](https://github.com/IvorySQL/IvorySQL) is a *fork of the PostgreSQL
-server* that builds Oracle compatibility — an Oracle parse mode, PL/iSQL,
-packages, `NUMBER`/`DATE` semantics, `DUAL` — **into the database engine**. You
-deploy IvorySQL as your database.
+server* that builds Oracle SQL / PL-SQL compatibility — an Oracle parse mode,
+PL/iSQL, packages, `NUMBER`/`DATE` semantics, `DUAL` — **into the database
+engine**. It is far deeper than pgSaci on the *dialect*. But IvorySQL speaks the
+**PostgreSQL wire protocol**: your application connects to it with a PostgreSQL
+driver. An unmodified Oracle client (ojdbc, ODP.NET, `python-oracledb`, an
+OCI-linked tool) cannot connect to IvorySQL at all.
 
-pgSaci changes nothing in the database. It is a **man-in-the-middle process** in
-front of an ordinary, current PostgreSQL release. That buys you a smaller blast
-radius (your DB is just Postgres) and lets Oracle *drivers* connect unchanged,
-but it also means pgSaci only supports what its translation layer plus `orafce`
-can express — a much narrower slice of Oracle than IvorySQL's engine-level
-compatibility.
+pgSaci is the inverse trade. It speaks Oracle's **TNS/TTC wire protocol**, so the
+Oracle client connects exactly as it would to Oracle — no driver swap, no
+connection-string rewrite — while the database behind it is an ordinary,
+unmodified PostgreSQL. The cost is coverage: pgSaci only supports the slice of
+Oracle SQL / PL-SQL its translation layer plus `orafce` can express.
 
-If you want broad Oracle SQL/PL-SQL fidelity, use IvorySQL. If you specifically
-need Oracle *clients* to connect to *plain PostgreSQL*, that is what pgSaci is
-for.
+Use IvorySQL if you can repoint the application at a new database and want broad
+Oracle SQL semantics. Use pgSaci if the application **and its Oracle driver** have
+to stay exactly as they are.
 
 ## Requirements
 

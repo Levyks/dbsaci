@@ -1107,7 +1107,7 @@ async fn handle_connection(stream: TcpStream, config: Config) -> Result<()> {
                             req_seq,
                             is_query_statement(&pg_sql),
                             is_ddl_statement(&pg_sql),
-                            &pg_sql.chars().take(50).collect::<String>(),
+                            pg_sql.chars().take(50).collect::<String>(),
                             &payload[..payload.len().min(48)],
                         );
                     }
