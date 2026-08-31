@@ -1,5 +1,7 @@
 # PgSaci
 
+**Docs: <https://levyks.github.io/pgsaci/>**
+
 PgSaci is a proxy that speaks Oracle's **TNS/TTC wire protocol** on the front and
 **stock PostgreSQL** on the back. An unmodified Oracle client — `python-oracledb`
 (thin), the Oracle JDBC thin driver, ODP.NET, OCI-based tools — points at PgSaci
