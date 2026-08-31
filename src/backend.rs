@@ -1074,6 +1074,75 @@ const SYS_CATALOG_FACADE: &str = "
     CREATE OR REPLACE FUNCTION dbms_utility.get_hash_value(name text, base numeric, hash_size numeric)
       RETURNS numeric LANGUAGE sql IMMUTABLE AS
       $fn$ SELECT (abs(pg_catalog.hashtext(name)::bigint) % (hash_size)::bigint + (base)::bigint)::numeric $fn$;
+
+    -- USER_* = ALL_* for the current schema, minus the leading OWNER column
+    -- (Oracle's USER_* views omit it). Introspectors filter further themselves.
+    CREATE OR REPLACE VIEW sys.user_users AS
+      SELECT username, user_id, NULL::varchar AS account_status, NULL::timestamp AS lock_date,
+             NULL::timestamp AS expiry_date, 'USERS'::varchar AS default_tablespace,
+             'TEMP'::varchar AS temporary_tablespace, created, NULL::varchar AS profile,
+             common, oracle_maintained
+      FROM sys.all_users WHERE username = current_schema() OR username = current_user;
+    CREATE OR REPLACE VIEW sys.user_objects AS
+      SELECT object_name, subobject_name, object_id, data_object_id, object_type, created,
+             last_ddl_time, timestamp, status, temporary, generated, secondary
+      FROM sys.all_objects WHERE owner = current_schema();
+    CREATE OR REPLACE VIEW sys.user_tables AS
+      SELECT table_name, tablespace_name, status, num_rows, temporary, nested, iot_type, partitioned
+      FROM sys.all_tables WHERE owner = current_schema();
+    CREATE OR REPLACE VIEW sys.user_views AS
+      SELECT view_name, text_length, text, type_text, oid_text, read_only
+      FROM sys.all_views WHERE owner = current_schema();
+    CREATE OR REPLACE VIEW sys.user_mviews AS
+      SELECT mview_name, query, updatable, refresh_mode, refresh_method, compile_state
+      FROM sys.all_mviews WHERE owner = current_schema();
+    CREATE OR REPLACE VIEW sys.user_tab_columns AS
+      SELECT table_name, column_name, data_type, data_length, data_precision, data_scale,
+             nullable, column_id, data_default, char_length, char_used
+      FROM sys.all_tab_columns WHERE owner = current_schema();
+    CREATE OR REPLACE VIEW sys.user_tab_cols AS
+      SELECT c.*, 'NO'::varchar AS hidden_column, 'NO'::varchar AS virtual_column
+      FROM sys.user_tab_columns c;
+    CREATE OR REPLACE VIEW sys.user_constraints AS
+      SELECT constraint_name, constraint_type, table_name, search_condition, r_owner,
+             r_constraint_name, delete_rule, status
+      FROM sys.all_constraints WHERE owner = current_schema();
+    CREATE OR REPLACE VIEW sys.user_cons_columns AS
+      SELECT constraint_name, table_name, column_name, position
+      FROM sys.all_cons_columns WHERE owner = current_schema();
+    CREATE OR REPLACE VIEW sys.user_indexes AS
+      SELECT index_name, index_type, table_owner, table_name, uniqueness, status, tablespace_name
+      FROM sys.all_indexes WHERE owner = current_schema();
+    CREATE OR REPLACE VIEW sys.user_ind_columns AS
+      SELECT index_name, table_name, column_name, column_position, descend
+      FROM sys.all_ind_columns WHERE index_owner = current_schema();
+    CREATE OR REPLACE VIEW sys.user_sequences AS
+      SELECT sequence_name, min_value, max_value, increment_by, cycle_flag, order_flag,
+             cache_size, last_number
+      FROM sys.all_sequences WHERE sequence_owner = current_schema();
+    CREATE OR REPLACE VIEW sys.user_synonyms AS
+      SELECT synonym_name, table_owner, table_name, db_link FROM sys.all_synonyms WHERE false;
+    CREATE OR REPLACE VIEW sys.user_tab_comments AS
+      SELECT table_name, table_type, comments FROM sys.all_tab_comments WHERE owner = current_schema();
+    CREATE OR REPLACE VIEW sys.user_col_comments AS
+      SELECT table_name, column_name, comments FROM sys.all_col_comments WHERE owner = current_schema();
+    CREATE OR REPLACE VIEW sys.user_triggers AS
+      SELECT trigger_name, trigger_type, triggering_event, table_owner, table_name, status,
+             trigger_body, description, when_clause
+      FROM sys.all_triggers WHERE owner = current_schema();
+    CREATE OR REPLACE VIEW sys.user_procedures AS
+      SELECT object_name, procedure_name, object_type, aggregate, pipelined
+      FROM sys.all_procedures WHERE owner = current_schema();
+    CREATE OR REPLACE VIEW sys.user_arguments AS
+      SELECT object_name, package_name, argument_name, position, sequence, data_type, in_out, object_id
+      FROM sys.all_arguments WHERE false;
+    CREATE OR REPLACE VIEW sys.user_source AS
+      SELECT name, type, line, text FROM sys.all_source WHERE false;
+    CREATE OR REPLACE VIEW sys.user_types AS
+      SELECT type_name, type_oid, typecode FROM sys.all_types WHERE false;
+    CREATE OR REPLACE VIEW sys.user_dependencies AS
+      SELECT name, type, referenced_owner, referenced_name, referenced_type
+      FROM sys.all_dependencies WHERE false;
 ";
 
 #[derive(Debug)]
