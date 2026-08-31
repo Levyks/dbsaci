@@ -4,10 +4,13 @@ SELECT SYSDATE FROM DUAL => SELECT CURRENT_TIMESTAMP
 SELECT SYSTIMESTAMP FROM DUAL => SELECT CURRENT_TIMESTAMP
 SELECT a FROM t1 MINUS SELECT a FROM t2 => SELECT a FROM t1 EXCEPT SELECT a FROM t2
 SELECT NVL(NULL, 'SYSDATE'), SYSDATE FROM DUAL MINUS SELECT 'x', SYSDATE FROM DUAL => SELECT COALESCE(NULL, 'SYSDATE'), CURRENT_TIMESTAMP EXCEPT SELECT 'x', CURRENT_TIMESTAMP
-# Literals, quoted identifiers and comments are preserved byte for byte.
-SELECT 'O''Reilly SYSDATE', "NUMBER", NVL(NULL, 'x') /* MINUS SYSDATE */ FROM DUAL -- NVL => SELECT 'O''Reilly SYSDATE', "NUMBER", COALESCE(NULL, 'x')
-# Oracle type names in DDL.
-CREATE TABLE oracle_ddl_people (id NUMBER(10) PRIMARY KEY, label VARCHAR2(30), note CLOB, created_at DATE DEFAULT SYSDATE) => CREATE TABLE oracle_ddl_people (id NUMERIC(10) PRIMARY KEY, label VARCHAR(30), note TEXT, created_at DATE DEFAULT CURRENT_TIMESTAMP)
+# String literals and comments are preserved byte for byte; an all-uppercase
+# quoted identifier is lowercased so it resolves to the same PostgreSQL column
+# an unquoted Oracle name would.
+SELECT 'O''Reilly SYSDATE', "NUMBER", NVL(NULL, 'x') /* MINUS SYSDATE */ FROM DUAL -- NVL => SELECT 'O''Reilly SYSDATE', "number", COALESCE(NULL, 'x')
+# Oracle type names in DDL. Oracle DATE carries a time component, so it maps to
+# TIMESTAMP(0), not PostgreSQL DATE.
+CREATE TABLE oracle_ddl_people (id NUMBER(10) PRIMARY KEY, label VARCHAR2(30), note CLOB, created_at DATE DEFAULT SYSDATE) => CREATE TABLE oracle_ddl_people (id NUMERIC(10) PRIMARY KEY, label VARCHAR(30), note TEXT, created_at TIMESTAMP(0) DEFAULT CURRENT_TIMESTAMP)
 CREATE TABLE t (a NVARCHAR2(10), b BINARY_FLOAT, c BINARY_DOUBLE, d BLOB, e RAW, f LONG) => CREATE TABLE t (a VARCHAR(10), b pgsaci.binary_float, c pgsaci.binary_double, d BYTEA, e BYTEA, f TEXT)
 # RAW(n) -> BYTEA (length dropped); VARCHAR2(n CHAR|BYTE) -> VARCHAR(n).
 CREATE TABLE t (e RAW(16)) => CREATE TABLE t (e BYTEA)

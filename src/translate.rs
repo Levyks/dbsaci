@@ -3761,12 +3761,12 @@ fn rewrite_decode(args: Vec<Expr>) -> Result<Expr> {
     };
     let mut conditions = Vec::new();
     let mut results = Vec::new();
-    for pair in args[1..pair_end].chunks_exact(2) {
+    for [cond, result] in args[1..pair_end].as_chunks::<2>().0 {
         conditions.push(Expr::IsNotDistinctFrom(
             Box::new(input.clone()),
-            Box::new(pair[0].clone()),
+            Box::new(cond.clone()),
         ));
-        results.push(pair[1].clone());
+        results.push(result.clone());
     }
     Ok(Expr::Case {
         operand: None,

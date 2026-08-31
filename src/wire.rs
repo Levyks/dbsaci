@@ -3703,8 +3703,10 @@ pub fn encode_oracle_number_i64(value: i64) -> Vec<u8> {
     }
     let digits: Vec<u8> = decimal
         .as_bytes()
-        .chunks_exact(2)
-        .map(|pair| (pair[0] - b'0') * 10 + (pair[1] - b'0'))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|[hi, lo]| (hi - b'0') * 10 + (lo - b'0'))
         .collect();
 
     if value > 0 {
