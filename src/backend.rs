@@ -188,6 +188,11 @@ impl PostgresBackend {
         if let Err(e) = client.batch_execute(PERSISTENT_SETUP).await {
             tracing::warn!("persistent setup failed: {}", pg_error_detail(&e));
         }
+        // Cross-session `SYS.ALL_*` catalog views for IDE schema browsers.
+        // Best-effort: a failure here only degrades introspection.
+        if let Err(e) = client.batch_execute(SYS_CATALOG_FACADE).await {
+            tracing::warn!("sys catalog facade failed: {}", pg_error_detail(&e));
+        }
 
         // Session init is on the hot path of every connect. The read-only
         // catalog-facade temp views and the built-in / `DBMS_*` facade functions
@@ -827,14 +832,231 @@ const PERSISTENT_SETUP: &str = "
       EXCEPTION WHEN duplicate_object THEN NULL; END $b$;
     DO $b$ BEGIN CREATE DOMAIN pgsaci.binary_float AS real;
       EXCEPTION WHEN duplicate_object THEN NULL; END $b$;
+";
 
-    -- A few schema-qualified Oracle catalog views IDE introspectors probe for
-    -- privilege detection. Empty is a correct answer for the proxy's own role
-    -- model (it has no Oracle roles/privileges) and lets the introspector fall
-    -- back to the ordinary USER_*/ALL_* views.
+/// Schema-qualified `SYS.ALL_*` / `SYS.USER_*` data-dictionary views that IDE
+/// schema browsers (DataGrip/IntelliJ, SQL Developer, DBeaver) query directly by
+/// their `sys.` name — the unqualified `all_tables` temp views in
+/// [`ORACLE_COMPAT_FACADE`] are not enough for them. Cross-session, built over
+/// `pg_catalog`, so they live with the persistent setup. Column sets cover what
+/// those introspectors select; values are best-effort (`VALID` status, `USERS`
+/// tablespace, NULL timestamps). Applied best-effort — a missing column here
+/// only degrades IDE introspection, never a real query.
+const SYS_CATALOG_FACADE: &str = "
     CREATE SCHEMA IF NOT EXISTS sys;
-    CREATE OR REPLACE VIEW sys.session_roles AS SELECT NULL::varchar AS role       WHERE false;
-    CREATE OR REPLACE VIEW sys.session_privs AS SELECT NULL::varchar AS privilege  WHERE false;
+    CREATE OR REPLACE VIEW sys.session_roles AS SELECT NULL::varchar AS role      WHERE false;
+    CREATE OR REPLACE VIEW sys.session_privs AS SELECT NULL::varchar AS privilege WHERE false;
+
+    CREATE OR REPLACE VIEW sys.all_users AS
+      SELECT n.nspname::varchar AS username, n.oid::bigint AS user_id,
+             NULL::timestamp AS created, 'NO'::varchar AS common,
+             (CASE WHEN n.nspname LIKE 'pg\\_%'
+                    OR n.nspname IN ('information_schema','sys','pgsaci')
+                   THEN 'YES' ELSE 'NO' END)::varchar AS oracle_maintained
+      FROM pg_catalog.pg_namespace n
+      WHERE n.nspname NOT LIKE 'pg_temp_%' AND n.nspname NOT LIKE 'pg_toast%';
+
+    CREATE OR REPLACE VIEW sys.all_objects AS
+      SELECT n.nspname::varchar AS owner, c.relname::varchar AS object_name,
+             NULL::varchar AS subobject_name, c.oid::bigint AS object_id,
+             c.oid::bigint AS data_object_id,
+             (CASE c.relkind WHEN 'r' THEN 'TABLE' WHEN 'p' THEN 'TABLE'
+                             WHEN 'v' THEN 'VIEW' WHEN 'm' THEN 'MATERIALIZED VIEW'
+                             WHEN 'i' THEN 'INDEX' WHEN 'S' THEN 'SEQUENCE'
+                             ELSE upper(c.relkind::text) END)::varchar AS object_type,
+             NULL::timestamp AS created, NULL::timestamp AS last_ddl_time,
+             NULL::timestamp AS timestamp, 'VALID'::varchar AS status,
+             (CASE WHEN c.relpersistence='t' THEN 'Y' ELSE 'N' END)::varchar AS temporary,
+             'N'::varchar AS generated, 'N'::varchar AS secondary
+      FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace
+      WHERE c.relkind IN ('r','p','v','m','i','S')
+      UNION ALL
+      SELECT n.nspname::varchar, p.proname::varchar, NULL::varchar, p.oid::bigint,
+             p.oid::bigint,
+             (CASE p.prokind WHEN 'p' THEN 'PROCEDURE' ELSE 'FUNCTION' END)::varchar,
+             NULL::timestamp, NULL::timestamp, NULL::timestamp, 'VALID'::varchar,
+             'N'::varchar, 'N'::varchar, 'N'::varchar
+      FROM pg_catalog.pg_proc p JOIN pg_catalog.pg_namespace n ON n.oid=p.pronamespace;
+
+    CREATE OR REPLACE VIEW sys.all_tables AS
+      SELECT n.nspname::varchar AS owner, c.relname::varchar AS table_name,
+             'USERS'::varchar AS tablespace_name, 'VALID'::varchar AS status,
+             c.reltuples::numeric AS num_rows,
+             (CASE WHEN c.relpersistence='t' THEN 'Y' ELSE 'N' END)::varchar AS temporary,
+             'NO'::varchar AS nested, NULL::varchar AS iot_type,
+             'NO'::varchar AS partitioned
+      FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace
+      WHERE c.relkind IN ('r','p');
+
+    CREATE OR REPLACE VIEW sys.all_views AS
+      SELECT n.nspname::varchar AS owner, c.relname::varchar AS view_name,
+             length(pg_get_viewdef(c.oid))::numeric AS text_length,
+             pg_get_viewdef(c.oid)::varchar AS text,
+             NULL::varchar AS type_text, NULL::varchar AS oid_text,
+             'N'::varchar AS read_only
+      FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace
+      WHERE c.relkind='v';
+
+    CREATE OR REPLACE VIEW sys.all_mviews AS
+      SELECT n.nspname::varchar AS owner, c.relname::varchar AS mview_name,
+             pg_get_viewdef(c.oid)::varchar AS query, 'N'::varchar AS updatable,
+             'DEMAND'::varchar AS refresh_mode, 'FORCE'::varchar AS refresh_method,
+             'VALID'::varchar AS compile_state
+      FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace
+      WHERE c.relkind='m';
+
+    CREATE OR REPLACE VIEW sys.all_tab_columns AS
+      SELECT n.nspname::varchar AS owner, c.relname::varchar AS table_name,
+             a.attname::varchar AS column_name,
+             upper(format_type(a.atttypid, NULL))::varchar AS data_type,
+             information_schema._pg_char_max_length(a.atttypid,a.atttypmod)::numeric AS data_length,
+             information_schema._pg_numeric_precision(a.atttypid,a.atttypmod)::numeric AS data_precision,
+             information_schema._pg_numeric_scale(a.atttypid,a.atttypmod)::numeric AS data_scale,
+             (CASE WHEN a.attnotnull THEN 'N' ELSE 'Y' END)::varchar AS nullable,
+             a.attnum::numeric AS column_id,
+             pg_get_expr(ad.adbin, ad.adrelid)::varchar AS data_default,
+             COALESCE(information_schema._pg_char_max_length(a.atttypid,a.atttypmod),0)::numeric AS char_length,
+             'B'::varchar AS char_used
+      FROM pg_catalog.pg_attribute a
+      JOIN pg_catalog.pg_class c ON c.oid=a.attrelid
+      JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace
+      LEFT JOIN pg_catalog.pg_attrdef ad ON ad.adrelid=a.attrelid AND ad.adnum=a.attnum
+      WHERE a.attnum>0 AND NOT a.attisdropped AND c.relkind IN ('r','p','v','m');
+
+    CREATE OR REPLACE VIEW sys.all_tab_cols AS
+      SELECT c.*, 'NO'::varchar AS hidden_column, 'NO'::varchar AS virtual_column
+      FROM sys.all_tab_columns c;
+
+    CREATE OR REPLACE VIEW sys.all_constraints AS
+      SELECT n.nspname::varchar AS owner, con.conname::varchar AS constraint_name,
+             (CASE con.contype WHEN 'p' THEN 'P' WHEN 'f' THEN 'R' WHEN 'u' THEN 'U'
+                               WHEN 'c' THEN 'C' ELSE con.contype::text END)::varchar AS constraint_type,
+             rel.relname::varchar AS table_name,
+             (CASE WHEN con.contype='c' THEN pg_get_constraintdef(con.oid) ELSE NULL END)::varchar AS search_condition,
+             rn.nspname::varchar AS r_owner, rc.conname::varchar AS r_constraint_name,
+             (CASE con.confdeltype WHEN 'c' THEN 'CASCADE' WHEN 'n' THEN 'SET NULL'
+                                   WHEN 'a' THEN 'NO ACTION' ELSE NULL END)::varchar AS delete_rule,
+             (CASE WHEN con.convalidated THEN 'VALID' ELSE 'NOT VALIDATED' END)::varchar AS status
+      FROM pg_catalog.pg_constraint con
+      JOIN pg_catalog.pg_class rel ON rel.oid=con.conrelid
+      JOIN pg_catalog.pg_namespace n ON n.oid=con.connamespace
+      LEFT JOIN pg_catalog.pg_class rrel ON rrel.oid=con.confrelid
+      LEFT JOIN pg_catalog.pg_namespace rn ON rn.oid=rrel.relnamespace
+      LEFT JOIN pg_catalog.pg_constraint rc ON rc.conrelid=con.confrelid AND rc.contype='p';
+
+    CREATE OR REPLACE VIEW sys.all_cons_columns AS
+      SELECT n.nspname::varchar AS owner, con.conname::varchar AS constraint_name,
+             rel.relname::varchar AS table_name, a.attname::varchar AS column_name,
+             k.ord::numeric AS position
+      FROM pg_catalog.pg_constraint con
+      JOIN pg_catalog.pg_class rel ON rel.oid=con.conrelid
+      JOIN pg_catalog.pg_namespace n ON n.oid=con.connamespace
+      JOIN LATERAL unnest(con.conkey) WITH ORDINALITY AS k(attnum,ord) ON true
+      JOIN pg_catalog.pg_attribute a ON a.attrelid=con.conrelid AND a.attnum=k.attnum;
+
+    CREATE OR REPLACE VIEW sys.all_indexes AS
+      SELECT tn.nspname::varchar AS owner, ic.relname::varchar AS index_name,
+             'NORMAL'::varchar AS index_type, tn.nspname::varchar AS table_owner,
+             tc.relname::varchar AS table_name,
+             (CASE WHEN ix.indisunique THEN 'UNIQUE' ELSE 'NONUNIQUE' END)::varchar AS uniqueness,
+             'VALID'::varchar AS status, 'USERS'::varchar AS tablespace_name
+      FROM pg_catalog.pg_index ix
+      JOIN pg_catalog.pg_class ic ON ic.oid=ix.indexrelid
+      JOIN pg_catalog.pg_class tc ON tc.oid=ix.indrelid
+      JOIN pg_catalog.pg_namespace tn ON tn.oid=tc.relnamespace;
+
+    CREATE OR REPLACE VIEW sys.all_ind_columns AS
+      SELECT tn.nspname::varchar AS index_owner, ic.relname::varchar AS index_name,
+             tn.nspname::varchar AS table_owner, tc.relname::varchar AS table_name,
+             a.attname::varchar AS column_name, k.ord::numeric AS column_position,
+             'ASC'::varchar AS descend
+      FROM pg_catalog.pg_index ix
+      JOIN pg_catalog.pg_class ic ON ic.oid=ix.indexrelid
+      JOIN pg_catalog.pg_class tc ON tc.oid=ix.indrelid
+      JOIN pg_catalog.pg_namespace tn ON tn.oid=tc.relnamespace
+      JOIN LATERAL unnest(ix.indkey) WITH ORDINALITY AS k(attnum,ord) ON k.attnum<>0
+      JOIN pg_catalog.pg_attribute a ON a.attrelid=ix.indrelid AND a.attnum=k.attnum;
+
+    CREATE OR REPLACE VIEW sys.all_sequences AS
+      SELECT n.nspname::varchar AS sequence_owner, c.relname::varchar AS sequence_name,
+             s.seqmin::numeric AS min_value, s.seqmax::numeric AS max_value,
+             s.seqincrement::numeric AS increment_by,
+             (CASE WHEN s.seqcycle THEN 'Y' ELSE 'N' END)::varchar AS cycle_flag,
+             'N'::varchar AS order_flag, s.seqcache::numeric AS cache_size,
+             s.seqstart::numeric AS last_number
+      FROM pg_catalog.pg_class c
+      JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace
+      JOIN pg_catalog.pg_sequence s ON s.seqrelid=c.oid
+      WHERE c.relkind='S';
+
+    CREATE OR REPLACE VIEW sys.all_synonyms AS
+      SELECT NULL::varchar AS owner, NULL::varchar AS synonym_name,
+             NULL::varchar AS table_owner, NULL::varchar AS table_name,
+             NULL::varchar AS db_link WHERE false;
+
+    CREATE OR REPLACE VIEW sys.all_tab_comments AS
+      SELECT n.nspname::varchar AS owner, c.relname::varchar AS table_name,
+             (CASE c.relkind WHEN 'v' THEN 'VIEW' WHEN 'm' THEN 'MATERIALIZED VIEW'
+                             ELSE 'TABLE' END)::varchar AS table_type,
+             pg_catalog.obj_description(c.oid,'pg_class')::varchar AS comments
+      FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace
+      WHERE c.relkind IN ('r','p','v','m');
+
+    CREATE OR REPLACE VIEW sys.all_col_comments AS
+      SELECT n.nspname::varchar AS owner, c.relname::varchar AS table_name,
+             a.attname::varchar AS column_name,
+             pg_catalog.col_description(c.oid,a.attnum)::varchar AS comments
+      FROM pg_catalog.pg_attribute a
+      JOIN pg_catalog.pg_class c ON c.oid=a.attrelid
+      JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace
+      WHERE a.attnum>0 AND NOT a.attisdropped AND c.relkind IN ('r','p','v','m');
+
+    CREATE OR REPLACE VIEW sys.all_triggers AS
+      SELECT n.nspname::varchar AS owner, t.tgname::varchar AS trigger_name,
+             'BEFORE EACH ROW'::varchar AS trigger_type, 'INSERT'::varchar AS triggering_event,
+             n.nspname::varchar AS table_owner, c.relname::varchar AS table_name,
+             'ENABLED'::varchar AS status, NULL::varchar AS trigger_body,
+             NULL::varchar AS description, NULL::varchar AS when_clause
+      FROM pg_catalog.pg_trigger t
+      JOIN pg_catalog.pg_class c ON c.oid=t.tgrelid
+      JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace
+      WHERE NOT t.tgisinternal;
+
+    CREATE OR REPLACE VIEW sys.all_procedures AS
+      SELECT n.nspname::varchar AS owner, p.proname::varchar AS object_name,
+             NULL::varchar AS procedure_name,
+             (CASE p.prokind WHEN 'p' THEN 'PROCEDURE' ELSE 'FUNCTION' END)::varchar AS object_type,
+             'NO'::varchar AS aggregate, 'NO'::varchar AS pipelined
+      FROM pg_catalog.pg_proc p JOIN pg_catalog.pg_namespace n ON n.oid=p.pronamespace;
+
+    CREATE OR REPLACE VIEW sys.all_arguments AS
+      SELECT NULL::varchar AS owner, NULL::varchar AS object_name, NULL::varchar AS package_name,
+             NULL::varchar AS argument_name, NULL::numeric AS position, NULL::numeric AS sequence,
+             NULL::varchar AS data_type, NULL::varchar AS in_out, NULL::bigint AS object_id
+      WHERE false;
+
+    CREATE OR REPLACE VIEW sys.all_source AS
+      SELECT NULL::varchar AS owner, NULL::varchar AS name, NULL::varchar AS type,
+             NULL::numeric AS line, NULL::varchar AS text WHERE false;
+
+    CREATE OR REPLACE VIEW sys.all_types AS
+      SELECT NULL::varchar AS owner, NULL::varchar AS type_name, NULL::bigint AS type_oid,
+             NULL::varchar AS typecode WHERE false;
+
+    CREATE OR REPLACE VIEW sys.all_dependencies AS
+      SELECT NULL::varchar AS owner, NULL::varchar AS name, NULL::varchar AS type,
+             NULL::varchar AS referenced_owner, NULL::varchar AS referenced_name,
+             NULL::varchar AS referenced_type WHERE false;
+
+    CREATE OR REPLACE VIEW sys.all_scheduler_jobs AS
+      SELECT NULL::varchar AS owner, NULL::varchar AS job_name, NULL::varchar AS state WHERE false;
+
+    CREATE OR REPLACE VIEW sys.all_db_links AS
+      SELECT NULL::varchar AS owner, NULL::varchar AS db_link, NULL::varchar AS username,
+             NULL::varchar AS host WHERE false;
+
+    CREATE OR REPLACE VIEW sys.all_queues AS
+      SELECT NULL::varchar AS owner, NULL::varchar AS name, NULL::varchar AS queue_table WHERE false;
 ";
 
 #[derive(Debug)]
