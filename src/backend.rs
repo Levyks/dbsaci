@@ -852,7 +852,10 @@ const SYS_CATALOG_FACADE: &str = "
              NULL::timestamp AS created, 'NO'::varchar AS common,
              (CASE WHEN n.nspname LIKE 'pg\\_%'
                     OR n.nspname IN ('information_schema','sys','pgsaci')
-                   THEN 'YES' ELSE 'NO' END)::varchar AS oracle_maintained
+                   THEN 'YES' ELSE 'NO' END)::varchar AS oracle_maintained,
+             'OPEN'::varchar  AS account_status,
+             'USERS'::varchar AS default_tablespace,
+             'TEMP'::varchar  AS temporary_tablespace
       FROM pg_catalog.pg_namespace n
       WHERE n.nspname NOT LIKE 'pg_temp_%' AND n.nspname NOT LIKE 'pg_toast%';
 
@@ -1078,10 +1081,9 @@ const SYS_CATALOG_FACADE: &str = "
     -- USER_* = ALL_* for the current schema, minus the leading OWNER column
     -- (Oracle's USER_* views omit it). Introspectors filter further themselves.
     CREATE OR REPLACE VIEW sys.user_users AS
-      SELECT username, user_id, NULL::varchar AS account_status, NULL::timestamp AS lock_date,
-             NULL::timestamp AS expiry_date, 'USERS'::varchar AS default_tablespace,
-             'TEMP'::varchar AS temporary_tablespace, created, NULL::varchar AS profile,
-             common, oracle_maintained
+      SELECT username, user_id, account_status, NULL::timestamp AS lock_date,
+             NULL::timestamp AS expiry_date, default_tablespace, temporary_tablespace,
+             created, 'DEFAULT'::varchar AS profile, common, oracle_maintained
       FROM sys.all_users WHERE username = current_schema() OR username = current_user;
     CREATE OR REPLACE VIEW sys.user_objects AS
       SELECT object_name, subobject_name, object_id, data_object_id, object_type, created,
