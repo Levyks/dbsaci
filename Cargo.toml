@@ -44,3 +44,7 @@ harness = false
 [[test]]
 name = "translate_golden"
 harness = true
+
+[profile.release]
+strip = "symbols"   # drop debuginfo/symbols from the binary
+lto = "thin"        # modest size + speed win, safe
