@@ -70,6 +70,11 @@ cargo run --bin pgsaci
 
 Then connect any Oracle client to `//host:1521/FREEPDB1`.
 
+Or run it from a container — `docker build -t levyks/pgsaci:0.0.1 .` then
+`docker run -p 1521:1521 -e PGSACI_PG_HOST=… levyks/pgsaci:0.0.1`. See the
+[docs](https://levyks.github.io/pgsaci/getting-started/) for a full
+docker-compose.
+
 Every option also has a CLI flag (`pgsaci --help`); the flag wins over the env var.
 
 `PGSACI_ORACLE_VERSION` picks which release PgSaci claims to be — `19` (default) or
@@ -97,7 +102,7 @@ case-insensitively; a user with no match and no fallback is rejected with
 ORA-01017. The matched password drives both the login challenge and the backend
 PostgreSQL connection.
 
-## What works (some of it may surprise you)
+## What works
 
 - **Real Oracle drivers connect and run a real session.** `python-oracledb`
   (thin), the Oracle JDBC thin driver, and ODP.NET managed

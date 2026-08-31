@@ -7,11 +7,12 @@ pgSaci needs a PostgreSQL server with the [`orafce`](https://github.com/orafce/o
 extension available, and a PostgreSQL login role for the proxy to use. Below,
 "the client" is any supported Oracle driver.
 
-:::note[Release artifacts]
-The `levyks/pgsaci:0.0.1` image and the pre-built binaries are published on the
-[GitHub releases page](https://github.com/Levyks/pgsaci/releases). If a channel
-is not up yet for the version you want, [build from source](#option-c-build-from-source)
-— it is a single `cargo build`.
+:::note[Getting the image / binary]
+The repo has a [`Dockerfile`](https://github.com/Levyks/pgsaci/blob/main/Dockerfile);
+build the image with `docker build -t levyks/pgsaci:0.0.1 .`. Pre-built images
+and binaries, when published, land on the
+[GitHub releases page](https://github.com/Levyks/pgsaci/releases). Either way,
+[building from source](#option-d--build-from-source) is a single `cargo build`.
 :::
 
 ## Option A — Docker Compose (proxy + database)
