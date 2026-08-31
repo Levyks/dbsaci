@@ -172,3 +172,14 @@ SELECT 'id=' || id FROM people WHERE id = 3
 -- expect:
 id=3
 -- end
+
+# Oracle resolves a SELECT-list alias inside an ORDER BY expression; PostgreSQL
+# only resolves a bare alias term. The translator substitutes the alias.
+-- case: order_by_alias_inside_expression
+SELECT name nm FROM people ORDER BY LENGTH(nm) DESC, nm
+-- expect:
+Margaret
+Grace
+Linus
+Ada
+-- end

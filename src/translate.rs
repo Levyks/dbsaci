@@ -3187,6 +3187,30 @@ fn translate_query(query: &mut Query) -> Result<()> {
         }
     }
 
+    // Oracle resolves SELECT-list aliases inside ORDER BY *expressions*
+    // (`ORDER BY decode(constraint_type, ...)` where `constraint_type` is an
+    // alias); PostgreSQL only resolves an alias when it is the whole ORDER BY
+    // term. Substitute the alias with its expression where it appears nested.
+    if let SetExpr::Select(select) = query.body.as_ref() {
+        let aliases: std::collections::HashMap<String, Expr> = select
+            .projection
+            .iter()
+            .filter_map(|item| match item {
+                SelectItem::ExprWithAlias { expr, alias } => {
+                    Some((alias.value.to_ascii_lowercase(), expr.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        if !aliases.is_empty() {
+            for order_by in &mut query.order_by {
+                if !matches!(order_by.expr, Expr::Identifier(_)) {
+                    substitute_select_aliases(&mut order_by.expr, &aliases);
+                }
+            }
+        }
+    }
+
     let row_limit = translate_set_expr(&mut query.body)?;
     for order_by in &mut query.order_by {
         rewrite_expr(&mut order_by.expr)?;
@@ -3222,6 +3246,72 @@ fn translate_query(query: &mut Query) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Replace bare `Expr::Identifier` nodes that name a SELECT-list alias with the
+/// aliased expression. Does not recurse into a substituted expression (so
+/// `SELECT a AS b, b AS a` cannot loop) and leaves qualified names alone.
+fn substitute_select_aliases(expr: &mut Expr, aliases: &std::collections::HashMap<String, Expr>) {
+    match expr {
+        Expr::Identifier(id) => {
+            if let Some(replacement) = aliases.get(&id.value.to_ascii_lowercase()) {
+                *expr = replacement.clone();
+            }
+        }
+        Expr::Nested(e)
+        | Expr::UnaryOp { expr: e, .. }
+        | Expr::Cast { expr: e, .. }
+        | Expr::Collate { expr: e, .. }
+        | Expr::IsNull(e)
+        | Expr::IsNotNull(e)
+        | Expr::IsTrue(e)
+        | Expr::IsFalse(e) => substitute_select_aliases(e, aliases),
+        Expr::BinaryOp { left, right, .. } => {
+            substitute_select_aliases(left, aliases);
+            substitute_select_aliases(right, aliases);
+        }
+        Expr::Between {
+            expr: e, low, high, ..
+        } => {
+            substitute_select_aliases(e, aliases);
+            substitute_select_aliases(low, aliases);
+            substitute_select_aliases(high, aliases);
+        }
+        Expr::Case {
+            operand,
+            conditions,
+            results,
+            else_result,
+        } => {
+            if let Some(o) = operand {
+                substitute_select_aliases(o, aliases);
+            }
+            for c in conditions {
+                substitute_select_aliases(c, aliases);
+            }
+            for r in results {
+                substitute_select_aliases(r, aliases);
+            }
+            if let Some(e) = else_result {
+                substitute_select_aliases(e, aliases);
+            }
+        }
+        Expr::Function(f) => {
+            if let FunctionArguments::List(list) = &mut f.args {
+                for arg in &mut list.args {
+                    if let FunctionArg::Unnamed(FunctionArgExpr::Expr(e))
+                    | FunctionArg::Named {
+                        arg: FunctionArgExpr::Expr(e),
+                        ..
+                    } = arg
+                    {
+                        substitute_select_aliases(e, aliases);
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
 }
 
 fn translate_set_expr(set_expr: &mut SetExpr) -> Result<Option<Expr>> {
