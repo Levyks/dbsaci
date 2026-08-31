@@ -1057,6 +1057,23 @@ const SYS_CATALOG_FACADE: &str = "
 
     CREATE OR REPLACE VIEW sys.all_queues AS
       SELECT NULL::varchar AS owner, NULL::varchar AS name, NULL::varchar AS queue_table WHERE false;
+
+    CREATE OR REPLACE VIEW sys.user_tablespaces AS
+      SELECT spcname::varchar     AS tablespace_name, 8192::numeric AS block_size,
+             'PERMANENT'::varchar AS contents,       'LOGGING'::varchar AS logging,
+             'NO'::varchar        AS force_logging,  'ONLINE'::varchar AS status,
+             'NO'::varchar        AS bigfile,        'LOCAL'::varchar AS extent_management,
+             'AUTO'::varchar      AS segment_space_management
+      FROM pg_catalog.pg_tablespace;
+    CREATE OR REPLACE VIEW public.user_tablespaces AS SELECT * FROM sys.user_tablespaces;
+
+    -- IDE schema browsers hash concatenated catalog rows to detect changes.
+    -- orafce ships part of dbms_utility but not get_hash_value; only stability
+    -- and change-sensitivity matter, so any deterministic hash works.
+    CREATE SCHEMA IF NOT EXISTS dbms_utility;
+    CREATE OR REPLACE FUNCTION dbms_utility.get_hash_value(name text, base numeric, hash_size numeric)
+      RETURNS numeric LANGUAGE sql IMMUTABLE AS
+      $fn$ SELECT (abs(pg_catalog.hashtext(name)::bigint) % (hash_size)::bigint + (base)::bigint)::numeric $fn$;
 ";
 
 #[derive(Debug)]
