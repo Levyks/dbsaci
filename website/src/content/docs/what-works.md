@@ -15,6 +15,12 @@ Everything below has golden-corpus coverage. See the
   `INSERT` with row counts, `ROLLBACK`, a 2 500-row fetch loop, and array-bind
   batch DML (`executemany` / JDBC batch / ODP.NET `ArrayBindCount`) — against
   both the 19c and 11g personas.
+- The **OCI thick client** (Instant Client, via `python-oracledb` thick mode)
+  runs the golden corpus too: 634 / 637, the 3 skips being cases Oracle itself
+  rejects over that transport (`ORA-01036` ×2, `ORA-00925`). It uses its own TTC
+  dialect — little-endian fixed-width integers — which pgSaci emits from the
+  negotiated `TNS_CCAP_OCI1` capability. Not run in CI (needs a licensed Instant
+  Client).
 - **Scalar and array binds** go across as PostgreSQL parameters. A cached
   statement re-run with new binds (`REEXECUTE`) is handled. Results stream
   batch by batch, including results past 1M rows or one 64 MiB packet.

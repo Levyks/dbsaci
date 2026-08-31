@@ -72,7 +72,7 @@ personas:
 | Oracle JDBC thin driver (ojdbc8 / ojdbc11) | thin | Supported |
 | ODP.NET (`Oracle.ManagedDataAccess.Core`) | managed | Supported |
 | `oracle-rs` | thin | Supported |
-| Instant Client / OCI thick | thick | Handshake differs (`ORA-12592`) — [not yet](/pgsaci/limitations/) |
+| Instant Client / OCI thick (via `python-oracledb` thick mode) | thick | Supported — not in CI (needs a licensed Instant Client) |
 
 Each wire-level behaviour is chosen from the capabilities the client negotiates
 in the TTC handshake. See [How it works](/pgsaci/how-it-works/).

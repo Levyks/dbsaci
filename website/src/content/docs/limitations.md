@@ -44,9 +44,6 @@ Expressible on PostgreSQL, but the wire framing or translation is not written.
 
 ### Other planned items
 
-- **OCI thick-client handshake.** The Instant Client loads but the TNS/TTC
-  negotiation differs from the thin drivers (`ORA-12592`); it needs its own
-  reverse-engineering pass.
 - **Non-UTF-8 wire character sets.** The server side is `AL32UTF8` only.
   Single-byte request-charset transcoding (`WE8ISO8859P1`, `WE8MSWIN1252`) is
   bounded but unvalidated — no non-UTF-8 thin client exists to test against.
