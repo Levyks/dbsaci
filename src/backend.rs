@@ -193,10 +193,11 @@ impl PostgresBackend {
         // transactions open (`idle in transaction`) holding a read lock on these
         // views — so re-running the whole batch on *every* connect eventually
         // deadlocks a wave of connects behind one idle client. Run it only when
-        // the stored version marker is stale (i.e. first connect after a deploy
-        // that changed the facade).
-        let facade_current = client
-            .query_opt(
+        // the stored version marker is stale (first connect after a deploy that
+        // changed the facade), and serialize that one run with an advisory lock
+        // so a concurrent connect wave doesn't all apply it at once.
+        async fn facade_stale(c: &tokio_postgres::Client) -> bool {
+            !c.query_opt(
                 "SELECT ver = $1 FROM pgsaci.facade_ver",
                 &[&SYS_CATALOG_FACADE_VERSION],
             )
@@ -204,19 +205,32 @@ impl PostgresBackend {
             .ok()
             .flatten()
             .and_then(|r| r.try_get::<_, bool>(0).ok())
-            .unwrap_or(false);
-        if !facade_current {
-            if let Err(e) = client.batch_execute(SYS_CATALOG_FACADE).await {
-                tracing::warn!("sys catalog facade failed: {}", pg_error_detail(&e));
-            } else {
-                let _ = client
-                    .batch_execute(&format!(
-                        "INSERT INTO pgsaci.facade_ver(only_one, ver) VALUES (true, '{v}')
-                           ON CONFLICT (only_one) DO UPDATE SET ver = '{v}'",
-                        v = SYS_CATALOG_FACADE_VERSION
-                    ))
-                    .await;
+            .unwrap_or(false)
+        }
+        if facade_stale(&client).await {
+            let _ = client
+                .batch_execute(
+                    "SELECT pg_advisory_lock(hashtext('pgsaci:sys_catalog_facade')::bigint)",
+                )
+                .await;
+            if facade_stale(&client).await {
+                if let Err(e) = client.batch_execute(SYS_CATALOG_FACADE).await {
+                    tracing::warn!("sys catalog facade failed: {}", pg_error_detail(&e));
+                } else {
+                    let _ = client
+                        .batch_execute(&format!(
+                            "INSERT INTO pgsaci.facade_ver(only_one, ver) VALUES (true, '{v}')
+                               ON CONFLICT (only_one) DO UPDATE SET ver = '{v}'",
+                            v = SYS_CATALOG_FACADE_VERSION
+                        ))
+                        .await;
+                }
             }
+            let _ = client
+                .batch_execute(
+                    "SELECT pg_advisory_unlock(hashtext('pgsaci:sys_catalog_facade')::bigint)",
+                )
+                .await;
         }
 
         // Session init is on the hot path of every connect. The read-only
