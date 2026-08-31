@@ -8,12 +8,12 @@ extension available, and a PostgreSQL login role for the proxy to use. Below,
 "the client" is any supported Oracle driver.
 
 :::note[Getting the image / binary]
-The repo has a [`Dockerfile`](https://github.com/Levyks/pgsaci/blob/main/Dockerfile) —
-`docker build -t levyks/pgsaci:0.0.1 .` produces a **~10 MB** image (a static
-musl binary on `scratch`; pgSaci has no C dependencies). Pre-built images and
-binaries, when published, land on the
-[GitHub releases page](https://github.com/Levyks/pgsaci/releases). Either way,
+`docker pull levyks/pgsaci:0.0.1` — a **~10 MB** image (a static musl binary on
+`scratch`; pgSaci has no C dependencies). It is also buildable from the repo's
+[`Dockerfile`](https://github.com/Levyks/pgsaci/blob/main/Dockerfile), and
 [building from source](#option-d--build-from-source) is a single `cargo build`.
+Pre-built stand-alone binaries, when published, land on the
+[GitHub releases page](https://github.com/Levyks/pgsaci/releases).
 :::
 
 ## Option A — Docker Compose (proxy + database)
