@@ -1,0 +1,81 @@
+---
+title: What works
+description: The Oracle surface pgSaci covers today, verified by an end-to-end golden corpus.
+---
+
+Everything below is exercised by the **golden corpus** — one real
+PostgreSQL/`orafce` container and one real pgSaci proxy, every case driven over
+TNS, asserting Oracle-correct values, row counts and error text (not merely "did
+not error"). See [Compatibility matrix](/pgsaci/compatibility/) for the
+per-area status, and [Limitations](/pgsaci/limitations/) for what is missing.
+
+## Drivers & sessions
+
+- **Real Oracle drivers connect and run a real session.** `python-oracledb`
+  (thin), the Oracle JDBC thin driver, and ODP.NET managed
+  (`Oracle.ManagedDataAccess.Core`) all pass an end-to-end probe — connect, auth
+  (12c PBKDF2 with mutual server proof), metadata, parametrised `SELECT`,
+  `INSERT` with row counts, `ROLLBACK`, a 2 500-row fetch loop, and array-bind
+  batch DML (`executemany` / JDBC batch / ODP.NET `ArrayBindCount`) — against
+  both the 19c and 11g personas.
+- **Scalar and array binds** cross as real typed parameters, never string
+  interpolation. A cached statement re-run with new binds (`REEXECUTE`) is
+  handled. Results stream row-batch by row-batch, including results past 1M rows
+  or one 64 MiB packet.
+
+## SQL
+
+- `SELECT ... FROM DUAL`, `ROWNUM` (→ `LIMIT`), Oracle legacy `(+)` outer joins,
+  `CONNECT BY` hierarchical queries (incl. `NOCYCLE`, `CONNECT_BY_ISCYCLE` /
+  `_ISLEAF`), `MERGE` (incl. `WHEN MATCHED ... DELETE`), `INSERT ALL` /
+  `INSERT FIRST`, `PIVOT` / `UNPIVOT`, analytic/window functions, recursive CTEs.
+- `NVL` / `DECODE` / `NVL2` / `SYSDATE` / `ADD_MONTHS` / `TO_CHAR` / `SUBSTR` and
+  the rest of the common Oracle scalar library — routed to `orafce`, not
+  reimplemented.
+- **Sequences** (`seq.NEXTVAL` / `.CURRVAL`), identity columns.
+
+## Transactions
+
+Explicit control, `SAVEPOINT` / `ROLLBACK TO`, Oracle-style implicit commit on
+DDL, `SET TRANSACTION READ ONLY`, `SELECT ... FOR UPDATE` (`OF <cols>` dropped,
+`WAIT n` → blocking, `NOWAIT` / `SKIP LOCKED` passthrough).
+
+## DDL
+
+Oracle column types, `CREATE VIEW` / `CREATE TABLE AS` (the SELECT body is
+translated), many `ALTER TABLE` forms, `COMMENT ON`, `CREATE SYNONYM` → view,
+global/private temp tables → `TEMP ... IF NOT EXISTS`, ordinary and `BITMAP`
+(→ plain) indexes, function-based / expression indexes, basic materialized views
+with explicit refresh.
+
+## Triggers
+
+`CREATE [OR REPLACE] TRIGGER`, `BEFORE` / `AFTER` / `INSTEAD OF`, row/statement
+level, multi-event (`INSERT OR UPDATE`), `WHEN (...)`, `:NEW` / `:OLD`,
+`REFERENCING NEW AS x`, and bodies that do column assignment, an audit `INSERT`,
+`RAISE_APPLICATION_ERROR`, `IF … END IF`, or numeric `FOR` loops — lowered to a
+PostgreSQL trigger function.
+
+## PL/SQL (the smaller end)
+
+Anonymous blocks and standalone function/procedure bodies translate — including
+`%TYPE` / `%ROWTYPE`, explicit named cursors, `WHERE CURRENT OF`, expression and
+statement `CASE`, `WHILE` / `LOOP`, `EXECUTE IMMEDIATE`, `EXCEPTION WHEN …`
+handlers (Oracle predefined names mapped), user exceptions via
+`PRAGMA EXCEPTION_INIT`, and `SELECT … INTO` (single-row `INTO STRICT`
+semantics). `DBMS_OUTPUT.PUT_LINE` → `RAISE NOTICE`.
+
+## Errors
+
+~35 PostgreSQL `SQLSTATE` classes map to real `ORA-` numbers — deadlock,
+serialization failure, unique / foreign-key / not-null / check violations, lock
+timeout, statement cancellation, connection loss, and more. The PostgreSQL
+statement character position is carried into the TTC `error_pos` field
+(`python-oracledb` `error.offset`).
+
+## Operations
+
+TCP keepalive, idle-session reaping, per-statement timeout → `ORA-01013`,
+`OCIBreak` / Ctrl-C cancels the in-flight statement, graceful drain on
+`SIGINT` / `SIGTERM`, and dependency-free `/healthz` + `/readyz` + `/metrics`
+(Prometheus) endpoints.

@@ -282,7 +282,7 @@ PostgreSQL's `max_connections`; PgSaci translates the rejection.
       + exact value). Gated off (`DescribeCaps::native_binary_floats`) for the
       others: oracle-rs 0.1.7 mis-decodes a BINARY_DOUBLE result column (its
       tests only cover the raw encode/decode fns), and ojdbc / ODP.NET need
-      per-driver OAC describe framing for types 100/101 — they get NUMBER
+      per-driver column-describe framing for types 100/101 — they get NUMBER
       (value-exact). Arithmetic over a BINARY_DOUBLE column also degrades to
       NUMBER (PostgreSQL erases the domain on expressions).
 - [~] `NCHAR` / `NVARCHAR2` map to VARCHAR2 and round-trip UTF-8 correctly

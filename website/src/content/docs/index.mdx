@@ -1,0 +1,75 @@
+---
+title: pgSaci
+description: An Oracle TNS/TTC wire-protocol proxy in front of stock PostgreSQL.
+template: splash
+hero:
+  tagline: >-
+    Point an unmodified Oracle driver at pgSaci and it connects, authenticates,
+    and runs a session — while the database behind it is plain PostgreSQL.
+  actions:
+    - text: Getting started
+      link: /pgsaci/getting-started/
+      icon: right-arrow
+      variant: primary
+    - text: View on GitHub
+      link: https://github.com/Levyks/pgsaci
+      icon: external
+      variant: minimal
+---
+
+import { Card, CardGrid, LinkCard, Aside } from '@astrojs/starlight/components';
+
+<Aside type="caution" title="Very early development — mostly written by AI">
+Hundreds of end-to-end tests pass, but pgSaci has never run a real workload.
+**Do not point it at data you care about.** Bug reports, failing-case
+contributions, and design feedback are very welcome.
+</Aside>
+
+## What it is
+
+pgSaci speaks Oracle's **TNS / TTC wire protocol** on the front and **stock
+PostgreSQL** on the back. An unmodified Oracle client — `python-oracledb` (thin),
+the Oracle JDBC thin driver, ODP.NET managed — points at pgSaci instead of at an
+Oracle database, and pgSaci:
+
+<CardGrid>
+	<Card title="1 · Terminates the handshake" icon="seti:default">
+		The full Oracle Net connect + TTC negotiation + challenge/response auth
+		(12c PBKDF2 with mutual server proof, or the 11g MD5 verifier).
+	</Card>
+	<Card title="2 · Translates the SQL" icon="seti:sql">
+		The Oracle SQL/PL-SQL dialect it understands is rewritten into PostgreSQL
+		SQL — binds stay typed parameters, never string interpolation.
+	</Card>
+	<Card title="3 · Runs it on PostgreSQL" icon="seti:db">
+		One backend round trip to an ordinary current PostgreSQL release with the
+		<a href="https://github.com/orafce/orafce">orafce</a> extension.
+	</Card>
+	<Card title="4 · Re-frames the result" icon="seti:binary">
+		The PostgreSQL result is re-encoded into Oracle's binary framing and
+		streamed back batch by batch.
+	</Card>
+</CardGrid>
+
+The application keeps its Oracle driver, its connection-string shape, and most
+of its SQL. Nothing about the database it actually talks to is Oracle.
+
+## How this differs from IvorySQL
+
+[IvorySQL](https://github.com/IvorySQL/IvorySQL) is a **fork of the PostgreSQL
+server** that builds Oracle compatibility — an Oracle parse mode, PL/iSQL,
+packages, `NUMBER`/`DATE` semantics — into the engine. You deploy IvorySQL as
+your database.
+
+pgSaci changes nothing in the database. It is a **man-in-the-middle process** in
+front of an ordinary PostgreSQL release. Smaller blast radius (your DB is just
+Postgres), and Oracle *drivers* connect unchanged — but pgSaci only supports what
+its translation layer plus `orafce` can express, a much narrower slice of Oracle
+than IvorySQL's engine-level compatibility.
+
+<CardGrid>
+	<LinkCard title="What works" href="/pgsaci/what-works/" description="Drivers, SQL, DDL, triggers, transactions, operations." />
+	<LinkCard title="What doesn't" href="/pgsaci/limitations/" description="Not yet vs structurally impossible on stock PostgreSQL." />
+	<LinkCard title="Compatibility matrix" href="/pgsaci/compatibility/" description="The detailed per-area breakdown." />
+	<LinkCard title="How it works" href="/pgsaci/how-it-works/" description="Capability-driven wire negotiation; no driver-name detection." />
+</CardGrid>
