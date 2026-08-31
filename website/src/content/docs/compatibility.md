@@ -3,21 +3,10 @@ title: Compatibility matrix
 description: The detailed per-area breakdown of what pgSaci supports.
 ---
 
-pgSaci is an Oracle TNS/TTC proxy that runs Oracle clients against stock
-PostgreSQL with the `orafce` extension. It is **not** an Oracle database
-implementation, and it is in very early development. This page is the detailed
-per-area breakdown; see [What works](/pgsaci/what-works/) and
-[Limitations](/pgsaci/limitations/) for the narrative version.
-
-The canonical, executable compatibility claim is the corpus:
-
-```bash
-cargo test --test corpus -- --test-threads=1
-```
-
-It runs with no ignored cases (bar `MERGE`, which needs PostgreSQL 15). New
-behaviour must add Oracle-correct corpus coverage rather than weaken an
-expectation.
+The detailed per-area breakdown. See [What works](/pgsaci/what-works/) and
+[Limitations](/pgsaci/limitations/) for the narrative version. Everything marked
+"Supported" or "Partial" below has golden-corpus coverage
+(`cargo test --test corpus`).
 
 ## Per-area status
 

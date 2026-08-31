@@ -19,8 +19,8 @@ micro-workload (`python-oracledb` thin) against:
 Both database containers are pinned to **2 CPU** (Oracle XE 21c is licence-capped
 there anyway; its container gets 3 GiB for headroom, PostgreSQL gets 2 GiB),
 loopback, **stock / untuned PostgreSQL config** (`shared_buffers` 128 MB, 4 MB
-`work_mem`, no parallel-query room). The pgSaci proxy runs unconstrained on the
-host — it is the overhead being measured, not a third contestant.
+`work_mem`, no parallel-query room). The pgSaci proxy itself runs unconstrained
+on the host.
 
 :::note
 These are one sample run on a Windows laptop. Absolute numbers move a lot with

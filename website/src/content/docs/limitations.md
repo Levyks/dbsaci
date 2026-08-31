@@ -3,13 +3,12 @@ title: What does not work
 description: Split into "not yet — planned" and "structurally impossible on stock PostgreSQL + orafce".
 ---
 
-Two categories. The first is missing work that is on the map; the second cannot
-be done with stock PostgreSQL and `orafce` at all.
+Two categories: missing work that is on the roadmap, and things stock PostgreSQL
+with `orafce` cannot do at all.
 
-## Not yet — planned, needs more protocol work
+## Not yet — planned
 
 Expressible on PostgreSQL, but the wire framing or translation is not written.
-Deferred, not ruled out.
 
 ### Likely to bite first
 
@@ -34,11 +33,11 @@ Deferred, not ruled out.
   (their column-metadata parser desyncs on a non-zero scale field). Values are
   always exact.
 - **Native `TIMESTAMP` / `TIMESTAMP WITH TIME ZONE` describe for ojdbc and
-  ODP.NET.** Those two drivers are described PostgreSQL `timestamp` /
-  `timestamptz` as Oracle `DATE` (second precision). Exact for an Oracle `DATE`
-  column (the common case); an Oracle `TIMESTAMP(n>0)` loses its sub-second
-  digits over ojdbc / ODP.NET. `python-oracledb` thin keeps the native types
-  with sub-second precision.
+  ODP.NET.** Those two drivers see PostgreSQL `timestamp` / `timestamptz`
+  described as Oracle `DATE` (second precision) — exact for an Oracle `DATE`
+  column (the common case), but an Oracle `TIMESTAMP(n>0)` loses its sub-second
+  digits. `python-oracledb` thin keeps the native types with sub-second
+  precision.
 - **Native TTC encodings for `INTERVAL`, `BINARY_FLOAT` / `BINARY_DOUBLE`.**
   Complete for `python-oracledb` thin; other drivers get `NUMBER` / an
   Oracle-style interval text rendering.
@@ -58,8 +57,7 @@ Deferred, not ruled out.
 
 ## Structurally impossible on stock PostgreSQL + `orafce`
 
-Out of scope for the foreseeable future — the engine underneath simply cannot
-express these:
+Out of scope — the engine underneath can't express these:
 
 - **Flashback** (`AS OF SCN|TIMESTAMP`, `VERSIONS BETWEEN`) — no time-travel
   storage.

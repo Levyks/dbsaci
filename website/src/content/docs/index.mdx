@@ -38,8 +38,8 @@ Oracle database, and pgSaci:
 		(12c PBKDF2 with mutual server proof, or the 11g MD5 verifier).
 	</Card>
 	<Card title="2 · Translates the SQL" icon="seti:sql">
-		The Oracle SQL/PL-SQL dialect it understands is rewritten into PostgreSQL
-		SQL — binds stay typed parameters, never string interpolation.
+		The Oracle SQL/PL-SQL dialect it understands is rewritten to PostgreSQL
+		SQL; binds are sent as PostgreSQL parameters.
 	</Card>
 	<Card title="3 · Runs it on PostgreSQL" icon="seti:db">
 		One backend round trip to an ordinary current PostgreSQL release with the
@@ -76,5 +76,5 @@ its Oracle client have to stay exactly as they are.
 	<LinkCard title="What works" href="/pgsaci/what-works/" description="Drivers, SQL, DDL, triggers, transactions, operations." />
 	<LinkCard title="What doesn't" href="/pgsaci/limitations/" description="Not yet vs structurally impossible on stock PostgreSQL." />
 	<LinkCard title="Compatibility matrix" href="/pgsaci/compatibility/" description="The detailed per-area breakdown." />
-	<LinkCard title="How it works" href="/pgsaci/how-it-works/" description="Capability-driven wire negotiation; no driver-name detection." />
+	<LinkCard title="How it works" href="/pgsaci/how-it-works/" description="The query path, wire negotiation, and testing." />
 </CardGrid>

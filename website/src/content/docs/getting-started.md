@@ -19,12 +19,18 @@ is not up yet for the version you want, [build from source](#option-c-build-from
 The fastest way to try it. This brings up PostgreSQL 18 with `orafce` and pgSaci
 in front of it.
 
+Build the PostgreSQL + `orafce` image once (or point `image:` at any PostgreSQL
+image where `CREATE EXTENSION orafce` works):
+
+```bash
+docker build -t pgsaci-postgres:18 \
+  https://github.com/Levyks/pgsaci.git#main:testcontainers --build-arg PG_VERSION=18
+```
+
 ```yaml title="docker-compose.yml"
 services:
   postgres:
-    # PostgreSQL + orafce, built from testcontainers/Dockerfile in the repo.
-    # Swap for your own image that has `CREATE EXTENSION orafce` available.
-    image: ghcr.io/levyks/pgsaci-postgres:18
+    image: pgsaci-postgres:18
     environment:
       POSTGRES_PASSWORD: pgpw
       POSTGRES_DB: appdb

@@ -47,6 +47,7 @@ export default defineConfig({
 						{ label: 'Configuration', slug: 'configuration' },
 						{ label: 'How it works', slug: 'how-it-works' },
 						{ label: 'Benchmarks', slug: 'benchmarks' },
+						{ label: 'Legal & trademarks', slug: 'legal' },
 					],
 				},
 			],

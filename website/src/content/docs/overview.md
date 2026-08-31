@@ -74,6 +74,5 @@ personas:
 | `oracle-rs` | thin | Supported |
 | Instant Client / OCI thick | thick | Handshake differs (`ORA-12592`) — [not yet](/pgsaci/limitations/) |
 
-pgSaci chooses every wire-level behaviour from the capabilities the client
-negotiates in the TTC handshake, the way a real Oracle server does — never from a
-driver-name string. See [How it works](/pgsaci/how-it-works/).
+Each wire-level behaviour is chosen from the capabilities the client negotiates
+in the TTC handshake. See [How it works](/pgsaci/how-it-works/).

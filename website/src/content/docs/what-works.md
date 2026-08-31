@@ -3,25 +3,21 @@ title: What works
 description: The Oracle surface pgSaci covers today, verified by an end-to-end golden corpus.
 ---
 
-Everything below is exercised by the **golden corpus** — one real
-PostgreSQL/`orafce` container and one real pgSaci proxy, every case driven over
-TNS, asserting Oracle-correct values, row counts and error text (not merely "did
-not error"). See [Compatibility matrix](/pgsaci/compatibility/) for the
-per-area status, and [Limitations](/pgsaci/limitations/) for what is missing.
+Everything below has golden-corpus coverage. See the
+[Compatibility matrix](/pgsaci/compatibility/) for per-area status and
+[Limitations](/pgsaci/limitations/) for what is missing.
 
 ## Drivers & sessions
 
-- **Real Oracle drivers connect and run a real session.** `python-oracledb`
-  (thin), the Oracle JDBC thin driver, and ODP.NET managed
-  (`Oracle.ManagedDataAccess.Core`) all pass an end-to-end probe — connect, auth
+- `python-oracledb` (thin), the Oracle JDBC thin driver, and ODP.NET managed
+  (`Oracle.ManagedDataAccess.Core`) each pass an end-to-end probe — connect, auth
   (12c PBKDF2 with mutual server proof), metadata, parametrised `SELECT`,
   `INSERT` with row counts, `ROLLBACK`, a 2 500-row fetch loop, and array-bind
   batch DML (`executemany` / JDBC batch / ODP.NET `ArrayBindCount`) — against
   both the 19c and 11g personas.
-- **Scalar and array binds** cross as real typed parameters, never string
-  interpolation. A cached statement re-run with new binds (`REEXECUTE`) is
-  handled. Results stream row-batch by row-batch, including results past 1M rows
-  or one 64 MiB packet.
+- **Scalar and array binds** go across as PostgreSQL parameters. A cached
+  statement re-run with new binds (`REEXECUTE`) is handled. Results stream
+  batch by batch, including results past 1M rows or one 64 MiB packet.
 
 ## SQL
 
@@ -30,8 +26,7 @@ per-area status, and [Limitations](/pgsaci/limitations/) for what is missing.
   `_ISLEAF`), `MERGE` (incl. `WHEN MATCHED ... DELETE`), `INSERT ALL` /
   `INSERT FIRST`, `PIVOT` / `UNPIVOT`, analytic/window functions, recursive CTEs.
 - `NVL` / `DECODE` / `NVL2` / `SYSDATE` / `ADD_MONTHS` / `TO_CHAR` / `SUBSTR` and
-  the rest of the common Oracle scalar library — routed to `orafce`, not
-  reimplemented.
+  the rest of the common Oracle scalar library, via `orafce`.
 - **Sequences** (`seq.NEXTVAL` / `.CURRVAL`), identity columns.
 
 ## Transactions
