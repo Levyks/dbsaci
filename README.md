@@ -70,8 +70,8 @@ cargo run --bin pgsaci
 
 Then connect any Oracle client to `//host:1521/FREEPDB1`.
 
-Or run it from a container (`levyks/pgsaci:0.0.1`, ~10 MB) —
-`docker run -p 1521:1521 -e PGSACI_PG_HOST=… levyks/pgsaci:0.0.1`. See the
+Or run it from a container (`levyks/pgsaci:0.0.2`, ~10 MB) —
+`docker run -p 1521:1521 -e PGSACI_PG_HOST=… levyks/pgsaci:0.0.2`. See the
 [docs](https://levyks.github.io/pgsaci/getting-started/) for a full
 docker-compose.
 

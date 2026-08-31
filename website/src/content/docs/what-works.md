@@ -39,11 +39,14 @@ Everything below has golden-corpus coverage. See the
 
 ## Data dictionary
 
-Read-only catalog views the tooling and ORMs probe: `USER_TABLES` /
-`ALL_TABLES`, `USER_TAB_COLUMNS` / `ALL_TAB_COLUMNS`, `USER_OBJECTS`,
-`USER_CONSTRAINTS`, `USER_INDEXES`, `USER_SEQUENCES` / `ALL_SEQUENCES`,
-`USER_TAB_COMMENTS`, `V$VERSION`, and `NLS_SESSION_PARAMETERS` (which reflects
-the session's `NLS_*` settings).
+Read-only catalog views the tooling and ORMs probe, returning UPPERCASE names
+like a real Oracle database: `USER_*` / `ALL_*` for tables, columns, objects,
+constraints, indexes, sequences, comments, triggers, users; `V$VERSION`;
+`NLS_SESSION_PARAMETERS` (reflects the session's `NLS_*` settings).
+
+An IDE schema browser — DataGrip / IntelliJ was the reference — introspects the
+tree end to end against these, including `DBMS_METADATA.GET_DDL` for the "copy
+DDL" action (rendered as PostgreSQL DDL).
 
 ## Transactions
 
