@@ -927,7 +927,8 @@ const SYS_CATALOG_FACADE: &str = "
       WHERE a.attnum>0 AND NOT a.attisdropped AND c.relkind IN ('r','p','v','m');
 
     CREATE OR REPLACE VIEW sys.all_tab_cols AS
-      SELECT c.*, 'NO'::varchar AS hidden_column, 'NO'::varchar AS virtual_column
+      SELECT c.*, 'NO'::varchar AS hidden_column, 'NO'::varchar AS virtual_column,
+             'YES'::varchar AS user_generated
       FROM sys.all_tab_columns c;
 
     CREATE OR REPLACE VIEW sys.all_constraints AS
@@ -1056,7 +1057,7 @@ const SYS_CATALOG_FACADE: &str = "
 
     CREATE OR REPLACE VIEW sys.all_db_links AS
       SELECT NULL::varchar AS owner, NULL::varchar AS db_link, NULL::varchar AS username,
-             NULL::varchar AS host WHERE false;
+             NULL::varchar AS host, NULL::timestamp AS created WHERE false;
 
     CREATE OR REPLACE VIEW sys.all_queues AS
       SELECT NULL::varchar AS owner, NULL::varchar AS name, NULL::varchar AS queue_table WHERE false;
@@ -1103,7 +1104,8 @@ const SYS_CATALOG_FACADE: &str = "
              nullable, column_id, data_default, char_length, char_used
       FROM sys.all_tab_columns WHERE owner = current_schema();
     CREATE OR REPLACE VIEW sys.user_tab_cols AS
-      SELECT c.*, 'NO'::varchar AS hidden_column, 'NO'::varchar AS virtual_column
+      SELECT c.*, 'NO'::varchar AS hidden_column, 'NO'::varchar AS virtual_column,
+             'YES'::varchar AS user_generated
       FROM sys.user_tab_columns c;
     CREATE OR REPLACE VIEW sys.user_constraints AS
       SELECT constraint_name, constraint_type, table_name, search_condition, r_owner,
