@@ -881,7 +881,7 @@ const PERSISTENT_SETUP: &str = "
 /// Bump on any change to [`SYS_CATALOG_FACADE`]. Connects re-apply the facade
 /// (an ACCESS EXCLUSIVE `CREATE OR REPLACE VIEW` storm) only when the value
 /// stored in `pgsaci.facade_ver` differs from this.
-const SYS_CATALOG_FACADE_VERSION: &str = "2026-09-01.1";
+const SYS_CATALOG_FACADE_VERSION: &str = "2026-09-01.2";
 
 /// Schema-qualified `SYS.ALL_*` / `SYS.USER_*` data-dictionary views that IDE
 /// schema browsers (DataGrip/IntelliJ, SQL Developer, DBeaver) query directly by
@@ -989,7 +989,9 @@ const SYS_CATALOG_FACADE: &str = "
              upper(rn.nspname)::varchar AS r_owner, upper(rc.conname)::varchar AS r_constraint_name,
              (CASE con.confdeltype WHEN 'c' THEN 'CASCADE' WHEN 'n' THEN 'SET NULL'
                                    WHEN 'a' THEN 'NO ACTION' ELSE NULL END)::varchar AS delete_rule,
-             (CASE WHEN con.convalidated THEN 'VALID' ELSE 'NOT VALIDATED' END)::varchar AS status
+             (CASE WHEN con.convalidated THEN 'VALID' ELSE 'NOT VALIDATED' END)::varchar AS status,
+             (CASE WHEN con.conname ~ '_(pkey|fkey|key|check|excl)[0-9]*$'
+                   THEN 'GENERATED NAME' ELSE 'USER NAME' END)::varchar AS generated
       FROM pg_catalog.pg_constraint con
       JOIN pg_catalog.pg_class rel ON rel.oid=con.conrelid
       JOIN pg_catalog.pg_namespace n ON n.oid=con.connamespace
@@ -1158,7 +1160,7 @@ const SYS_CATALOG_FACADE: &str = "
       FROM sys.user_tab_columns c;
     CREATE OR REPLACE VIEW sys.user_constraints AS
       SELECT constraint_name, constraint_type, table_name, search_condition, r_owner,
-             r_constraint_name, delete_rule, status
+             r_constraint_name, delete_rule, status, generated
       FROM sys.all_constraints WHERE owner = upper(current_schema());
     CREATE OR REPLACE VIEW sys.user_cons_columns AS
       SELECT constraint_name, table_name, column_name, position
