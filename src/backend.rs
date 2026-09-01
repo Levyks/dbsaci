@@ -716,7 +716,7 @@ const SESSION_FACADE_VIEWS: &str = "
       WHERE c.relkind IN ('r', 'p', 'v', 'm')
         AND pg_catalog.pg_table_is_visible(c.oid);
     CREATE OR REPLACE TEMP VIEW all_tables AS
-      SELECT upper(n.nspname)::varchar AS owner, upper(c.relname)::varchar AS table_name
+      SELECT upper(CASE WHEN n.nspname = 'oracle' THEN current_user ELSE n.nspname END)::varchar AS owner, upper(c.relname)::varchar AS table_name
       FROM pg_catalog.pg_class c
       JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
       WHERE c.relkind IN ('r', 'p', 'v', 'm');
@@ -735,7 +735,7 @@ const ORACLE_COMPAT_FACADE: &[&str] = &[
     "CREATE OR REPLACE TEMP VIEW dual AS SELECT 'X'::varchar AS dummy",
     "
     CREATE OR REPLACE TEMP VIEW all_tab_columns AS
-      SELECT upper(n.nspname)::varchar AS owner, upper(c.table_name)::varchar AS table_name,
+      SELECT upper(CASE WHEN n.nspname = 'oracle' THEN current_user ELSE n.nspname END)::varchar AS owner, upper(c.table_name)::varchar AS table_name,
              upper(c.column_name)::varchar AS column_name,
              c.data_type, c.ordinal_position::integer AS column_id
       FROM information_schema.columns c
@@ -777,7 +777,7 @@ const ORACLE_COMPAT_FACADE: &[&str] = &[
       WHERE c.relkind = 'S' AND pg_catalog.pg_table_is_visible(c.oid)",
     "
     CREATE OR REPLACE TEMP VIEW all_sequences AS
-      SELECT upper(n.nspname)::varchar   AS sequence_owner,
+      SELECT upper(CASE WHEN n.nspname = 'oracle' THEN current_user ELSE n.nspname END)::varchar   AS sequence_owner,
              upper(c.relname)::varchar   AS sequence_name,
              s.seqmin::numeric           AS min_value,
              s.seqmax::numeric           AS max_value,
@@ -883,7 +883,7 @@ const PERSISTENT_SETUP: &str = "
 /// Bump on any change to [`SYS_CATALOG_FACADE`]. Connects re-apply the facade
 /// (an ACCESS EXCLUSIVE `CREATE OR REPLACE VIEW` storm) only when the value
 /// stored in `pgsaci.facade_ver` differs from this.
-const SYS_CATALOG_FACADE_VERSION: &str = "2026-09-01.3";
+const SYS_CATALOG_FACADE_VERSION: &str = "2026-09-01.5";
 
 /// Schema-qualified `SYS.ALL_*` / `SYS.USER_*` data-dictionary views that IDE
 /// schema browsers (DataGrip/IntelliJ, SQL Developer, DBeaver) query directly by
@@ -899,7 +899,7 @@ const SYS_CATALOG_FACADE: &str = "
     CREATE OR REPLACE VIEW sys.session_privs AS SELECT NULL::varchar AS privilege WHERE false;
 
     CREATE OR REPLACE VIEW sys.all_users AS
-      SELECT upper(n.nspname)::varchar AS username, n.oid::bigint AS user_id,
+      SELECT upper(CASE WHEN n.nspname = 'oracle' THEN current_user ELSE n.nspname END)::varchar AS username, n.oid::bigint AS user_id,
              NULL::timestamp AS created, 'NO'::varchar AS common,
              (CASE WHEN n.nspname LIKE 'pg\\_%'
                     OR n.nspname IN ('information_schema','sys','pgsaci')
@@ -908,10 +908,16 @@ const SYS_CATALOG_FACADE: &str = "
              'USERS'::varchar AS default_tablespace,
              'TEMP'::varchar  AS temporary_tablespace
       FROM pg_catalog.pg_namespace n
-      WHERE n.nspname NOT LIKE 'pg_temp_%' AND n.nspname NOT LIKE 'pg_toast%';
+      WHERE n.nspname NOT LIKE 'pg_temp_%' AND n.nspname NOT LIKE 'pg_toast%'
+        -- orafce drops one schema per PL/SQL package; they are not Oracle
+        -- schemas a browser should list. `oracle` itself is kept: it is
+        -- remapped to the connected user (their objects live there).
+        AND n.nspname NOT IN ('dbms_alert','dbms_assert','dbms_lob','dbms_metadata',
+              'dbms_output','dbms_pipe','dbms_random','dbms_sql','dbms_utility',
+              'utl_file','plunit','plvchr','plvdate','plvlex','plvstr','plvsubst');
 
     CREATE OR REPLACE VIEW sys.all_objects AS
-      SELECT upper(n.nspname)::varchar AS owner, upper(c.relname)::varchar AS object_name,
+      SELECT upper(CASE WHEN n.nspname = 'oracle' THEN current_user ELSE n.nspname END)::varchar AS owner, upper(c.relname)::varchar AS object_name,
              NULL::varchar AS subobject_name, c.oid::bigint AS object_id,
              c.oid::bigint AS data_object_id,
              (CASE c.relkind WHEN 'r' THEN 'TABLE' WHEN 'p' THEN 'TABLE'
@@ -925,7 +931,7 @@ const SYS_CATALOG_FACADE: &str = "
       FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace
       WHERE c.relkind IN ('r','p','v','m','i','S')
       UNION ALL
-      SELECT upper(n.nspname)::varchar, upper(p.proname)::varchar, NULL::varchar, p.oid::bigint,
+      SELECT upper(CASE WHEN n.nspname = 'oracle' THEN current_user ELSE n.nspname END)::varchar, upper(p.proname)::varchar, NULL::varchar, p.oid::bigint,
              p.oid::bigint,
              (CASE p.prokind WHEN 'p' THEN 'PROCEDURE' ELSE 'FUNCTION' END)::varchar,
              NULL::timestamp, NULL::timestamp, NULL::timestamp, 'VALID'::varchar,
@@ -933,7 +939,7 @@ const SYS_CATALOG_FACADE: &str = "
       FROM pg_catalog.pg_proc p JOIN pg_catalog.pg_namespace n ON n.oid=p.pronamespace;
 
     CREATE OR REPLACE VIEW sys.all_tables AS
-      SELECT upper(n.nspname)::varchar AS owner, upper(c.relname)::varchar AS table_name,
+      SELECT upper(CASE WHEN n.nspname = 'oracle' THEN current_user ELSE n.nspname END)::varchar AS owner, upper(c.relname)::varchar AS table_name,
              'USERS'::varchar AS tablespace_name, 'VALID'::varchar AS status,
              c.reltuples::numeric AS num_rows,
              (CASE WHEN c.relpersistence='t' THEN 'Y' ELSE 'N' END)::varchar AS temporary,
@@ -943,7 +949,7 @@ const SYS_CATALOG_FACADE: &str = "
       WHERE c.relkind IN ('r','p');
 
     CREATE OR REPLACE VIEW sys.all_views AS
-      SELECT upper(n.nspname)::varchar AS owner, upper(c.relname)::varchar AS view_name,
+      SELECT upper(CASE WHEN n.nspname = 'oracle' THEN current_user ELSE n.nspname END)::varchar AS owner, upper(c.relname)::varchar AS view_name,
              length(pg_get_viewdef(c.oid))::numeric AS text_length,
              pg_get_viewdef(c.oid)::varchar AS text,
              NULL::varchar AS type_text, NULL::varchar AS oid_text,
@@ -952,7 +958,7 @@ const SYS_CATALOG_FACADE: &str = "
       WHERE c.relkind='v';
 
     CREATE OR REPLACE VIEW sys.all_mviews AS
-      SELECT upper(n.nspname)::varchar AS owner, upper(c.relname)::varchar AS mview_name,
+      SELECT upper(CASE WHEN n.nspname = 'oracle' THEN current_user ELSE n.nspname END)::varchar AS owner, upper(c.relname)::varchar AS mview_name,
              pg_get_viewdef(c.oid)::varchar AS query, 'N'::varchar AS updatable,
              'DEMAND'::varchar AS refresh_mode, 'FORCE'::varchar AS refresh_method,
              'VALID'::varchar AS compile_state
@@ -960,7 +966,7 @@ const SYS_CATALOG_FACADE: &str = "
       WHERE c.relkind='m';
 
     CREATE OR REPLACE VIEW sys.all_tab_columns AS
-      SELECT upper(n.nspname)::varchar AS owner, upper(c.relname)::varchar AS table_name,
+      SELECT upper(CASE WHEN n.nspname = 'oracle' THEN current_user ELSE n.nspname END)::varchar AS owner, upper(c.relname)::varchar AS table_name,
              upper(a.attname)::varchar AS column_name,
              upper(format_type(a.atttypid, NULL))::varchar AS data_type,
              information_schema._pg_char_max_length(a.atttypid,a.atttypmod)::numeric AS data_length,
@@ -983,12 +989,13 @@ const SYS_CATALOG_FACADE: &str = "
       FROM sys.all_tab_columns c;
 
     CREATE OR REPLACE VIEW sys.all_constraints AS
-      SELECT upper(n.nspname)::varchar AS owner, upper(con.conname)::varchar AS constraint_name,
+      SELECT upper(CASE WHEN n.nspname = 'oracle' THEN current_user ELSE n.nspname END)::varchar AS owner, upper(con.conname)::varchar AS constraint_name,
              (CASE con.contype WHEN 'p' THEN 'P' WHEN 'f' THEN 'R' WHEN 'u' THEN 'U'
-                               WHEN 'c' THEN 'C' ELSE con.contype::text END)::varchar AS constraint_type,
+                               WHEN 'c' THEN 'C' WHEN 'n' THEN 'C' ELSE con.contype::text END)::varchar AS constraint_type,
              upper(rel.relname)::varchar AS table_name,
-             (CASE WHEN con.contype='c' THEN pg_get_constraintdef(con.oid) ELSE NULL END)::varchar AS search_condition,
-             upper(rn.nspname)::varchar AS r_owner, upper(rc.conname)::varchar AS r_constraint_name,
+             (CASE WHEN con.contype IN ('c','n') THEN pg_get_constraintdef(con.oid)
+                   ELSE NULL END)::varchar AS search_condition,
+             upper(CASE WHEN rn.nspname = 'oracle' THEN current_user ELSE rn.nspname END)::varchar AS r_owner, upper(rc.conname)::varchar AS r_constraint_name,
              (CASE con.confdeltype WHEN 'c' THEN 'CASCADE' WHEN 'n' THEN 'SET NULL'
                                    WHEN 'a' THEN 'NO ACTION' ELSE NULL END)::varchar AS delete_rule,
              (CASE WHEN con.convalidated THEN 'VALID' ELSE 'NOT VALIDATED' END)::varchar AS status,
@@ -1002,7 +1009,7 @@ const SYS_CATALOG_FACADE: &str = "
       LEFT JOIN pg_catalog.pg_constraint rc ON rc.conrelid=con.confrelid AND rc.contype='p';
 
     CREATE OR REPLACE VIEW sys.all_cons_columns AS
-      SELECT upper(n.nspname)::varchar AS owner, upper(con.conname)::varchar AS constraint_name,
+      SELECT upper(CASE WHEN n.nspname = 'oracle' THEN current_user ELSE n.nspname END)::varchar AS owner, upper(con.conname)::varchar AS constraint_name,
              upper(rel.relname)::varchar AS table_name, upper(a.attname)::varchar AS column_name,
              k.ord::numeric AS position
       FROM pg_catalog.pg_constraint con
@@ -1012,8 +1019,8 @@ const SYS_CATALOG_FACADE: &str = "
       JOIN pg_catalog.pg_attribute a ON a.attrelid=con.conrelid AND a.attnum=k.attnum;
 
     CREATE OR REPLACE VIEW sys.all_indexes AS
-      SELECT upper(tn.nspname)::varchar AS owner, upper(ic.relname)::varchar AS index_name,
-             'NORMAL'::varchar AS index_type, upper(tn.nspname)::varchar AS table_owner,
+      SELECT upper(CASE WHEN tn.nspname = 'oracle' THEN current_user ELSE tn.nspname END)::varchar AS owner, upper(ic.relname)::varchar AS index_name,
+             'NORMAL'::varchar AS index_type, upper(CASE WHEN tn.nspname = 'oracle' THEN current_user ELSE tn.nspname END)::varchar AS table_owner,
              upper(tc.relname)::varchar AS table_name,
              (CASE WHEN ix.indisunique THEN 'UNIQUE' ELSE 'NONUNIQUE' END)::varchar AS uniqueness,
              'VALID'::varchar AS status, 'USERS'::varchar AS tablespace_name
@@ -1023,8 +1030,8 @@ const SYS_CATALOG_FACADE: &str = "
       JOIN pg_catalog.pg_namespace tn ON tn.oid=tc.relnamespace;
 
     CREATE OR REPLACE VIEW sys.all_ind_columns AS
-      SELECT upper(tn.nspname)::varchar AS index_owner, upper(ic.relname)::varchar AS index_name,
-             upper(tn.nspname)::varchar AS table_owner, upper(tc.relname)::varchar AS table_name,
+      SELECT upper(CASE WHEN tn.nspname = 'oracle' THEN current_user ELSE tn.nspname END)::varchar AS index_owner, upper(ic.relname)::varchar AS index_name,
+             upper(CASE WHEN tn.nspname = 'oracle' THEN current_user ELSE tn.nspname END)::varchar AS table_owner, upper(tc.relname)::varchar AS table_name,
              upper(a.attname)::varchar AS column_name, k.ord::numeric AS column_position,
              'ASC'::varchar AS descend
       FROM pg_catalog.pg_index ix
@@ -1035,7 +1042,7 @@ const SYS_CATALOG_FACADE: &str = "
       JOIN pg_catalog.pg_attribute a ON a.attrelid=ix.indrelid AND a.attnum=k.attnum;
 
     CREATE OR REPLACE VIEW sys.all_sequences AS
-      SELECT upper(n.nspname)::varchar AS sequence_owner, upper(c.relname)::varchar AS sequence_name,
+      SELECT upper(CASE WHEN n.nspname = 'oracle' THEN current_user ELSE n.nspname END)::varchar AS sequence_owner, upper(c.relname)::varchar AS sequence_name,
              s.seqmin::numeric AS min_value, s.seqmax::numeric AS max_value,
              s.seqincrement::numeric AS increment_by,
              (CASE WHEN s.seqcycle THEN 'Y' ELSE 'N' END)::varchar AS cycle_flag,
@@ -1052,7 +1059,7 @@ const SYS_CATALOG_FACADE: &str = "
              NULL::varchar AS db_link WHERE false;
 
     CREATE OR REPLACE VIEW sys.all_tab_comments AS
-      SELECT upper(n.nspname)::varchar AS owner, upper(c.relname)::varchar AS table_name,
+      SELECT upper(CASE WHEN n.nspname = 'oracle' THEN current_user ELSE n.nspname END)::varchar AS owner, upper(c.relname)::varchar AS table_name,
              (CASE c.relkind WHEN 'v' THEN 'VIEW' WHEN 'm' THEN 'MATERIALIZED VIEW'
                              ELSE 'TABLE' END)::varchar AS table_type,
              pg_catalog.obj_description(c.oid,'pg_class')::varchar AS comments
@@ -1060,7 +1067,7 @@ const SYS_CATALOG_FACADE: &str = "
       WHERE c.relkind IN ('r','p','v','m');
 
     CREATE OR REPLACE VIEW sys.all_col_comments AS
-      SELECT upper(n.nspname)::varchar AS owner, upper(c.relname)::varchar AS table_name,
+      SELECT upper(CASE WHEN n.nspname = 'oracle' THEN current_user ELSE n.nspname END)::varchar AS owner, upper(c.relname)::varchar AS table_name,
              upper(a.attname)::varchar AS column_name,
              pg_catalog.col_description(c.oid,a.attnum)::varchar AS comments
       FROM pg_catalog.pg_attribute a
@@ -1069,9 +1076,9 @@ const SYS_CATALOG_FACADE: &str = "
       WHERE a.attnum>0 AND NOT a.attisdropped AND c.relkind IN ('r','p','v','m');
 
     CREATE OR REPLACE VIEW sys.all_triggers AS
-      SELECT upper(n.nspname)::varchar AS owner, upper(t.tgname)::varchar AS trigger_name,
+      SELECT upper(CASE WHEN n.nspname = 'oracle' THEN current_user ELSE n.nspname END)::varchar AS owner, upper(t.tgname)::varchar AS trigger_name,
              'BEFORE EACH ROW'::varchar AS trigger_type, 'INSERT'::varchar AS triggering_event,
-             upper(n.nspname)::varchar AS table_owner, upper(c.relname)::varchar AS table_name,
+             upper(CASE WHEN n.nspname = 'oracle' THEN current_user ELSE n.nspname END)::varchar AS table_owner, upper(c.relname)::varchar AS table_name,
              'ENABLED'::varchar AS status, NULL::varchar AS trigger_body,
              NULL::varchar AS description, NULL::varchar AS when_clause
       FROM pg_catalog.pg_trigger t
@@ -1080,7 +1087,7 @@ const SYS_CATALOG_FACADE: &str = "
       WHERE NOT t.tgisinternal;
 
     CREATE OR REPLACE VIEW sys.all_procedures AS
-      SELECT upper(n.nspname)::varchar AS owner, upper(p.proname)::varchar AS object_name,
+      SELECT upper(CASE WHEN n.nspname = 'oracle' THEN current_user ELSE n.nspname END)::varchar AS owner, upper(p.proname)::varchar AS object_name,
              NULL::varchar AS procedure_name,
              (CASE p.prokind WHEN 'p' THEN 'PROCEDURE' ELSE 'FUNCTION' END)::varchar AS object_type,
              'NO'::varchar AS aggregate, 'NO'::varchar AS pipelined
@@ -1138,24 +1145,24 @@ const SYS_CATALOG_FACADE: &str = "
       SELECT username, user_id, account_status, NULL::timestamp AS lock_date,
              NULL::timestamp AS expiry_date, default_tablespace, temporary_tablespace,
              created, 'DEFAULT'::varchar AS profile, common, oracle_maintained
-      FROM sys.all_users WHERE username = upper(current_schema()) OR username = upper(current_user);
+      FROM sys.all_users WHERE username = upper(CASE WHEN current_schema = 'oracle' THEN current_user ELSE current_schema END) OR username = upper(current_user);
     CREATE OR REPLACE VIEW sys.user_objects AS
       SELECT object_name, subobject_name, object_id, data_object_id, object_type, created,
              last_ddl_time, timestamp, status, temporary, generated, secondary
-      FROM sys.all_objects WHERE owner = upper(current_schema());
+      FROM sys.all_objects WHERE owner = upper(CASE WHEN current_schema = 'oracle' THEN current_user ELSE current_schema END);
     CREATE OR REPLACE VIEW sys.user_tables AS
       SELECT table_name, tablespace_name, status, num_rows, temporary, nested, iot_type, partitioned
-      FROM sys.all_tables WHERE owner = upper(current_schema());
+      FROM sys.all_tables WHERE owner = upper(CASE WHEN current_schema = 'oracle' THEN current_user ELSE current_schema END);
     CREATE OR REPLACE VIEW sys.user_views AS
       SELECT view_name, text_length, text, type_text, oid_text, read_only
-      FROM sys.all_views WHERE owner = upper(current_schema());
+      FROM sys.all_views WHERE owner = upper(CASE WHEN current_schema = 'oracle' THEN current_user ELSE current_schema END);
     CREATE OR REPLACE VIEW sys.user_mviews AS
       SELECT mview_name, query, updatable, refresh_mode, refresh_method, compile_state
-      FROM sys.all_mviews WHERE owner = upper(current_schema());
+      FROM sys.all_mviews WHERE owner = upper(CASE WHEN current_schema = 'oracle' THEN current_user ELSE current_schema END);
     CREATE OR REPLACE VIEW sys.user_tab_columns AS
       SELECT table_name, column_name, data_type, data_length, data_precision, data_scale,
              nullable, column_id, data_default, char_length, char_used
-      FROM sys.all_tab_columns WHERE owner = upper(current_schema());
+      FROM sys.all_tab_columns WHERE owner = upper(CASE WHEN current_schema = 'oracle' THEN current_user ELSE current_schema END);
     CREATE OR REPLACE VIEW sys.user_tab_cols AS
       SELECT c.*, 'NO'::varchar AS hidden_column, 'NO'::varchar AS virtual_column,
              'YES'::varchar AS user_generated
@@ -1163,33 +1170,33 @@ const SYS_CATALOG_FACADE: &str = "
     CREATE OR REPLACE VIEW sys.user_constraints AS
       SELECT constraint_name, constraint_type, table_name, search_condition, r_owner,
              r_constraint_name, delete_rule, status, generated
-      FROM sys.all_constraints WHERE owner = upper(current_schema());
+      FROM sys.all_constraints WHERE owner = upper(CASE WHEN current_schema = 'oracle' THEN current_user ELSE current_schema END);
     CREATE OR REPLACE VIEW sys.user_cons_columns AS
       SELECT constraint_name, table_name, column_name, position
-      FROM sys.all_cons_columns WHERE owner = upper(current_schema());
+      FROM sys.all_cons_columns WHERE owner = upper(CASE WHEN current_schema = 'oracle' THEN current_user ELSE current_schema END);
     CREATE OR REPLACE VIEW sys.user_indexes AS
       SELECT index_name, index_type, table_owner, table_name, uniqueness, status, tablespace_name
-      FROM sys.all_indexes WHERE owner = upper(current_schema());
+      FROM sys.all_indexes WHERE owner = upper(CASE WHEN current_schema = 'oracle' THEN current_user ELSE current_schema END);
     CREATE OR REPLACE VIEW sys.user_ind_columns AS
       SELECT index_name, table_name, column_name, column_position, descend
-      FROM sys.all_ind_columns WHERE index_owner = upper(current_schema());
+      FROM sys.all_ind_columns WHERE index_owner = upper(CASE WHEN current_schema = 'oracle' THEN current_user ELSE current_schema END);
     CREATE OR REPLACE VIEW sys.user_sequences AS
       SELECT sequence_name, min_value, max_value, increment_by, cycle_flag, order_flag,
              cache_size, last_number
-      FROM sys.all_sequences WHERE sequence_owner = upper(current_schema());
+      FROM sys.all_sequences WHERE sequence_owner = upper(CASE WHEN current_schema = 'oracle' THEN current_user ELSE current_schema END);
     CREATE OR REPLACE VIEW sys.user_synonyms AS
       SELECT synonym_name, table_owner, table_name, db_link FROM sys.all_synonyms WHERE false;
     CREATE OR REPLACE VIEW sys.user_tab_comments AS
-      SELECT table_name, table_type, comments FROM sys.all_tab_comments WHERE owner = upper(current_schema());
+      SELECT table_name, table_type, comments FROM sys.all_tab_comments WHERE owner = upper(CASE WHEN current_schema = 'oracle' THEN current_user ELSE current_schema END);
     CREATE OR REPLACE VIEW sys.user_col_comments AS
-      SELECT table_name, column_name, comments FROM sys.all_col_comments WHERE owner = upper(current_schema());
+      SELECT table_name, column_name, comments FROM sys.all_col_comments WHERE owner = upper(CASE WHEN current_schema = 'oracle' THEN current_user ELSE current_schema END);
     CREATE OR REPLACE VIEW sys.user_triggers AS
       SELECT trigger_name, trigger_type, triggering_event, table_owner, table_name, status,
              trigger_body, description, when_clause
-      FROM sys.all_triggers WHERE owner = upper(current_schema());
+      FROM sys.all_triggers WHERE owner = upper(CASE WHEN current_schema = 'oracle' THEN current_user ELSE current_schema END);
     CREATE OR REPLACE VIEW sys.user_procedures AS
       SELECT object_name, procedure_name, object_type, aggregate, pipelined
-      FROM sys.all_procedures WHERE owner = upper(current_schema());
+      FROM sys.all_procedures WHERE owner = upper(CASE WHEN current_schema = 'oracle' THEN current_user ELSE current_schema END);
     CREATE OR REPLACE VIEW sys.user_arguments AS
       SELECT object_name, package_name, argument_name, position, sequence, data_type, in_out, object_id
       FROM sys.all_arguments WHERE false;
@@ -1216,10 +1223,16 @@ $fn$
 DECLARE
   nsp  text := lower(coalesce(nullif(schema, ''), current_schema()));
   rel  text := lower(name);
-  q    text := quote_ident(nsp) || '.' || quote_ident(rel);
+  q    text;
   oid_ oid;
   body text; cons text; idx text;
 BEGIN
+  -- pgSaci keeps every user's objects in the shared `oracle` schema; an IDE
+  -- that asks for schema = the connected user (its Oracle "schema == user"
+  -- assumption) must be pointed there.
+  IF nsp = lower(current_user) THEN nsp := 'oracle'; END IF;
+  q := quote_ident(nsp) || '.' || quote_ident(rel);
+
   SELECT c.oid INTO oid_
   FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
   WHERE n.nspname = nsp AND c.relname = rel;

@@ -8,7 +8,7 @@ extension available, and a PostgreSQL login role for the proxy to use. Below,
 "the client" is any supported Oracle driver.
 
 :::note[Getting the image / binary]
-`docker pull levyks/pgsaci:0.0.3` — a **~10 MB** image (a static musl binary on
+`docker pull levyks/pgsaci:0.0.4` — a **~10 MB** image (a static musl binary on
 `scratch`; pgSaci has no C dependencies). It is also buildable from the repo's
 [`Dockerfile`](https://github.com/Levyks/pgsaci/blob/main/Dockerfile), and
 [building from source](#option-d--build-from-source) is a single `cargo build`.
@@ -39,7 +39,7 @@ services:
     ports: ["5432:5432"]
 
   pgsaci:
-    image: levyks/pgsaci:0.0.3
+    image: levyks/pgsaci:0.0.4
     depends_on: [postgres]
     environment:
       PGSACI_LISTEN: 0.0.0.0:1521
@@ -73,7 +73,7 @@ docker run --rm -p 1521:1521 -p 9500:9500 \
   -e PGSACI_PG_PASSWORD=pgpw \
   -e PGSACI_ORACLE_VERSION=19 \
   -e PGSACI_HEALTH_ADDR=0.0.0.0:9500 \
-  levyks/pgsaci:0.0.3
+  levyks/pgsaci:0.0.4
 ```
 
 Your PostgreSQL must have `orafce` installed in the target database

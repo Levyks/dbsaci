@@ -121,6 +121,25 @@ SELECT table_name FROM user_tables WHERE table_name = 'CATALOG_PROBE'
 CATALOG_PROBE
 -- end
 
+# A table created through PgSaci lands in the shared `oracle` schema, but the
+# catalog facade must present it as owned by the connected user (Oracle's
+# "schema == user" model) so an IDE shows it under the user's node — not under
+# a literal ORACLE schema. `all_users` must likewise list the connected user.
+-- case: all_tables_owner_is_connected_user_for_session_table
+-- setup: CREATE TABLE owner_probe (id NUMBER)
+SELECT COUNT(*) FROM all_tables
+WHERE table_name = 'OWNER_PROBE' AND owner = sys_context('USERENV','CURRENT_SCHEMA')
+-- expect:
+1
+-- end
+
+-- case: all_users_lists_connected_user
+SELECT COUNT(*) FROM sys.all_users
+WHERE username = sys_context('USERENV','CURRENT_SCHEMA')
+-- expect:
+1
+-- end
+
 -- case: user_tab_columns_counts_people_columns
 SELECT COUNT(*) FROM user_tab_columns WHERE table_name = 'PEOPLE'
 -- expect:
