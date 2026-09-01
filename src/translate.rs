@@ -1385,7 +1385,7 @@ fn rewrite_connect_by(sql: &str) -> String {
     // list. `__ids` (the ancestor path) is carried on every `__cb` row.
     if proj.to_ascii_uppercase().contains("CONNECT_BY_ISCYCLE") {
         let expr = format!(
-            "(CASE WHEN EXISTS (SELECT 1 FROM {tbl} {child} WHERE {cond} AND {child}.{id_col} = ANY(__cb.__ids)) THEN 1 ELSE 0 END)"
+            "(CASE WHEN EXISTS (SELECT 1 FROM {tbl} {child} WHERE {cond} AND {child}.{id_col}::text = ANY(__cb.__ids)) THEN 1 ELSE 0 END)"
         );
         proj = replace_ident_ci(&proj, "CONNECT_BY_ISCYCLE", &expr);
     }
@@ -1396,9 +1396,18 @@ fn rewrite_connect_by(sql: &str) -> String {
         proj = replace_ident_ci(&proj, "CONNECT_BY_ISLEAF", &expr);
     }
 
+    // The `__ids` ancestor path and the `__sib` ordering path are accumulator
+    // arrays. PostgreSQL requires the non-recursive and recursive arms of a
+    // `WITH RECURSIVE` union to have *identical* column types, and an array
+    // literal keeps the element's typmod (`ARRAY[empno]` is `numeric(4,0)[]`
+    // when `empno` is `NUMBER(4)`) while `array || elem` in the recursive arm
+    // yields the typmod-stripped `numeric[]`. Normalise every element to `text`
+    // in both arms so the types line up regardless of the key column's declared
+    // type; `__ids` is only ever compared for membership (cycle detection), and
+    // `__sib` ordering already cast to text on the recursive side.
     let sib_seed = siblings
         .as_deref()
-        .map(|s| format!(", ARRAY[{alias}.{}] AS __sib", s.trim()))
+        .map(|s| format!(", ARRAY[{alias}.{}::text] AS __sib", s.trim()))
         .unwrap_or_else(|| ", ARRAY[]::text[] AS __sib".to_string());
     let sib_step = siblings
         .as_deref()
@@ -1407,12 +1416,12 @@ fn rewrite_connect_by(sql: &str) -> String {
 
     let mut out = format!(
         "{prefix}WITH RECURSIVE __cb AS (\
-           SELECT {alias}.*, 1 AS __level, ARRAY[{alias}.{id_col}] AS __ids{extra_seed}{sib_seed} \
+           SELECT {alias}.*, 1 AS __level, ARRAY[{alias}.{id_col}::text] AS __ids{extra_seed}{sib_seed} \
            FROM {tbl} {alias}{seed_where} \
            UNION ALL \
-           SELECT {child}.*, __cb.__level + 1, __cb.__ids || {child}.{id_col}{extra_step}{sib_step} \
+           SELECT {child}.*, __cb.__level + 1, __cb.__ids || {child}.{id_col}::text{extra_step}{sib_step} \
            FROM {tbl} {child} JOIN __cb ON {cond} \
-           WHERE NOT {child}.{id_col} = ANY(__cb.__ids)\
+           WHERE NOT {child}.{id_col}::text = ANY(__cb.__ids)\
          ) SELECT {proj} FROM __cb"
     );
 

@@ -118,3 +118,60 @@ START WITH id = 91 CONNECT BY NOCYCLE PRIOR id = mgr ORDER BY id
 Loop A | 0
 Loop B | 1
 -- end
+
+# A hierarchy keyed on NUMBER(p) rather than a bare INT: the CONNECT BY ->
+# WITH RECURSIVE lowering carries an ancestor-id path array, and PostgreSQL
+# rejects the recursive union unless both arms agree on the array's element
+# typmod (`numeric(4,0)[]` seed vs `numeric[]` step). Regression guard.
+-- fixture: CREATE TABLE IF NOT EXISTS emp_num (id NUMERIC(4) PRIMARY KEY, name TEXT, mgr NUMERIC(4))
+-- fixture: TRUNCATE emp_num
+-- fixture: INSERT INTO emp_num VALUES (1,'King',NULL),(2,'Jones',1),(3,'Scott',2),(4,'Adams',3),(5,'Blake',1),(6,'Allen',5)
+
+-- case: numeric_key_walk_down
+SELECT name FROM emp_num START WITH mgr IS NULL CONNECT BY PRIOR id = mgr ORDER BY id
+-- expect:
+King
+Jones
+Scott
+Adams
+Blake
+Allen
+-- end
+
+-- case: numeric_key_path_and_level
+SELECT SYS_CONNECT_BY_PATH(name, '/') AS path, LEVEL AS lvl
+FROM emp_num START WITH id = 1 CONNECT BY PRIOR id = mgr
+ORDER BY id
+-- expect:
+/King | 1
+/King/Jones | 2
+/King/Jones/Scott | 3
+/King/Jones/Scott/Adams | 4
+/King/Blake | 2
+/King/Blake/Allen | 3
+-- end
+
+-- case: numeric_key_order_siblings
+SELECT name FROM emp_num
+START WITH mgr IS NULL CONNECT BY PRIOR id = mgr
+ORDER SIBLINGS BY name
+-- expect:
+King
+Blake
+Allen
+Jones
+Scott
+Adams
+-- end
+
+-- case: numeric_key_isleaf
+SELECT name, CONNECT_BY_ISLEAF AS leaf FROM emp_num
+START WITH id = 1 CONNECT BY PRIOR id = mgr ORDER BY id
+-- expect:
+King | 0
+Jones | 0
+Scott | 0
+Adams | 1
+Blake | 0
+Allen | 1
+-- end
