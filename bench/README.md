@@ -19,7 +19,7 @@ Everything — the workload client, Oracle XE, PostgreSQL, and pgSaci — runs i
 Docker on one user-defined bridge network. Every hop is a container-to-container
 veth inside the Docker VM, so there is no host port-proxy in the path and both
 targets are reached identically. pgSaci runs from its **published image**
-(`levyks/pgsaci:0.0.2`, a static musl build), so the number reflects what you
+(`levyks/pgsaci:0.0.3`, a static musl build), so the number reflects what you
 ship. `PGSACI_IMAGE=…` overrides it.
 
 ## Fairness: 2 CPU / 2.5 GiB
