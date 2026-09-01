@@ -15,12 +15,32 @@ The same script and SQL run against two endpoints:
 | **Oracle XE 21c** (`gvenzl/oracle-xe:21-slim`) | client → real Oracle |
 | **pgSaci** | client → pgSaci (TNS decode + translate + re-frame) → PostgreSQL + orafce |
 
-## Fairness: 2 CPU / 2 GiB
+Everything — the workload client, Oracle XE, PostgreSQL, and pgSaci — runs in
+Docker on one user-defined bridge network. Every hop is a container-to-container
+veth inside the Docker VM, so there is no host port-proxy in the path and both
+targets are reached identically. pgSaci runs from its **published image**
+(`levyks/pgsaci:0.0.2`, a static musl build), so the number reflects what you
+ship. `PGSACI_IMAGE=…` overrides it.
 
-`run.sh` starts **both** database containers with `--cpus=2 --memory=2g`. Oracle
-XE 21c is already hard-capped at 2 threads / 2 GB by its licence, so this makes
-the two engines directly comparable. The pgSaci proxy itself runs unconstrained
-on the host — it is the overhead being measured, not a third contestant.
+## Fairness: 2 CPU / 2.5 GiB
+
+`run.sh` starts **both** database containers with `--cpus=2` and
+`--memory=$BENCH_MEM` (default `2560m`).
+
+* Oracle XE 21c is hard-capped at 2 threads / 2 GiB of database RAM by its
+  licence. The run spends the whole 2 GiB explicitly — `INIT_SGA_SIZE=1536` +
+  `INIT_PGA_SIZE=512` — and the container ceiling is a little above that so
+  background processes, redo, server processes and the container OS have
+  headroom (it OOM-kills with much less). 2.5 GiB is proven sufficient with the
+  full licence spent; run-to-run numbers are indistinguishable from a 3 GiB
+  ceiling.
+* PostgreSQL gets the same ceiling and a config **tuned to that envelope**
+  (`shared_buffers=768MB`, `work_mem=64MB`, `max_parallel_workers_per_gather=2`,
+  `jit=off`, …) instead of the stock 128 MB / 4 MB defaults. `synchronous_commit`
+  stays `on` — the commit ops have to be as durable as Oracle's.
+
+The pgSaci proxy container runs unconstrained — it is the overhead being
+measured, not a third contestant.
 
 ## Operations
 
@@ -58,26 +78,30 @@ pgSaci now supports them.
 ## Running it
 
 ```bash
-pip install oracledb
 bench/run.sh
 BENCH_ITERS=500 BENCH_HEAVY_ITERS=10 BENCH_BIG_ROWS=50000 bench/run.sh   # quick
+BENCH_KEEP=1 bench/run.sh          # leave the network + containers up afterwards
 ```
 
-`run.sh` starts both containers, seeds a `bench` user + tables in each, runs the
+Only `docker` is needed — the client (python-oracledb thin) runs in a throwaway
+`python:3.12-slim` container. `run.sh` creates the network, starts the three
+server containers, seeds a `bench` user + tables in each engine, runs the
 workload twice, prints two markdown tables, and tears everything down. Raw
 per-run JSON is left in a temp dir (path printed at the end).
 
 ## Reading the results
 
-* **latency** table — pgSaci is expected to be slower; the `pgSaci / Oracle`
-  column is how much. It is ~1 ms of fixed overhead, so a 0.5 ms Oracle read is
-  ~1.5 ms (≈3x) but still ~1.5 ms.
-* **throughput** table — the hop is amortised, so this mostly reflects the two
-  database engines. `ratio < 1` means PostgreSQL-behind-pgSaci finished sooner.
-  Under this 2 CPU cap, with the **stock, untuned** PostgreSQL container config
-  (`shared_buffers` 128 MB, 4 MB `work_mem`, no parallel query room) and Oracle
-  `NUMBER` → PostgreSQL `numeric` columns, Oracle XE's executor wins the
-  CPU-bound scan/aggregate ops. Tune the config, use integer types, or add
-  cores and it narrows or flips. The table shows the shape, not a winner.
-* Single connection, single thread, loopback — no statement about concurrency.
+* **latency** table — pgSaci adds a fixed per-round-trip cost (TNS decode →
+  translate → re-frame → a hop to PostgreSQL → and back). On this box that is
+  ~0.45 ms, so a 0.1 ms Oracle point-read becomes ~0.55 ms (~5x) but is still
+  sub-millisecond. On the commit ops the durable `fsync` dominates and the ratio
+  falls to ~1.2x.
+* **throughput** table — the per-call hop is amortised, so this splits two ways:
+  * the **fetch** ops (`big_fetch_*`) still carry a proxy tax — every row is
+    decoded from the PostgreSQL wire and re-encoded onto the Oracle wire.
+  * the pure-engine ops (aggregate / sort / group-by) mostly reflect Oracle
+    `NUMBER` → PostgreSQL `numeric` arithmetic, which is slower. Integer columns,
+    more cores, or a bigger `work_mem` narrow it. The table shows the shape, not
+    a winner.
+* Single connection, single thread — no statement about concurrency.
 * Numbers move a lot with the host. Re-run locally.

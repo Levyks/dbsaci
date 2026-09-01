@@ -194,58 +194,62 @@ latency*, i.e. the overhead pgSaci adds — not database throughput. See
 `bench/README.md` for methodology and caveats.
 
 <!-- BENCH:START -->
-One sample run — 1 500 iterations/op (30 for the heavy ops), both database
-containers pinned to **2 CPU** (Oracle XE 21c is licence-capped there anyway;
-its container gets 3 GiB for headroom, PostgreSQL gets 2 GiB), single
-connection, loopback, **stock/untuned PostgreSQL config**. A Windows laptop.
-Re-run it on your own hardware — absolute numbers move a lot.
+One sample run — 2 000 iterations/op (30 for the heavy ops), single connection.
+Everything runs in Docker on one bridge network — the client, Oracle XE,
+PostgreSQL and pgSaci — so every hop is a container veth with no host
+port-proxy in the path. pgSaci runs from its published image
+(`levyks/pgsaci:0.0.2`, a static musl build). Both database containers get
+**2 CPU / 2.5 GiB**: Oracle XE spends its full 2 GiB licence (`INIT_SGA_SIZE`
+1536M + `INIT_PGA_SIZE` 512M), PostgreSQL is **tuned to that envelope**
+(`shared_buffers` 768 MB, 64 MB `work_mem`, parallel workers, `jit=off`). A
+Windows laptop — re-run it on your own hardware, absolute numbers move a lot.
 
 **Per-statement latency** — small ops; the wall-clock is the proxy overhead.
 
 | operation | Oracle XE p50 | pgSaci p50 | pgSaci / Oracle |
 | --- | ---: | ---: | ---: |
-| `select_1_from_dual` | 0.48 ms | 1.46 ms | 3.1x |
-| `point_select_by_pk` (1 bind) | 0.49 ms | 1.53 ms | 3.1x |
-| `multi_bind_filter` (3 binds) | 0.60 ms | 2.12 ms | 3.6x |
-| `range_scan_100_rows` | 0.55 ms | 1.73 ms | 3.2x |
-| `insert_commit` | 2.42 ms | 3.41 ms | 1.4x |
-| `update_commit` | 2.34 ms | 3.45 ms | 1.5x |
-| `insert_then_rollback` | 2.39 ms | 2.06 ms | 0.9x |
+| `select_1_from_dual` | 0.11 ms | 0.58 ms | 5.2x |
+| `point_select_by_pk` (1 bind) | 0.11 ms | 0.55 ms | 4.8x |
+| `multi_bind_filter` (3 binds) | 0.21 ms | 0.94 ms | 4.5x |
+| `range_scan_100_rows` | 0.16 ms | 0.60 ms | 3.9x |
+| `insert_commit` | 1.55 ms | 1.95 ms | 1.3x |
+| `update_commit` | 1.52 ms | 1.92 ms | 1.3x |
+| `insert_then_rollback` | 1.56 ms | 0.67 ms | 0.4x |
 
-pgSaci adds **~1 ms of fixed overhead per statement** — it is a second hop
-(client→pgSaci→PostgreSQL and back), plus SQL translation and re-encoding the
-result into Oracle's wire format. A 0.5 ms Oracle read becomes ~1.5 ms — ~3x,
-but still ~1.5 ms. Committed writes add that hop on top of a WAL fsync.
-`insert + rollback` is *quicker* via pgSaci — Oracle XE's redo/undo path for
-that pattern is heavier.
+pgSaci adds **~0.45 ms of fixed overhead per round trip** — a second hop
+(client → pgSaci → PostgreSQL and back), plus SQL translation and re-encoding
+the result into Oracle's wire format. It is a large *ratio* on the sub-0.2 ms
+reads but still sub-millisecond in absolute terms. On the commit ops the WAL
+fsync dominates and the ratio falls to ~1.3x. `insert + rollback` is *quicker*
+via pgSaci — Oracle XE's redo/undo path for that pattern is heavier.
 
 **Throughput** — scan / sort / aggregate / transfer over `bench_big` (100 000
 rows); the wall-clock is dominated by the database engine, not the hop.
 
 | operation | Oracle XE p50 | pgSaci p50 | pgSaci / Oracle |
 | --- | ---: | ---: | ---: |
-| `big_full_aggregate` (COUNT/SUM/AVG/MIN/MAX, `NUMBER` cols) | 3.3 ms | 10.5 ms | 3.2x |
-| `big_scan_expr_count` (per-row `MOD` expr) | 16.3 ms | 23.4 ms | 1.4x |
-| `big_group_by_50` (hash aggregate) | 8.2 ms | 15.7 ms | 1.9x |
-| `big_window_sort` (full `ORDER BY` via window) | 16.7 ms | 41.7 ms | 2.5x |
-| `big_fetch_25k_rows` (25 k rows across the wire) | 24.6 ms | 38.5 ms | 1.6x |
-| `big_fetch_all_rows` (100 k rows across the wire) | 85.7 ms | 134 ms | 1.6x |
-| `bulk_insert_5000` (`INSERT … SELECT` + commit) | 78 ms (p95 **2.9 s**) | 147 ms (p95 160 ms) | 1.9x |
+| `big_full_aggregate` (COUNT/SUM/AVG/MIN/MAX, `NUMBER` cols) | 2.8 ms | 9.2 ms | 3.3x |
+| `big_scan_expr_count` (per-row `MOD` expr) | 15.3 ms | 21.1 ms | 1.4x |
+| `big_group_by_50` (hash aggregate) | 8.8 ms | 14.3 ms | 1.6x |
+| `big_window_sort` (full `ORDER BY` via window) | 15.8 ms | 33.1 ms | 2.1x |
+| `big_fetch_25k_rows` (25 k rows across the wire) | 12.6 ms | 37.9 ms | 3.0x |
+| `big_fetch_all_rows` (100 k rows across the wire) | 43.7 ms | 135.6 ms | 3.1x |
+| `bulk_insert_5000` (`INSERT … SELECT` + commit) | 72 ms (p95 **2.9 s**) | 150 ms (p95 203 ms) | 2.1x |
 
-On the CPU-bound analytics, PostgreSQL here is 1.4–3x slower than Oracle XE —
-but the setup is stacked against it: the container config is untuned
-(`shared_buffers` 128 MB, 4 MB `work_mem`), the columns are Oracle `NUMBER` →
-PostgreSQL `numeric` (software decimal arithmetic, much slower than
-`bigint`/`double precision`), and the 2-CPU cap removes PostgreSQL's parallel
-query. Tune the config, use integer types, or give it more cores and the gap
-closes or reverses. Bulk row transfer (`big_fetch_*`) is only ~1.6x — reasonable
-for a double hop that re-encodes every row. The bulk write is ~2x slower but far
-steadier: Oracle XE's p95 is ~2.9 s (redo-log-switch stalls) vs pgSaci's
-~160 ms.
+The `big_fetch_*` ops are ~3x — that is the proxy decoding every row off the
+PostgreSQL wire and re-encoding it onto the Oracle wire, which is structural for
+a translating proxy. The pure-engine ops (aggregate / sort / group-by) mostly
+reflect Oracle `NUMBER` → PostgreSQL `numeric` arithmetic (software decimal,
+slower than `bigint` / `double precision`); even with the tuned config and
+parallel query enabled, `big_full_aggregate` stays ~3x because the query is too
+short to parallelise. Integer columns or more cores narrow it. The bulk write is
+~2x slower on p50 but far **steadier**: Oracle XE's p95 is ~2.9 s
+(redo-log-switch stalls) versus pgSaci's ~200 ms.
 
 **This is a single-connection latency benchmark** and says nothing about
 concurrency, mixed OLTP, or a tuned deployment — the areas where PostgreSQL
-usually shines.
+usually shines. The shipped image is a musl build (no custom allocator), which
+costs a slice of the tiny-op latency.
 <!-- BENCH:END -->
 
 ## Tests
