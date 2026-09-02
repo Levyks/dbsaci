@@ -2,6 +2,9 @@
 name = "pgsaci"
 version = "0.0.6"
 edition = "2024"
+license = "WTFPL"
+description = "A proxy that speaks Oracle's TNS/TTC wire protocol on the front and PostgreSQL on the back"
+repository = "https://github.com/Levyks/pgsaci"
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }

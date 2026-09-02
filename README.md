@@ -297,7 +297,9 @@ Other suites:
 
 ## License
 
-TBD.
+[WTFPL](LICENSE) — Do What The Fuck You Want To Public License, v2. Use it,
+fork it, ship it, sell it; no attribution required. (See *Legal / trademarks*
+below — that covers Oracle's marks and drivers, not this code.)
 
 ## Legal / trademarks
 
