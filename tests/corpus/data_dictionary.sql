@@ -145,3 +145,92 @@ SELECT COUNT(*) FROM user_tab_columns WHERE table_name = 'PEOPLE'
 -- expect:
 3
 -- end
+
+# Materialized-view-log dictionary views: no equivalent in PostgreSQL, so
+# always empty — but an IDE walking the mview branch selects from them and
+# errors if the relation is missing (ORA-00942).
+-- case: all_mview_logs_is_queryable_and_empty
+SELECT COUNT(*) FROM sys.all_mview_logs
+-- expect:
+0
+-- end
+
+-- case: all_mview_comments_is_queryable_and_empty
+SELECT COUNT(*) FROM sys.all_mview_comments
+-- expect:
+0
+-- end
+
+-- case: all_object_tables_is_queryable_and_empty
+SELECT COUNT(*) FROM sys.all_object_tables
+-- expect:
+0
+-- end
+
+-- case: all_indexes_has_domain_index_columns
+SELECT ityp_owner, ityp_name, parameters, funcidx_status, visibility
+FROM sys.all_indexes WHERE index_name = 'DD_DEMO_LABEL_IX'
+-- expect:
+NULL | NULL | NULL | NULL | VISIBLE
+-- end
+
+-- case: all_ind_expressions_is_queryable_and_empty
+SELECT COUNT(*) FROM sys.all_ind_expressions
+-- expect:
+0
+-- end
+
+-- case: all_triggers_reports_timing_event_action_type
+-- setup: CREATE TABLE trg_probe (id NUMBER, n NUMBER)
+-- setup: CREATE OR REPLACE TRIGGER trg_probe_biu BEFORE INSERT OR UPDATE ON trg_probe FOR EACH ROW BEGIN :NEW.n := NVL(:NEW.n, 0) + 1; END;
+SELECT trigger_type, triggering_event, action_type, before_row, status
+FROM sys.all_triggers WHERE trigger_name = 'TRG_PROBE_BIU'
+-- expect:
+BEFORE EACH ROW | INSERT OR UPDATE | PL/SQL | YES | ENABLED
+-- end
+
+# The long tail of Oracle dictionary views an IDE introspector walks: no
+# PostgreSQL equivalent, so empty, but each must resolve instead of ORA-00942.
+-- case: ide_introspection_stub_views_all_resolve_empty
+SELECT (SELECT COUNT(*) FROM sys.all_tab_partitions)
+     + (SELECT COUNT(*) FROM sys.all_part_tables)
+     + (SELECT COUNT(*) FROM sys.all_part_key_columns)
+     + (SELECT COUNT(*) FROM sys.all_tab_subpartitions)
+     + (SELECT COUNT(*) FROM sys.all_ind_partitions)
+     + (SELECT COUNT(*) FROM sys.all_lobs)
+     + (SELECT COUNT(*) FROM sys.all_nested_tables)
+     + (SELECT COUNT(*) FROM sys.all_trigger_cols)
+     + (SELECT COUNT(*) FROM sys.all_type_attrs)
+     + (SELECT COUNT(*) FROM sys.all_coll_types)
+     + (SELECT COUNT(*) FROM sys.all_tab_privs)
+     + (SELECT COUNT(*) FROM sys.all_col_privs)
+     + (SELECT COUNT(*) FROM sys.all_role_privs)
+     + (SELECT COUNT(*) FROM sys.all_directories)
+     + (SELECT COUNT(*) FROM sys.all_java_classes)
+     + (SELECT COUNT(*) FROM sys.all_clusters)
+     + (SELECT COUNT(*) FROM sys.all_editioning_views)
+     + (SELECT COUNT(*) FROM sys.all_xml_schemas)
+     + (SELECT COUNT(*) FROM sys.all_scheduler_programs)
+     + (SELECT COUNT(*) FROM sys.all_queue_tables)
+     + (SELECT COUNT(*) FROM sys.all_tab_col_statistics)
+     + (SELECT COUNT(*) FROM sys.all_registered_mviews)
+     + (SELECT COUNT(*) FROM sys.all_identifiers)
+     + (SELECT COUNT(*) FROM sys.all_all_tables)
+     + (SELECT COUNT(*) FROM sys.all_external_tables)
+     + (SELECT COUNT(*) FROM sys.all_tab_identity_cols WHERE owner = 'NO_SUCH_OWNER')
+     AS total FROM dual
+-- expect:
+0
+-- end
+
+-- case: product_component_version_has_a_row
+SELECT status FROM sys.product_component_version
+-- expect:
+Production
+-- end
+
+-- case: global_name_view_resolves
+SELECT COUNT(*) FROM global_name
+-- expect:
+1
+-- end

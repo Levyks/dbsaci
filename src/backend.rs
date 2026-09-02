@@ -240,6 +240,8 @@ impl PostgresBackend {
             if facade_stale(&client).await {
                 if let Err(e) = client.batch_execute(SYS_CATALOG_FACADE).await {
                     tracing::warn!("sys catalog facade failed: {}", pg_error_detail(&e));
+                } else if let Err(e) = client.batch_execute(IDE_INTROSPECTION_STUBS).await {
+                    tracing::warn!("ide introspection stubs failed: {}", pg_error_detail(&e));
                 } else if let Err(e) = client.batch_execute(DBMS_METADATA_FACADE).await {
                     tracing::warn!("dbms_metadata facade failed: {}", pg_error_detail(&e));
                 } else {
@@ -837,6 +839,22 @@ const ORACLE_COMPAT_FACADE: &[&str] = &[
         ('NLS_SORT', upper(coalesce(current_setting('pgsaci.nls_sort', true), 'BINARY'))),
         ('NLS_COMP', upper(coalesce(current_setting('pgsaci.nls_comp', true), 'BINARY')))
       ) AS t(parameter, value)",
+    // Version / DB-identity views Oracle tooling also reads *unqualified*
+    // (SYS.* copies live in IDE_INTROSPECTION_STUBS for the qualified path).
+    "CREATE OR REPLACE TEMP VIEW product_component_version AS
+       SELECT 'PgSaci Oracle-compatibility proxy'::varchar AS product,
+              '19.0.0.0.0'::varchar AS version,
+              '19.0.0.0.0'::varchar AS version_full,
+              'Production'::varchar AS status",
+    "CREATE OR REPLACE TEMP VIEW nls_database_parameters AS
+       SELECT * FROM (VALUES
+         ('NLS_CHARACTERSET'::varchar, 'AL32UTF8'::varchar),
+         ('NLS_NCHAR_CHARACTERSET', 'AL16UTF16'),
+         ('NLS_LANGUAGE', 'AMERICAN'), ('NLS_TERRITORY', 'AMERICA'),
+         ('NLS_RDBMS_VERSION', '19.0.0.0.0')
+       ) AS t(parameter, value)",
+    "CREATE OR REPLACE TEMP VIEW global_name AS
+       SELECT (upper(current_database()) || '')::varchar AS global_name",
     // Pinned to `public` (always on the search_path, including after
     // `ALTER SESSION SET CURRENT_SCHEMA`), so an unqualified call resolves here
     // no matter which schema is current. Not `pg_temp` — temp functions are not
@@ -909,7 +927,7 @@ const PERSISTENT_SETUP: &str = "
 /// Bump on any change to [`SYS_CATALOG_FACADE`]. Connects re-apply the facade
 /// (an ACCESS EXCLUSIVE `CREATE OR REPLACE VIEW` storm) only when the value
 /// stored in `pgsaci.facade_ver` differs from this.
-const SYS_CATALOG_FACADE_VERSION: &str = "2026-09-02.1";
+const SYS_CATALOG_FACADE_VERSION: &str = "2026-09-02.8";
 
 /// Schema-qualified `SYS.ALL_*` / `SYS.USER_*` data-dictionary views that IDE
 /// schema browsers (DataGrip/IntelliJ, SQL Developer, DBeaver) query directly by
@@ -964,15 +982,53 @@ const SYS_CATALOG_FACADE: &str = "
              'N'::varchar, 'N'::varchar, 'N'::varchar
       FROM pg_catalog.pg_proc p JOIN pg_catalog.pg_namespace n ON n.oid=p.pronamespace;
 
+    -- IDE introspectors select many ALL_TABLES columns by name and fail on the
+    -- first that is missing. The leading columns keep their historical
+    -- name/order (PostgreSQL's `CREATE OR REPLACE VIEW` only allows *appending*
+    -- columns); everything else is appended with Oracle-plausible
+    -- constants/NULLs, real values where PostgreSQL has them.
     CREATE OR REPLACE VIEW sys.all_tables AS
       SELECT upper(n.nspname)::varchar AS owner, upper(c.relname)::varchar AS table_name,
              'USERS'::varchar AS tablespace_name, 'VALID'::varchar AS status,
              c.reltuples::numeric AS num_rows,
              (CASE WHEN c.relpersistence='t' THEN 'Y' ELSE 'N' END)::varchar AS temporary,
              'NO'::varchar AS nested, NULL::varchar AS iot_type,
-             'NO'::varchar AS partitioned
+             (CASE WHEN c.relkind='p' THEN 'YES' ELSE 'NO' END)::varchar AS partitioned,
+             -- appended
+             NULL::varchar AS cluster_name, NULL::varchar AS iot_name,
+             NULL::numeric AS pct_free, NULL::numeric AS pct_used,
+             NULL::numeric AS ini_trans, NULL::numeric AS max_trans,
+             NULL::numeric AS initial_extent, NULL::numeric AS next_extent,
+             NULL::numeric AS min_extents, NULL::numeric AS max_extents,
+             NULL::numeric AS pct_increase, NULL::numeric AS freelists,
+             NULL::numeric AS freelist_groups, 'YES'::varchar AS logging,
+             'N'::varchar AS backed_up, c.relpages::numeric AS blocks,
+             NULL::numeric AS empty_blocks, NULL::numeric AS avg_space,
+             NULL::numeric AS chain_cnt, NULL::numeric AS avg_row_len,
+             NULL::numeric AS avg_space_freelist_blocks,
+             NULL::numeric AS num_freelist_blocks, '1'::varchar AS degree,
+             '1'::varchar AS instances, 'N'::varchar AS cache,
+             'ENABLED'::varchar AS table_lock, NULL::numeric AS sample_size,
+             NULL::timestamp AS last_analyzed, NULL::varchar AS duration,
+             'NO'::varchar AS secondary, 'DEFAULT'::varchar AS buffer_pool,
+             'DEFAULT'::varchar AS flash_cache, 'DEFAULT'::varchar AS cell_flash_cache,
+             'DISABLED'::varchar AS row_movement, 'NO'::varchar AS global_stats,
+             'NO'::varchar AS user_stats, 'YES'::varchar AS segment_created,
+             NULL::varchar AS cluster_owner, 'DISABLED'::varchar AS dependencies,
+             'DISABLED'::varchar AS compression, NULL::varchar AS compress_for,
+             'DISABLED'::varchar AS skip_corrupt, 'YES'::varchar AS monitoring,
+             'NO'::varchar AS dropped, 'NO'::varchar AS read_only,
+             'DEFAULT'::varchar AS result_cache
       FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace
       WHERE c.relkind IN ('r','p');
+
+    -- Object tables (tables built on an object type). PostgreSQL has none, so
+    -- always empty — inherits every ALL_TABLES column plus the object-specific
+    -- ones so an introspector selecting any of them still resolves.
+    CREATE OR REPLACE VIEW sys.all_object_tables AS
+      SELECT *, NULL::varchar AS table_type_owner, NULL::varchar AS table_type,
+             NULL::varchar AS object_id_type
+      FROM sys.all_tables WHERE false;
 
     CREATE OR REPLACE VIEW sys.all_views AS
       SELECT upper(n.nspname)::varchar AS owner, upper(c.relname)::varchar AS view_name,
@@ -990,6 +1046,21 @@ const SYS_CATALOG_FACADE: &str = "
              'VALID'::varchar AS compile_state
       FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace
       WHERE c.relkind='m';
+
+    -- PostgreSQL has no materialized-view logs; always empty, but IDE
+    -- introspectors probe it while walking the mview branch.
+    CREATE OR REPLACE VIEW sys.all_mview_logs AS
+      SELECT NULL::varchar AS log_owner, NULL::varchar AS master,
+             NULL::varchar AS log_table, NULL::varchar AS log_trigger,
+             'NO'::varchar AS rowids, 'NO'::varchar AS primary_key,
+             NULL::bigint  AS object_id, NULL::varchar AS filter_columns,
+             'NO'::varchar AS sequence, 'NO'::varchar AS include_new_values
+      WHERE false;
+
+    CREATE OR REPLACE VIEW sys.all_mview_comments AS
+      SELECT NULL::varchar AS owner, NULL::varchar AS mview_name,
+             NULL::varchar AS comments
+      WHERE false;
 
     CREATE OR REPLACE VIEW sys.all_tab_columns AS
       SELECT upper(n.nspname)::varchar AS owner, upper(c.relname)::varchar AS table_name,
@@ -1044,16 +1115,62 @@ const SYS_CATALOG_FACADE: &str = "
       JOIN LATERAL unnest(con.conkey) WITH ORDINALITY AS k(attnum,ord) ON true
       JOIN pg_catalog.pg_attribute a ON a.attrelid=con.conrelid AND a.attnum=k.attnum;
 
+    -- Leading columns keep their historical name/order (CREATE OR REPLACE VIEW
+    -- appends only); the rest of the Oracle ALL_INDEXES surface is appended with
+    -- Oracle-plausible constants/NULLs (domain-index and CBO-stats columns have
+    -- no PostgreSQL equivalent).
     CREATE OR REPLACE VIEW sys.all_indexes AS
       SELECT upper(tn.nspname)::varchar AS owner, upper(ic.relname)::varchar AS index_name,
-             'NORMAL'::varchar AS index_type, upper(tn.nspname)::varchar AS table_owner,
+             (CASE WHEN ix.indexprs IS NOT NULL THEN 'FUNCTION-BASED NORMAL'
+                   ELSE 'NORMAL' END)::varchar AS index_type,
+             upper(tn.nspname)::varchar AS table_owner,
              upper(tc.relname)::varchar AS table_name,
              (CASE WHEN ix.indisunique THEN 'UNIQUE' ELSE 'NONUNIQUE' END)::varchar AS uniqueness,
-             'VALID'::varchar AS status, 'USERS'::varchar AS tablespace_name
+             'VALID'::varchar AS status, 'USERS'::varchar AS tablespace_name,
+             -- appended
+             'TABLE'::varchar AS table_type, NULL::varchar AS compression,
+             NULL::numeric AS prefix_length, NULL::numeric AS ini_trans,
+             NULL::numeric AS max_trans, NULL::numeric AS initial_extent,
+             NULL::numeric AS next_extent, NULL::numeric AS min_extents,
+             NULL::numeric AS max_extents, NULL::numeric AS pct_increase,
+             NULL::numeric AS pct_threshold, NULL::varchar AS include_column,
+             NULL::numeric AS freelists, NULL::numeric AS freelist_groups,
+             NULL::numeric AS pct_free, 'YES'::varchar AS logging,
+             NULL::numeric AS blevel, NULL::numeric AS leaf_blocks,
+             NULL::numeric AS distinct_keys,
+             NULL::numeric AS avg_leaf_blocks_per_key,
+             NULL::numeric AS avg_data_blocks_per_key,
+             NULL::numeric AS clustering_factor, NULL::numeric AS num_rows,
+             NULL::numeric AS sample_size, NULL::timestamp AS last_analyzed,
+             '1'::varchar AS degree, '1'::varchar AS instances,
+             (CASE WHEN ic.relkind='I' THEN 'YES' ELSE 'NO' END)::varchar AS partitioned,
+             'N'::varchar AS temporary, 'N'::varchar AS generated,
+             'N'::varchar AS secondary, 'DEFAULT'::varchar AS buffer_pool,
+             'DEFAULT'::varchar AS flash_cache, 'DEFAULT'::varchar AS cell_flash_cache,
+             'NO'::varchar AS user_stats, NULL::varchar AS duration,
+             NULL::numeric AS pct_direct_access, NULL::varchar AS ityp_owner,
+             NULL::varchar AS ityp_name, NULL::varchar AS parameters,
+             'NO'::varchar AS global_stats, NULL::varchar AS domidx_status,
+             NULL::varchar AS domidx_opstatus,
+             (CASE WHEN ix.indexprs IS NOT NULL THEN 'ENABLED' ELSE NULL END)::varchar AS funcidx_status,
+             'NO'::varchar AS join_index, 'NO'::varchar AS dropped,
+             'VISIBLE'::varchar AS visibility, 'YES'::varchar AS segment_created,
+             NULL::varchar AS orphaned_entries, 'YES'::varchar AS indexing,
+             'NO'::varchar AS auto,
+             (CASE WHEN EXISTS (SELECT 1 FROM pg_catalog.pg_constraint co WHERE co.conindid=ic.oid)
+                   THEN 'YES' ELSE 'NO' END)::varchar AS constraint_index
       FROM pg_catalog.pg_index ix
       JOIN pg_catalog.pg_class ic ON ic.oid=ix.indexrelid
       JOIN pg_catalog.pg_class tc ON tc.oid=ix.indrelid
       JOIN pg_catalog.pg_namespace tn ON tn.oid=tc.relnamespace;
+
+    -- Function-based-index expressions. Reconstructed from pg_get_indexdef where
+    -- possible is overkill for introspection; an empty view is enough to resolve.
+    CREATE OR REPLACE VIEW sys.all_ind_expressions AS
+      SELECT NULL::varchar AS index_owner, NULL::varchar AS index_name,
+             NULL::varchar AS table_owner, NULL::varchar AS table_name,
+             NULL::varchar AS column_expression, NULL::numeric AS column_position
+      WHERE false;
 
     CREATE OR REPLACE VIEW sys.all_ind_columns AS
       SELECT upper(tn.nspname)::varchar AS index_owner, upper(ic.relname)::varchar AS index_name,
@@ -1101,12 +1218,42 @@ const SYS_CATALOG_FACADE: &str = "
       JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace
       WHERE a.attnum>0 AND NOT a.attisdropped AND c.relkind IN ('r','p','v','m');
 
+    -- Real timing/event derived from pg_trigger.tgtype bits; leading columns
+    -- keep their name/order/type (CREATE OR REPLACE VIEW appends only), the rest
+    -- of the Oracle ALL_TRIGGERS surface is appended.
     CREATE OR REPLACE VIEW sys.all_triggers AS
       SELECT upper(n.nspname)::varchar AS owner, upper(t.tgname)::varchar AS trigger_name,
-             'BEFORE EACH ROW'::varchar AS trigger_type, 'INSERT'::varchar AS triggering_event,
+             (
+               (CASE WHEN (t.tgtype & 64) <> 0 THEN 'INSTEAD OF'
+                     WHEN (t.tgtype & 2)  <> 0 THEN 'BEFORE'
+                     ELSE 'AFTER' END)
+               || (CASE WHEN (t.tgtype & 1) <> 0 THEN ' EACH ROW' ELSE ' STATEMENT' END)
+             )::varchar AS trigger_type,
+             (
+               array_to_string(ARRAY[
+                 CASE WHEN (t.tgtype & 4)  <> 0 THEN 'INSERT' END,
+                 CASE WHEN (t.tgtype & 16) <> 0 THEN 'UPDATE' END,
+                 CASE WHEN (t.tgtype & 8)  <> 0 THEN 'DELETE' END
+               ]::text[], ' OR ')
+             )::varchar AS triggering_event,
              upper(n.nspname)::varchar AS table_owner, upper(c.relname)::varchar AS table_name,
-             'ENABLED'::varchar AS status, NULL::varchar AS trigger_body,
-             NULL::varchar AS description, NULL::varchar AS when_clause
+             (CASE WHEN t.tgenabled = 'D' THEN 'DISABLED' ELSE 'ENABLED' END)::varchar AS status,
+             -- trigger_body / when_clause stay NULL: pg_get_triggerdef and
+             -- pg_get_expr carry a non-default collation that a CREATE OR REPLACE
+             -- VIEW over an already-deployed facade rejects (42P16).
+             NULL::varchar AS trigger_body,
+             NULL::varchar AS description,
+             NULL::varchar AS when_clause,
+             -- appended
+             'TABLE'::varchar AS base_object_type, NULL::varchar AS column_name,
+             'REFERENCING NEW AS NEW OLD AS OLD'::varchar AS referencing_names,
+             'PL/SQL'::varchar AS action_type, 'NO'::varchar AS crossedition,
+             (CASE WHEN (t.tgtype & 2) <> 0 AND (t.tgtype & 1) =  0 THEN 'YES' ELSE 'NO' END)::varchar AS before_statement,
+             (CASE WHEN (t.tgtype & 2) <> 0 AND (t.tgtype & 1) <> 0 THEN 'YES' ELSE 'NO' END)::varchar AS before_row,
+             (CASE WHEN (t.tgtype & 66) = 0 AND (t.tgtype & 1) <> 0 THEN 'YES' ELSE 'NO' END)::varchar AS after_row,
+             (CASE WHEN (t.tgtype & 66) = 0 AND (t.tgtype & 1) =  0 THEN 'YES' ELSE 'NO' END)::varchar AS after_statement,
+             (CASE WHEN (t.tgtype & 64) <> 0 THEN 'YES' ELSE 'NO' END)::varchar AS instead_of_row,
+             'YES'::varchar AS fire_once, 'NO'::varchar AS apply_server_only
       FROM pg_catalog.pg_trigger t
       JOIN pg_catalog.pg_class c ON c.oid=t.tgrelid
       JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace
@@ -1177,7 +1324,10 @@ const SYS_CATALOG_FACADE: &str = "
              last_ddl_time, timestamp, status, temporary, generated, secondary
       FROM sys.all_objects WHERE owner = upper(current_schema());
     CREATE OR REPLACE VIEW sys.user_tables AS
-      SELECT table_name, tablespace_name, status, num_rows, temporary, nested, iot_type, partitioned
+      SELECT table_name, tablespace_name, status, num_rows, temporary, nested,
+             iot_type, partitioned,
+             cluster_name, iot_name, blocks, avg_row_len, degree, cache,
+             last_analyzed, row_movement, compression, dropped, read_only
       FROM sys.all_tables WHERE owner = upper(current_schema());
     CREATE OR REPLACE VIEW sys.user_views AS
       SELECT view_name, text_length, text, type_text, oid_text, read_only
@@ -1201,7 +1351,11 @@ const SYS_CATALOG_FACADE: &str = "
       SELECT constraint_name, table_name, column_name, position
       FROM sys.all_cons_columns WHERE owner = upper(current_schema());
     CREATE OR REPLACE VIEW sys.user_indexes AS
-      SELECT index_name, index_type, table_owner, table_name, uniqueness, status, tablespace_name
+      SELECT index_name, index_type, table_owner, table_name, uniqueness, status,
+             tablespace_name,
+             ityp_owner, ityp_name, parameters, funcidx_status, generated,
+             partitioned, temporary, visibility, constraint_index, degree,
+             last_analyzed, num_rows
       FROM sys.all_indexes WHERE owner = upper(current_schema());
     CREATE OR REPLACE VIEW sys.user_ind_columns AS
       SELECT index_name, table_name, column_name, column_position, descend
@@ -1218,7 +1372,10 @@ const SYS_CATALOG_FACADE: &str = "
       SELECT table_name, column_name, comments FROM sys.all_col_comments WHERE owner = upper(current_schema());
     CREATE OR REPLACE VIEW sys.user_triggers AS
       SELECT trigger_name, trigger_type, triggering_event, table_owner, table_name, status,
-             trigger_body, description, when_clause
+             trigger_body, description, when_clause,
+             base_object_type, column_name, referencing_names, action_type,
+             crossedition, before_statement, before_row, after_row,
+             after_statement, instead_of_row, fire_once
       FROM sys.all_triggers WHERE owner = upper(current_schema());
     CREATE OR REPLACE VIEW sys.user_procedures AS
       SELECT object_name, procedure_name, object_type, aggregate, pipelined
@@ -1233,6 +1390,334 @@ const SYS_CATALOG_FACADE: &str = "
     CREATE OR REPLACE VIEW sys.user_dependencies AS
       SELECT name, type, referenced_owner, referenced_name, referenced_type
       FROM sys.all_dependencies WHERE false;
+";
+
+/// Empty (or single-row) stand-ins for the long tail of Oracle data-dictionary
+/// views a JetBrains / SQL Developer / DBeaver Oracle introspector selects from
+/// while walking a schema. None have a meaningful PostgreSQL equivalent
+/// (partitioning, object types, LOB segments, privileges, scheduler, XML DB,
+/// editions, optimizer-stats history, …); the goal is only that a
+/// `SELECT … FROM sys.<view>` resolves instead of raising `ORA-00942` /
+/// `ORA-00904` and aborting introspection. Applied right after
+/// [`SYS_CATALOG_FACADE`], under the same version guard. Every view here is new
+/// (never an existing one) so `CREATE OR REPLACE VIEW`'s append-only rule
+/// cannot bite. Column lists follow Oracle's documented names.
+const IDE_INTROSPECTION_STUBS: &str = "
+    -- tables: variants & partitioning ------------------------------------------
+    CREATE OR REPLACE VIEW sys.all_all_tables AS SELECT * FROM sys.all_tables WHERE false;
+    CREATE OR REPLACE VIEW sys.all_external_tables AS
+      SELECT NULL::varchar AS owner, NULL::varchar AS table_name, NULL::varchar AS type_owner,
+             NULL::varchar AS type_name, NULL::varchar AS default_directory_owner,
+             NULL::varchar AS default_directory_name, NULL::varchar AS reject_limit,
+             NULL::varchar AS access_type, NULL::varchar AS access_parameters,
+             NULL::varchar AS property WHERE false;
+    CREATE OR REPLACE VIEW sys.all_external_locations AS
+      SELECT NULL::varchar AS owner, NULL::varchar AS table_name, NULL::varchar AS location,
+             NULL::varchar AS directory_owner, NULL::varchar AS directory_name WHERE false;
+    CREATE OR REPLACE VIEW sys.all_part_tables AS
+      SELECT NULL::varchar AS owner, NULL::varchar AS table_name,
+             NULL::varchar AS partitioning_type, NULL::varchar AS subpartitioning_type,
+             NULL::numeric AS partition_count, NULL::numeric AS def_subpartition_count,
+             NULL::numeric AS partitioning_key_count, NULL::varchar AS status,
+             NULL::varchar AS def_tablespace_name, NULL::varchar AS interval,
+             NULL::varchar AS autolist, NULL::varchar AS def_compression WHERE false;
+    CREATE OR REPLACE VIEW sys.all_tab_partitions AS
+      SELECT NULL::varchar AS table_owner, NULL::varchar AS table_name,
+             NULL::varchar AS composite, NULL::varchar AS partition_name,
+             NULL::numeric AS subpartition_count, NULL::varchar AS high_value,
+             NULL::numeric AS high_value_length, NULL::numeric AS partition_position,
+             NULL::varchar AS tablespace_name, NULL::numeric AS pct_free,
+             NULL::numeric AS ini_trans, NULL::varchar AS logging,
+             NULL::varchar AS compression, NULL::numeric AS num_rows,
+             NULL::numeric AS blocks, NULL::numeric AS avg_row_len,
+             NULL::numeric AS sample_size, NULL::timestamp AS last_analyzed,
+             NULL::varchar AS interval, NULL::varchar AS segment_created,
+             NULL::varchar AS indexing, NULL::varchar AS read_only WHERE false;
+    CREATE OR REPLACE VIEW sys.all_tab_subpartitions AS
+      SELECT NULL::varchar AS table_owner, NULL::varchar AS table_name,
+             NULL::varchar AS partition_name, NULL::varchar AS subpartition_name,
+             NULL::varchar AS high_value, NULL::numeric AS subpartition_position,
+             NULL::varchar AS tablespace_name, NULL::numeric AS num_rows,
+             NULL::timestamp AS last_analyzed WHERE false;
+    CREATE OR REPLACE VIEW sys.all_part_key_columns AS
+      SELECT NULL::varchar AS owner, NULL::varchar AS name, NULL::varchar AS object_type,
+             NULL::varchar AS column_name, NULL::numeric AS column_position WHERE false;
+    CREATE OR REPLACE VIEW sys.all_subpart_key_columns AS
+      SELECT NULL::varchar AS owner, NULL::varchar AS name, NULL::varchar AS object_type,
+             NULL::varchar AS column_name, NULL::numeric AS column_position WHERE false;
+    CREATE OR REPLACE VIEW sys.all_part_indexes AS
+      SELECT NULL::varchar AS owner, NULL::varchar AS index_name, NULL::varchar AS table_name,
+             NULL::varchar AS partitioning_type, NULL::numeric AS partition_count,
+             NULL::varchar AS locality, NULL::varchar AS alignment WHERE false;
+    CREATE OR REPLACE VIEW sys.all_ind_partitions AS
+      SELECT NULL::varchar AS index_owner, NULL::varchar AS index_name,
+             NULL::varchar AS partition_name, NULL::varchar AS status,
+             NULL::varchar AS tablespace_name, NULL::numeric AS partition_position,
+             NULL::varchar AS high_value, NULL::timestamp AS last_analyzed WHERE false;
+    CREATE OR REPLACE VIEW sys.all_ind_subpartitions AS
+      SELECT NULL::varchar AS index_owner, NULL::varchar AS index_name,
+             NULL::varchar AS partition_name, NULL::varchar AS subpartition_name,
+             NULL::varchar AS status, NULL::numeric AS subpartition_position WHERE false;
+    CREATE OR REPLACE VIEW sys.all_nested_tables AS
+      SELECT NULL::varchar AS owner, NULL::varchar AS table_name,
+             NULL::varchar AS table_type_owner, NULL::varchar AS table_type_name,
+             NULL::varchar AS parent_table_name, NULL::varchar AS parent_table_column WHERE false;
+
+    -- columns: identity / lobs / stats ----------------------------------------
+    CREATE OR REPLACE VIEW sys.all_tab_identity_cols AS
+      SELECT upper(n.nspname)::varchar AS owner, upper(c.relname)::varchar AS table_name,
+             upper(a.attname)::varchar AS column_name,
+             (CASE a.attidentity WHEN 'a' THEN 'ALWAYS' WHEN 'd' THEN 'BY DEFAULT'
+                                 ELSE NULL END)::varchar AS generation_type,
+             NULL::varchar AS identity_options, NULL::varchar AS sequence_name
+      FROM pg_catalog.pg_attribute a
+      JOIN pg_catalog.pg_class c ON c.oid=a.attrelid
+      JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace
+      WHERE a.attidentity IN ('a','d') AND NOT a.attisdropped;
+    CREATE OR REPLACE VIEW sys.all_lobs AS
+      SELECT NULL::varchar AS owner, NULL::varchar AS table_name, NULL::varchar AS column_name,
+             NULL::varchar AS segment_name, NULL::varchar AS tablespace_name,
+             NULL::varchar AS index_name, NULL::numeric AS chunk, NULL::varchar AS pctversion,
+             NULL::numeric AS retention, NULL::varchar AS cache, NULL::varchar AS logging,
+             NULL::varchar AS in_row, NULL::varchar AS securefile WHERE false;
+    CREATE OR REPLACE VIEW sys.all_lob_partitions AS
+      SELECT NULL::varchar AS table_owner, NULL::varchar AS table_name, NULL::varchar AS column_name,
+             NULL::varchar AS lob_name, NULL::varchar AS partition_name,
+             NULL::varchar AS lob_partition_name, NULL::varchar AS tablespace_name WHERE false;
+    CREATE OR REPLACE VIEW sys.all_varrays AS
+      SELECT NULL::varchar AS owner, NULL::varchar AS parent_table_name,
+             NULL::varchar AS parent_table_column, NULL::varchar AS type_owner,
+             NULL::varchar AS type_name, NULL::varchar AS lob_name,
+             NULL::varchar AS storage_spec, NULL::varchar AS return_type WHERE false;
+    CREATE OR REPLACE VIEW sys.all_encrypted_columns AS
+      SELECT NULL::varchar AS owner, NULL::varchar AS table_name, NULL::varchar AS column_name,
+             NULL::varchar AS encryption_alg, NULL::varchar AS salt WHERE false;
+    CREATE OR REPLACE VIEW sys.all_unused_col_tabs AS
+      SELECT NULL::varchar AS owner, NULL::varchar AS table_name, NULL::numeric AS count WHERE false;
+    CREATE OR REPLACE VIEW sys.all_tab_col_statistics AS
+      SELECT NULL::varchar AS owner, NULL::varchar AS table_name, NULL::varchar AS column_name,
+             NULL::numeric AS num_distinct, NULL::numeric AS density,
+             NULL::numeric AS num_nulls, NULL::timestamp AS last_analyzed,
+             NULL::numeric AS sample_size, NULL::varchar AS histogram WHERE false;
+    CREATE OR REPLACE VIEW sys.all_part_col_statistics AS
+      SELECT NULL::varchar AS owner, NULL::varchar AS table_name, NULL::varchar AS partition_name,
+             NULL::varchar AS column_name, NULL::numeric AS num_distinct WHERE false;
+    CREATE OR REPLACE VIEW sys.all_tab_histograms AS
+      SELECT NULL::varchar AS owner, NULL::varchar AS table_name, NULL::varchar AS column_name,
+             NULL::numeric AS endpoint_number, NULL::numeric AS endpoint_value WHERE false;
+    CREATE OR REPLACE VIEW sys.all_tab_modifications AS
+      SELECT NULL::varchar AS table_owner, NULL::varchar AS table_name, NULL::varchar AS partition_name,
+             NULL::numeric AS inserts, NULL::numeric AS updates, NULL::numeric AS deletes,
+             NULL::timestamp AS timestamp, NULL::varchar AS truncated WHERE false;
+
+    -- indexes: extras --------------------------------------------------------
+    CREATE OR REPLACE VIEW sys.all_ind_statistics AS
+      SELECT NULL::varchar AS owner, NULL::varchar AS index_name, NULL::varchar AS table_owner,
+             NULL::varchar AS table_name, NULL::numeric AS blevel, NULL::numeric AS leaf_blocks,
+             NULL::numeric AS distinct_keys, NULL::numeric AS clustering_factor,
+             NULL::timestamp AS last_analyzed WHERE false;
+    CREATE OR REPLACE VIEW sys.all_join_ind_columns AS
+      SELECT NULL::varchar AS index_owner, NULL::varchar AS index_name,
+             NULL::varchar AS inner_table_owner, NULL::varchar AS inner_table_name,
+             NULL::varchar AS inner_column_name, NULL::varchar AS outer_table_owner,
+             NULL::varchar AS outer_table_name, NULL::varchar AS outer_column_name WHERE false;
+
+    -- triggers: extras -----------------------------------------------------
+    CREATE OR REPLACE VIEW sys.all_trigger_cols AS
+      SELECT NULL::varchar AS trigger_owner, NULL::varchar AS trigger_name,
+             NULL::varchar AS table_owner, NULL::varchar AS table_name,
+             NULL::varchar AS column_name, NULL::varchar AS column_list,
+             NULL::varchar AS column_usage WHERE false;
+    CREATE OR REPLACE VIEW sys.all_trigger_ordering AS
+      SELECT NULL::varchar AS trigger_owner, NULL::varchar AS trigger_name,
+             NULL::varchar AS referenced_trigger_owner, NULL::varchar AS referenced_trigger_name,
+             NULL::varchar AS ordering_type WHERE false;
+
+    -- views: extras ------------------------------------------------------
+    CREATE OR REPLACE VIEW sys.all_updatable_columns AS
+      SELECT NULL::varchar AS owner, NULL::varchar AS table_name, NULL::varchar AS column_name,
+             NULL::varchar AS updatable, NULL::varchar AS insertable, NULL::varchar AS deletable WHERE false;
+    CREATE OR REPLACE VIEW sys.all_editioning_views AS
+      SELECT NULL::varchar AS owner, NULL::varchar AS view_name, NULL::varchar AS table_owner,
+             NULL::varchar AS table_name, NULL::varchar AS owner_id WHERE false;
+
+    -- materialized views: refresh metadata --------------------------------
+    CREATE OR REPLACE VIEW sys.all_registered_mviews AS
+      SELECT NULL::varchar AS owner, NULL::varchar AS name, NULL::varchar AS mview_site,
+             NULL::varchar AS mview_owner, NULL::varchar AS mview_name,
+             NULL::varchar AS can_use_log, NULL::varchar AS updatable, NULL::varchar AS refresh_method WHERE false;
+    CREATE OR REPLACE VIEW sys.all_base_table_mviews AS
+      SELECT NULL::varchar AS owner, NULL::varchar AS master, NULL::varchar AS mview_last_refresh_time,
+             NULL::numeric AS mview_id WHERE false;
+    CREATE OR REPLACE VIEW sys.all_mview_analysis AS
+      SELECT NULL::varchar AS owner, NULL::varchar AS mview_name, NULL::varchar AS last_refresh_date,
+             NULL::varchar AS query, NULL::numeric AS query_len WHERE false;
+    CREATE OR REPLACE VIEW sys.all_mview_detail_relations AS
+      SELECT NULL::varchar AS owner, NULL::varchar AS mview_name, NULL::varchar AS detailobj_owner,
+             NULL::varchar AS detailobj_name, NULL::varchar AS detailobj_type WHERE false;
+    CREATE OR REPLACE VIEW sys.all_refresh AS
+      SELECT NULL::varchar AS rowner, NULL::varchar AS rname, NULL::numeric AS refgroup,
+             NULL::varchar AS implicit_destroy, NULL::varchar AS broken WHERE false;
+    CREATE OR REPLACE VIEW sys.all_refresh_children AS
+      SELECT NULL::varchar AS owner, NULL::varchar AS name, NULL::varchar AS type,
+             NULL::varchar AS rowner, NULL::varchar AS rname WHERE false;
+    CREATE OR REPLACE VIEW sys.all_summaries AS
+      SELECT NULL::varchar AS owner, NULL::varchar AS summary_name, NULL::varchar AS last_refresh_date WHERE false;
+
+    -- object types --------------------------------------------------------
+    CREATE OR REPLACE VIEW sys.all_type_attrs AS
+      SELECT NULL::varchar AS owner, NULL::varchar AS type_name, NULL::varchar AS attr_name,
+             NULL::varchar AS attr_type_mod, NULL::varchar AS attr_type_owner,
+             NULL::varchar AS attr_type_name, NULL::numeric AS length, NULL::numeric AS precision,
+             NULL::numeric AS scale, NULL::varchar AS character_set_name,
+             NULL::numeric AS attr_no, NULL::varchar AS inherited WHERE false;
+    CREATE OR REPLACE VIEW sys.all_type_methods AS
+      SELECT NULL::varchar AS owner, NULL::varchar AS type_name, NULL::varchar AS method_name,
+             NULL::numeric AS method_no, NULL::varchar AS method_type, NULL::numeric AS parameters,
+             NULL::numeric AS results, NULL::varchar AS final, NULL::varchar AS instantiable,
+             NULL::varchar AS inherited WHERE false;
+    CREATE OR REPLACE VIEW sys.all_method_params AS
+      SELECT NULL::varchar AS owner, NULL::varchar AS type_name, NULL::varchar AS method_name,
+             NULL::numeric AS method_no, NULL::varchar AS param_name, NULL::numeric AS param_no,
+             NULL::varchar AS param_mode, NULL::varchar AS param_type_owner, NULL::varchar AS param_type_name WHERE false;
+    CREATE OR REPLACE VIEW sys.all_method_results AS
+      SELECT NULL::varchar AS owner, NULL::varchar AS type_name, NULL::varchar AS method_name,
+             NULL::numeric AS method_no, NULL::varchar AS result_type_owner, NULL::varchar AS result_type_name WHERE false;
+    CREATE OR REPLACE VIEW sys.all_coll_types AS
+      SELECT NULL::varchar AS owner, NULL::varchar AS type_name, NULL::varchar AS coll_type,
+             NULL::numeric AS upper_bound, NULL::varchar AS elem_type_owner,
+             NULL::varchar AS elem_type_name, NULL::numeric AS length, NULL::numeric AS precision,
+             NULL::numeric AS scale, NULL::varchar AS elem_storage, NULL::varchar AS nulls_stored WHERE false;
+
+    -- code / source -----------------------------------------------------
+    CREATE OR REPLACE VIEW sys.all_identifiers AS
+      SELECT NULL::varchar AS owner, NULL::varchar AS name, NULL::varchar AS signature,
+             NULL::varchar AS type, NULL::varchar AS object_name, NULL::varchar AS object_type,
+             NULL::varchar AS usage, NULL::numeric AS usage_id, NULL::numeric AS line, NULL::numeric AS col WHERE false;
+    CREATE OR REPLACE VIEW sys.all_plsql_object_settings AS
+      SELECT NULL::varchar AS owner, NULL::varchar AS name, NULL::varchar AS type,
+             NULL::varchar AS plsql_optimize_level, NULL::varchar AS plsql_code_type,
+             NULL::varchar AS plsql_debug, NULL::varchar AS plsql_warnings, NULL::varchar AS nls_length_semantics WHERE false;
+    CREATE OR REPLACE VIEW sys.all_stored_settings AS
+      SELECT NULL::varchar AS owner, NULL::varchar AS object_name, NULL::bigint AS object_id,
+             NULL::varchar AS param_name, NULL::varchar AS param_value WHERE false;
+
+    -- privileges --------------------------------------------------------
+    CREATE OR REPLACE VIEW sys.all_tab_privs AS
+      SELECT NULL::varchar AS grantor, NULL::varchar AS grantee, NULL::varchar AS table_schema,
+             NULL::varchar AS table_name, NULL::varchar AS privilege, NULL::varchar AS grantable,
+             NULL::varchar AS hierarchy, NULL::varchar AS common, NULL::varchar AS type,
+             NULL::varchar AS inherited WHERE false;
+    CREATE OR REPLACE VIEW sys.all_tab_privs_made AS
+      SELECT NULL::varchar AS grantee, NULL::varchar AS owner, NULL::varchar AS table_name,
+             NULL::varchar AS grantor, NULL::varchar AS privilege, NULL::varchar AS grantable WHERE false;
+    CREATE OR REPLACE VIEW sys.all_tab_privs_recd AS
+      SELECT NULL::varchar AS owner, NULL::varchar AS table_name, NULL::varchar AS grantor,
+             NULL::varchar AS grantee, NULL::varchar AS privilege, NULL::varchar AS grantable WHERE false;
+    CREATE OR REPLACE VIEW sys.all_col_privs AS
+      SELECT NULL::varchar AS grantor, NULL::varchar AS grantee, NULL::varchar AS table_schema,
+             NULL::varchar AS table_name, NULL::varchar AS column_name, NULL::varchar AS privilege,
+             NULL::varchar AS grantable WHERE false;
+    CREATE OR REPLACE VIEW sys.all_sys_privs AS
+      SELECT NULL::varchar AS grantee, NULL::varchar AS privilege, NULL::varchar AS admin_option,
+             NULL::varchar AS common, NULL::varchar AS inherited WHERE false;
+    CREATE OR REPLACE VIEW sys.all_role_privs AS
+      SELECT NULL::varchar AS grantee, NULL::varchar AS granted_role, NULL::varchar AS admin_option,
+             NULL::varchar AS default_role, NULL::varchar AS common WHERE false;
+
+    -- storage-ish ------------------------------------------------------
+    CREATE OR REPLACE VIEW sys.all_tablespaces AS
+      SELECT 'USERS'::varchar AS tablespace_name, NULL::numeric AS block_size,
+             NULL::numeric AS initial_extent, NULL::numeric AS next_extent,
+             'ONLINE'::varchar AS status, 'PERMANENT'::varchar AS contents,
+             'LOGGING'::varchar AS logging WHERE false;
+    CREATE OR REPLACE VIEW sys.all_segments AS
+      SELECT NULL::varchar AS owner, NULL::varchar AS segment_name, NULL::varchar AS segment_type,
+             NULL::varchar AS tablespace_name, NULL::numeric AS bytes, NULL::numeric AS blocks WHERE false;
+    CREATE OR REPLACE VIEW sys.all_objects_ae AS SELECT * FROM sys.all_objects WHERE false;
+
+    -- server-side programs / schedulers / queues --------------------------
+    CREATE OR REPLACE VIEW sys.all_scheduler_programs AS
+      SELECT NULL::varchar AS owner, NULL::varchar AS program_name, NULL::varchar AS program_type,
+             NULL::varchar AS program_action, NULL::numeric AS number_of_arguments,
+             NULL::varchar AS enabled, NULL::varchar AS comments WHERE false;
+    CREATE OR REPLACE VIEW sys.all_scheduler_schedules AS
+      SELECT NULL::varchar AS owner, NULL::varchar AS schedule_name, NULL::varchar AS schedule_type,
+             NULL::varchar AS start_date, NULL::varchar AS repeat_interval, NULL::varchar AS comments WHERE false;
+    CREATE OR REPLACE VIEW sys.all_jobs AS
+      SELECT NULL::numeric AS job, NULL::varchar AS log_user, NULL::varchar AS schema_user,
+             NULL::varchar AS what, NULL::varchar AS broken, NULL::varchar AS interval WHERE false;
+    CREATE OR REPLACE VIEW sys.all_queue_tables AS
+      SELECT NULL::varchar AS owner, NULL::varchar AS queue_table, NULL::varchar AS type,
+             NULL::varchar AS object_type, NULL::varchar AS sort_order, NULL::varchar AS recipients,
+             NULL::varchar AS message_grouping, NULL::varchar AS compatible WHERE false;
+
+    -- schema objects with no PG analogue -------------------------------
+    CREATE OR REPLACE VIEW sys.all_directories AS
+      SELECT NULL::varchar AS owner, NULL::varchar AS directory_name, NULL::varchar AS directory_path,
+             NULL::varchar AS origin_con_id WHERE false;
+    CREATE OR REPLACE VIEW sys.all_libraries AS
+      SELECT NULL::varchar AS owner, NULL::varchar AS library_name, NULL::varchar AS file_spec,
+             NULL::varchar AS dynamic, NULL::varchar AS status WHERE false;
+    CREATE OR REPLACE VIEW sys.all_java_classes AS
+      SELECT NULL::varchar AS owner, NULL::varchar AS name, NULL::varchar AS kind,
+             NULL::varchar AS accessibility, NULL::varchar AS is_inner, NULL::varchar AS source WHERE false;
+    CREATE OR REPLACE VIEW sys.all_clusters AS
+      SELECT NULL::varchar AS owner, NULL::varchar AS cluster_name, NULL::varchar AS tablespace_name,
+             NULL::varchar AS cluster_type, NULL::numeric AS hashkeys WHERE false;
+    CREATE OR REPLACE VIEW sys.all_cluster_hash_expressions AS
+      SELECT NULL::varchar AS owner, NULL::varchar AS cluster_name, NULL::varchar AS hash_expression WHERE false;
+    CREATE OR REPLACE VIEW sys.all_operators AS
+      SELECT NULL::varchar AS owner, NULL::varchar AS operator_name, NULL::numeric AS number_of_binds WHERE false;
+    CREATE OR REPLACE VIEW sys.all_indextypes AS
+      SELECT NULL::varchar AS owner, NULL::varchar AS indextype_name, NULL::varchar AS implementation_owner,
+             NULL::varchar AS implementation_name, NULL::numeric AS number_of_operators, NULL::varchar AS status WHERE false;
+    CREATE OR REPLACE VIEW sys.all_context AS
+      SELECT NULL::varchar AS namespace, NULL::varchar AS schema, NULL::varchar AS package,
+             NULL::varchar AS type, NULL::varchar AS origin_con_id WHERE false;
+    CREATE OR REPLACE VIEW sys.all_policies AS
+      SELECT NULL::varchar AS object_owner, NULL::varchar AS object_name, NULL::varchar AS policy_group,
+             NULL::varchar AS policy_name, NULL::varchar AS pf_owner, NULL::varchar AS package,
+             NULL::varchar AS function, NULL::varchar AS enable WHERE false;
+    CREATE OR REPLACE VIEW sys.all_dimensions AS
+      SELECT NULL::varchar AS owner, NULL::varchar AS dimension_name, NULL::varchar AS invalid,
+             NULL::numeric AS revision WHERE false;
+    CREATE OR REPLACE VIEW sys.all_xml_schemas AS
+      SELECT NULL::varchar AS owner, NULL::varchar AS schema_url, NULL::varchar AS local,
+             NULL::varchar AS schema, NULL::bigint AS schema_id, NULL::varchar AS qual_schema_url WHERE false;
+    CREATE OR REPLACE VIEW sys.all_xml_tables AS
+      SELECT NULL::varchar AS owner, NULL::varchar AS table_name, NULL::varchar AS xmlschema,
+             NULL::varchar AS schema_owner, NULL::varchar AS element_name, NULL::varchar AS storage_type WHERE false;
+    CREATE OR REPLACE VIEW sys.all_editions AS
+      SELECT NULL::varchar AS edition_name, NULL::varchar AS parent_edition_name WHERE false;
+
+    -- version / NLS / DB props ---------------------------------------------
+    CREATE OR REPLACE VIEW sys.product_component_version AS
+      SELECT 'PgSaci'::varchar AS product,
+             (current_setting('server_version_num')::int / 10000 || '.0.0.0.0')::varchar AS version,
+             (current_setting('server_version_num')::int / 10000 || '.0.0.0.0')::varchar AS version_full,
+             'Production'::varchar AS status;
+    CREATE OR REPLACE VIEW sys.nls_database_parameters AS
+      SELECT * FROM (VALUES
+        ('NLS_CHARACTERSET'::varchar, 'AL32UTF8'::varchar),
+        ('NLS_NCHAR_CHARACTERSET', 'AL16UTF16'),
+        ('NLS_LANGUAGE', 'AMERICAN'), ('NLS_TERRITORY', 'AMERICA'),
+        ('NLS_DATE_FORMAT', 'DD-MON-RR'),
+        ('NLS_TIMESTAMP_FORMAT', 'DD-MON-RR HH24.MI.SSXFF'),
+        ('NLS_NUMERIC_CHARACTERS', '.,'), ('NLS_SORT', 'BINARY'),
+        ('NLS_COMP', 'BINARY'), ('NLS_CALENDAR', 'GREGORIAN'),
+        ('NLS_RDBMS_VERSION', '19.0.0.0.0')
+      ) AS t(parameter, value);
+    CREATE OR REPLACE VIEW sys.database_properties AS
+      SELECT * FROM (VALUES
+        ('DEFAULT_TEMP_TABLESPACE'::varchar, 'TEMP'::varchar, NULL::varchar),
+        ('DEFAULT_PERMANENT_TABLESPACE', 'USERS', NULL),
+        ('DEFAULT_EDITION', 'ORA$BASE', NULL),
+        ('NLS_CHARACTERSET', 'AL32UTF8', NULL),
+        ('DICT.BASE', '2', NULL)
+      ) AS t(property_name, property_value, description);
+    CREATE OR REPLACE VIEW sys.global_name AS
+      SELECT (upper(current_database()) || '')::varchar AS global_name;
 ";
 
 /// `DBMS_METADATA.GET_DDL('TABLE', name, schema)` — IDEs offer a "copy original
