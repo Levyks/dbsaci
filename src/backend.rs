@@ -177,10 +177,7 @@ impl PostgresBackend {
         // connection still works — unqualified objects then resolve via the rest
         // of the search_path (`oracle`, `public`), exactly as before this schema
         // existed.
-        let ensure_schema = format!(
-            "CREATE SCHEMA IF NOT EXISTS {}",
-            quote_identifier(&pg_user)
-        );
+        let ensure_schema = format!("CREATE SCHEMA IF NOT EXISTS {}", quote_identifier(&pg_user));
         if let Err(e) = client.execute(&ensure_schema, &[]).await {
             tracing::warn!(
                 "could not ensure schema {:?} (objects will resolve via search_path; \
