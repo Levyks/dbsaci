@@ -8,7 +8,7 @@ extension available, and a PostgreSQL login role for the proxy to use. Below,
 "the client" is any supported Oracle driver.
 
 :::note[Getting the image / binary]
-`docker pull levyks/pgsaci:0.0.4` — a **~10 MB** image (a static musl binary on
+`docker pull levyks/pgsaci:0.0.5` — a **~10 MB** image (a static musl binary on
 `scratch`; pgSaci has no C dependencies). It is also buildable from the repo's
 [`Dockerfile`](https://github.com/Levyks/pgsaci/blob/main/Dockerfile), and
 [building from source](#option-d--build-from-source) is a single `cargo build`.
@@ -39,7 +39,7 @@ services:
     ports: ["5432:5432"]
 
   pgsaci:
-    image: levyks/pgsaci:0.0.4
+    image: levyks/pgsaci:0.0.5
     depends_on: [postgres]
     environment:
       PGSACI_LISTEN: 0.0.0.0:1521
@@ -73,7 +73,7 @@ docker run --rm -p 1521:1521 -p 9500:9500 \
   -e PGSACI_PG_PASSWORD=pgpw \
   -e PGSACI_ORACLE_VERSION=19 \
   -e PGSACI_HEALTH_ADDR=0.0.0.0:9500 \
-  levyks/pgsaci:0.0.4
+  levyks/pgsaci:0.0.5
 ```
 
 Your PostgreSQL must have `orafce` installed in the target database
@@ -168,6 +168,25 @@ Sources layer **file &lt; `PGSACI_PG_USERS` &lt; `--pg-user`**. The username is
 matched case-insensitively; a user with no match and no fallback is rejected with
 `ORA-01017`. The matched password drives both the login challenge and the backend
 PostgreSQL connection.
+
+## Schemas
+
+pgSaci follows Oracle's **schema == user** model. On connect it ensures a
+PostgreSQL schema named after the user exists (`CREATE SCHEMA IF NOT EXISTS
+"<user>"`) and sets `search_path` to `"<user>", oracle, public`:
+
+- unqualified `CREATE TABLE` / `SELECT` resolve in the user's own schema first;
+- other users' schemas are reached by qualifying (`SELECT * FROM hr.employees`,
+  with the usual `GRANT USAGE ON SCHEMA` / `GRANT SELECT`), exactly as in
+  Oracle;
+- `ALTER SESSION SET CURRENT_SCHEMA = hr` redirects unqualified resolution;
+- **`public`** is the shared fallback — objects there resolve unqualified for
+  every user, and are always reachable explicitly as `public.<name>`. Point
+  pgSaci at an existing PostgreSQL database whose tables live in `public` and
+  they work unchanged.
+
+If the backend role lacks `CREATE` on the database the connection still
+succeeds; objects then resolve via `oracle` / `public` and a warning is logged.
 
 ## Which Oracle version to claim
 

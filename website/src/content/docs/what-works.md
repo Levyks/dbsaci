@@ -46,7 +46,18 @@ constraints, indexes, sequences, comments, triggers, users; `V$VERSION`;
 
 An IDE schema browser — DataGrip / IntelliJ was the reference — introspects the
 tree end to end against these, including `DBMS_METADATA.GET_DDL` for the "copy
-DDL" action (rendered as PostgreSQL DDL).
+DDL" action (rendered as PostgreSQL DDL). Objects appear under the connected
+user's node: pgSaci gives each user a PostgreSQL schema of its own name
+(Oracle's "schema == user"), and `ALL_*` / `USER_*` report honest owners
+against it.
+
+## Schemas
+
+Each user owns a schema of its own name; unqualified names resolve there first,
+then in `public` (the shared fallback, also reachable as `public.<name>`).
+Cross-schema access is a qualified name plus the usual grants
+(`SELECT * FROM hr.employees`); `ALTER SESSION SET CURRENT_SCHEMA` redirects
+unqualified resolution.
 
 ## Transactions
 

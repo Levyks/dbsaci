@@ -70,8 +70,8 @@ cargo run --bin pgsaci
 
 Then connect any Oracle client to `//host:1521/FREEPDB1`.
 
-Or run it from a container (`levyks/pgsaci:0.0.4`, ~10 MB) —
-`docker run -p 1521:1521 -e PGSACI_PG_HOST=… levyks/pgsaci:0.0.4`. See the
+Or run it from a container (`levyks/pgsaci:0.0.5`, ~10 MB) —
+`docker run -p 1521:1521 -e PGSACI_PG_HOST=… levyks/pgsaci:0.0.5`. See the
 [docs](https://levyks.github.io/pgsaci/getting-started/) for a full
 docker-compose.
 
@@ -101,6 +101,17 @@ Sources layer file &lt; `PGSACI_PG_USERS` &lt; `--pg-user`. The username is matc
 case-insensitively; a user with no match and no fallback is rejected with
 ORA-01017. The matched password drives both the login challenge and the backend
 PostgreSQL connection.
+
+### Schemas
+
+Oracle's *schema == user*: on connect PgSaci ensures a PostgreSQL schema named
+after the user and sets `search_path` to `"<user>", oracle, public`. Unqualified
+names resolve in the user's own schema first, then in `public` (the shared
+fallback, also reachable as `public.<name>` — so an existing PostgreSQL database
+whose tables live in `public` works unchanged). Other schemas are reached by
+qualifying (`SELECT * FROM hr.emp`, with `GRANT USAGE`/`SELECT`) or
+`ALTER SESSION SET CURRENT_SCHEMA`. If the backend role can't `CREATE` a schema
+the connection still works and logs a warning.
 
 ## What works
 
@@ -198,7 +209,7 @@ One sample run — 2 000 iterations/op (30 for the heavy ops), single connection
 Everything runs in Docker on one bridge network — the client, Oracle XE,
 PostgreSQL and pgSaci — so every hop is a container veth with no host
 port-proxy in the path. pgSaci runs from its published image
-(`levyks/pgsaci:0.0.4`, a static musl build). Both database containers get
+(`levyks/pgsaci:0.0.5`, a static musl build). Both database containers get
 **2 CPU / 2.5 GiB**: Oracle XE spends its full 2 GiB licence (`INIT_SGA_SIZE`
 1536M + `INIT_PGA_SIZE` 512M), PostgreSQL is **tuned to that envelope**
 (`shared_buffers` 768 MB, 64 MB `work_mem`, parallel workers, `jit=off`). A
