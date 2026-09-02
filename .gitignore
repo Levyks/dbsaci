@@ -4,3 +4,6 @@
 /clients/java/*.class
 /clients/java/lib/
 /kimi-session-*/
+
+# JetBrains IDE
+.idea/
