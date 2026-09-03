@@ -1145,23 +1145,24 @@ async fn handle_connection(stream: TcpStream, session_id: u64, config: Config) -
                                 continue;
                             }
                         };
-                        let pg_sql = match crate::translate::oracle_to_postgres(&bound.sql) {
-                            Ok(s) => s,
-                            Err(e) => {
-                                write_error_response(
-                                    &mut tns,
-                                    oci_dialect,
-                                    response_completion,
-                                    newer_describe_framing,
-                                    900,
-                                    &e.to_string(),
-                                    0,
-                                    req_seq,
-                                )
-                                .await?;
-                                continue;
-                            }
-                        };
+                        let pg_sql =
+                            match crate::translate::oracle_to_backend(&bound.sql, config.backend) {
+                                Ok(s) => s,
+                                Err(e) => {
+                                    write_error_response(
+                                        &mut tns,
+                                        oci_dialect,
+                                        response_completion,
+                                        newer_describe_framing,
+                                        900,
+                                        &e.to_string(),
+                                        0,
+                                        req_seq,
+                                    )
+                                    .await?;
+                                    continue;
+                                }
+                            };
                         log_sql_translation(&bound.sql, &pg_sql);
                         let input_bind_count = execute
                             .bind_types
@@ -1222,23 +1223,24 @@ async fn handle_connection(stream: TcpStream, session_id: u64, config: Config) -
                     debug!(bind_count = execute.binds.len(), "executing statement");
 
                     // Translate Oracle-specific structural syntax before executing it.
-                    let pg_sql = match crate::translate::oracle_to_postgres(&bound.sql) {
-                        Ok(sql) => sql,
-                        Err(e) => {
-                            write_error_response(
-                                &mut tns,
-                                oci_dialect,
-                                response_completion,
-                                newer_describe_framing,
-                                900,
-                                &e.to_string(),
-                                0,
-                                req_seq,
-                            )
-                            .await?;
-                            continue;
-                        }
-                    };
+                    let pg_sql =
+                        match crate::translate::oracle_to_backend(&bound.sql, config.backend) {
+                            Ok(sql) => sql,
+                            Err(e) => {
+                                write_error_response(
+                                    &mut tns,
+                                    oci_dialect,
+                                    response_completion,
+                                    newer_describe_framing,
+                                    900,
+                                    &e.to_string(),
+                                    0,
+                                    req_seq,
+                                )
+                                .await?;
+                                continue;
+                            }
+                        };
                     log_sql_translation(&bound.sql, &pg_sql);
                     if std::env::var("PGSACI_OCI_DEBUG").is_ok() {
                         eprintln!(

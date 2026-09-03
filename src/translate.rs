@@ -14,6 +14,21 @@ use sqlparser::parser::Parser;
 
 use crate::error::{Error, Result};
 
+/// Translate Oracle SQL for the selected database engine.
+pub fn oracle_to_backend(sql: &str, backend: crate::backend::BackendKind) -> Result<String> {
+    match backend {
+        crate::backend::BackendKind::Postgres => oracle_to_postgres(sql),
+        crate::backend::BackendKind::MariaDb => oracle_to_mariadb(sql),
+    }
+}
+
+/// MariaDB's `SQL_MODE=ORACLE` owns most Oracle syntax and PL/SQL parsing.
+/// Keep this deliberately conservative: MariaDB-specific rewrites should be
+/// added only when a corpus case demonstrates that Oracle mode needs help.
+pub fn oracle_to_mariadb(sql: &str) -> Result<String> {
+    Ok(sql.trim().trim_end_matches(';').to_string())
+}
+
 /// Parse one Oracle statement and render its PostgreSQL-compatible form.
 pub fn oracle_to_postgres(sql: &str) -> Result<String> {
     // Lexer-level rewrites first, so the AST parser never sees Oracle-only
