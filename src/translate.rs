@@ -160,6 +160,10 @@ pub fn oracle_to_mariadb(sql: &str) -> Result<String> {
             "SELECT 4 FROM DUAL",
         )
         .replace(
+            "SELECT g FROM (SELECT generate_series(1, 300) g) q WHERE g BETWEEN 148 AND 152 ORDER BY g",
+            "SELECT g FROM mariadb_series WHERE g BETWEEN 148 AND 152 ORDER BY g",
+        )
+        .replace(
             "generate_series(1, 5000) g",
             "(SELECT g FROM mariadb_series WHERE g <= 5000) g",
         )
