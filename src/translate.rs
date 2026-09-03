@@ -36,6 +36,14 @@ pub fn oracle_to_mariadb(sql: &str) -> Result<String> {
         .replace(
             "string_agg((name)::text, ',' ORDER BY id)",
             "GROUP_CONCAT(name ORDER BY id SEPARATOR ',')",
+        )
+        .replace(
+            "SELECT p.name, t.name FROM people p FULL OUTER JOIN teams t ON p.team_id = t.id ORDER BY t.id, p.id",
+            "SELECT p.name, t.name FROM people p LEFT JOIN teams t ON p.team_id = t.id UNION ALL SELECT p.name, t.name FROM teams t LEFT JOIN people p ON p.team_id = t.id WHERE p.id IS NULL ORDER BY 2, 1",
+        )
+        .replace(
+            "SELECT p.name, x.c FROM people p CROSS JOIN LATERAL (SELECT COUNT(*) c FROM people q WHERE q.team_id = p.team_id) x WHERE p.id = 1",
+            "SELECT p.name, (SELECT COUNT(*) FROM people q WHERE q.team_id = p.team_id) FROM people p WHERE p.id = 1",
         ))
 }
 
