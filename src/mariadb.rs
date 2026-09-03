@@ -131,7 +131,16 @@ impl OracleBackend for Arc<MariaDbBackend> {
             .iter()
             .map(|row| {
                 (0..row.len())
-                    .map(|i| row.as_ref(i).map(encode_value).transpose())
+                    .map(|i| {
+                        row.as_ref(i)
+                            .map(|value| {
+                                encode_value_for_column(
+                                    value,
+                                    is_numeric_column(row.columns_ref()[i].column_type()),
+                                )
+                            })
+                            .transpose()
+                    })
                     .collect()
             })
             .collect::<Result<Vec<_>>>()?;
@@ -273,6 +282,33 @@ fn encode_value(value: &Value) -> Result<Vec<u8>> {
             s.saturating_add(1),
         ]),
     }
+}
+
+fn encode_value_for_column(value: &Value, number: bool) -> Result<Vec<u8>> {
+    if number {
+        return match value {
+            Value::Bytes(bytes) => encode_oracle_number_decimal(
+                std::str::from_utf8(bytes)
+                    .map_err(|e| Error::DataConversionError(e.to_string()))?,
+            ),
+            _ => encode_value(value),
+        };
+    }
+    encode_value(value)
+}
+
+fn is_numeric_column(kind: mysql_async::consts::ColumnType) -> bool {
+    matches!(
+        kind,
+        mysql_async::consts::ColumnType::MYSQL_TYPE_FLOAT
+            | mysql_async::consts::ColumnType::MYSQL_TYPE_DOUBLE
+            | mysql_async::consts::ColumnType::MYSQL_TYPE_DECIMAL
+            | mysql_async::consts::ColumnType::MYSQL_TYPE_NEWDECIMAL
+            | mysql_async::consts::ColumnType::MYSQL_TYPE_LONGLONG
+            | mysql_async::consts::ColumnType::MYSQL_TYPE_LONG
+            | mysql_async::consts::ColumnType::MYSQL_TYPE_SHORT
+            | mysql_async::consts::ColumnType::MYSQL_TYPE_TINY
+    )
 }
 
 /// Percent-encode the small set of URL-significant bytes accepted in
