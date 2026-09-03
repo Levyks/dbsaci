@@ -341,6 +341,10 @@ impl TestBackend {
             .query_drop("GRANT ALL PRIVILEGES ON postgres.* TO 'corpus'@'%'")
             .await
             .map_err(|e| format!("grant MariaDB corpus user: {e}"))?;
+        admin
+            .query_drop("GRANT ALL PRIVILEGES ON *.* TO 'corpus'@'%' WITH GRANT OPTION")
+            .await
+            .map_err(|e| format!("grant MariaDB cross-schema access: {e}"))?;
         for statement in MARIADB_BASELINE_SQL
             .split(';')
             .map(str::trim)
@@ -382,6 +386,10 @@ impl TestBackend {
                     .replace("generate_series(1, 300) g", "(SELECT g FROM mariadb_series WHERE g <= 300) g")
                     .replace("generate_series(1, 400000) g", "(SELECT g FROM mariadb_series WHERE g <= 400000) g")
                     .replace("generate_series(1, 1000000) g", "(SELECT g FROM mariadb_series WHERE g <= 1000000) g");
+                let statement = statement.replace(
+                    "public.corpus_shared_ref (k text PRIMARY KEY",
+                    "public.corpus_shared_ref (k varchar(255) PRIMARY KEY",
+                );
                 let statement = if let Some(rest) = statement.strip_prefix("COMMENT ON TABLE ") {
                     if let Some((table, comment)) = rest.split_once(" IS ") {
                         format!("ALTER TABLE {table} COMMENT = {comment}")
