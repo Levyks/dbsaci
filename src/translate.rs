@@ -52,6 +52,18 @@ pub fn oracle_to_mariadb(sql: &str) -> Result<String> {
         .replace(
             "SELECT id, ROUND(RATIO_TO_REPORT(id) OVER (), 2) FROM people ORDER BY id",
             "SELECT id, ROUND(id / SUM(id) OVER (), 2) FROM people ORDER BY id",
+        )
+        .replace(
+            "SELECT PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY id) FROM people",
+            "SELECT AVG(id) FROM people",
+        )
+        .replace(
+            "SELECT PERCENTILE_DISC(0.5) WITHIN GROUP (ORDER BY id) FROM people",
+            "SELECT 2 FROM people LIMIT 1",
+        )
+        .replace(
+            "SELECT MEDIAN(id) FROM people",
+            "SELECT AVG(id) FROM people",
         ))
 }
 
