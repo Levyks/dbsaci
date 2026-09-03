@@ -31,6 +31,10 @@ pub fn oracle_to_mariadb(sql: &str) -> Result<String> {
         .replace("sys_context('USERENV', 'CURRENT_SCHEMA')", "'CORPUS'")
         .replace("SYS_CONTEXT('USERENV', 'CURRENT_SCHEMA')", "'CORPUS'")
         .replace("public.corpus_shared_ref", "corpus_shared_ref")
+        .replace(
+            "ALTER SESSION SET CURRENT_SCHEMA = corpus_hr",
+            "USE corpus_hr",
+        )
         .replace("AS REAL", "AS DOUBLE")
         .replace("AS SMALLINT", "AS SIGNED")
         .replace("AS BIGINT", "AS SIGNED")
