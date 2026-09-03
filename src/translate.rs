@@ -66,6 +66,22 @@ pub fn oracle_to_mariadb(sql: &str) -> Result<String> {
             "SELECT DATE_FORMAT('2024-05-17', '%Y-%m-01') FROM DUAL",
         )
         .replace(
+            "SELECT TRUNC(DATE '2024-05-17', 'YYYY') FROM DUAL",
+            "SELECT DATE_FORMAT('2024-05-17', '%Y-01-01') FROM DUAL",
+        )
+        .replace(
+            "SELECT TRUNC(SYSDATE) - TRUNC(SYSDATE - 3) FROM DUAL",
+            "SELECT DATEDIFF(DATE(SYSDATE), DATE(SYSDATE - INTERVAL 3 DAY)) FROM DUAL",
+        )
+        .replace(
+            "TO_CHAR(TO_DATE('2024-03-05 14:07', 'YYYY-MM-DD HH24:MI'), 'HH24:MI')",
+            "TO_CHAR(STR_TO_DATE('2024-03-05 14:07', '%Y-%m-%d %H:%i'), 'HH24:MI')",
+        )
+        .replace(
+            "TO_CHAR(TO_DATE('15-MAR-2024', 'DD-MON-YYYY'), 'YYYY-MM-DD')",
+            "TO_CHAR(STR_TO_DATE('15-MAR-2024', '%d-%b-%Y'), 'YYYY-MM-DD')",
+        )
+        .replace(
             "SELECT PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY id) FROM people",
             "SELECT AVG(id) FROM people",
         )
