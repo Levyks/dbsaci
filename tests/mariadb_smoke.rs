@@ -108,6 +108,17 @@ async fn mariadb_oracle_mode_executes_basic_queries_and_binds() {
         .expect("MariaDB NUMBER cast rewrite");
     assert_eq!(result.rows.len(), 1);
 
+    for (sql, label) in [
+        ("SELECT NVL(NULL, 7) FROM DUAL", "NVL"),
+        ("SELECT DECODE(1, 1, 'yes', 'no') FROM DUAL", "DECODE"),
+        ("SELECT COUNT(*) FROM DUAL", "aggregate"),
+    ] {
+        oracle
+            .query(sql, &[])
+            .await
+            .unwrap_or_else(|e| panic!("{label} query: {e}"));
+    }
+
     oracle
         .execute(
             "CREATE TABLE mariadb_smoke_items (id INT PRIMARY KEY, label VARCHAR(32))",
@@ -134,6 +145,12 @@ async fn mariadb_oracle_mode_executes_basic_queries_and_binds() {
         .expect("query inserted row");
     assert_eq!(result.rows.len(), 1);
     oracle.execute("ROLLBACK", &[]).await.expect("rollback");
+
+    let result = oracle
+        .query("SELECT COUNT(*) FROM mariadb_smoke_items", &[])
+        .await
+        .expect("rolled-back table query");
+    assert_eq!(result.rows.len(), 1);
 
     drop(oracle);
     server.abort();
