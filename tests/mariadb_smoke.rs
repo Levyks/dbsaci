@@ -92,6 +92,12 @@ async fn mariadb_oracle_mode_executes_basic_queries_and_binds() {
         .expect("bound query");
     assert_eq!(result.rows.len(), 1);
 
+    let result = oracle
+        .query("SELECT CAST(1 AS NUMBER) FROM DUAL", &[])
+        .await
+        .expect("MariaDB NUMBER cast rewrite");
+    assert_eq!(result.rows.len(), 1);
+
     drop(oracle);
     server.abort();
     let _ = server.await;
