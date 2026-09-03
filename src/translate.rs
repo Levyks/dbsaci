@@ -41,6 +41,7 @@ pub fn oracle_to_mariadb(sql: &str) -> Result<String> {
         .replace(" CLOB", " TEXT")
         .replace("decode(", "UNHEX(")
         .replace(", 'hex')", ")");
+    let sql = rewrite_legacy_outer_join_text(&sql).unwrap_or(sql);
     let sql = rewrite_mariadb_cast_number(&sql);
     let sql = rewrite_connect_by(&sql)
         .replace("::text", "")
