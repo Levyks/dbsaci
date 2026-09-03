@@ -344,8 +344,13 @@ fn rewrite_mariadb_cast_number(sql: &str) -> String {
         };
         let body = &sql[open + 1..close];
         let body_upper = body.to_ascii_uppercase();
-        if let Some(as_pos) = body_upper.rfind(" AS NUMBER") {
-            let suffix = body[as_pos + 10..].trim();
+        let (as_pos, keyword_len) = body_upper
+            .rfind(" AS NUMBER")
+            .map(|pos| (pos, 10))
+            .or_else(|| body_upper.rfind(" AS NUMERIC").map(|pos| (pos, 11)))
+            .unwrap_or((usize::MAX, 0));
+        if as_pos != usize::MAX {
+            let suffix = body[as_pos + keyword_len..].trim();
             let target = if suffix.is_empty() {
                 "DECIMAL(65,30)".to_string()
             } else if suffix.starts_with('(') && suffix.ends_with(')') {
