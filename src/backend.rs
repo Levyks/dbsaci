@@ -1,4 +1,5 @@
 use std::pin::Pin;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
@@ -24,6 +25,37 @@ pub enum BackendKind {
     Postgres,
     /// MariaDB running with `SQL_MODE=ORACLE`.
     MariaDb,
+}
+
+/// Backend operations required by the Oracle session loop. Keeping this
+/// contract separate from a driver prevents the wire protocol from acquiring
+/// PostgreSQL- or MariaDB-specific assumptions.
+#[async_trait::async_trait]
+pub trait OracleBackend: Send + Sync {
+    async fn open_cursor(
+        &self,
+        sql: &str,
+        binds: &[BindValue],
+        caps: DescribeCaps,
+    ) -> Result<Box<dyn OracleCursor>>;
+    async fn execute_simple(&self, sql: &str, binds: &[BindValue]) -> Result<u64>;
+    async fn execute_ddl(&self, sql: &str, binds: &[BindValue]) -> Result<u64>;
+    async fn execute_returning(
+        &self,
+        sql: &str,
+        binds: &[BindValue],
+    ) -> Result<(u64, Vec<Vec<Option<Vec<u8>>>>)>;
+    async fn cancel(&self);
+}
+
+/// Cursor contract exposed to the wire layer. Values are already encoded in
+/// Oracle's TTC representation, so the wire layer remains driver-neutral.
+#[async_trait::async_trait]
+pub trait OracleCursor: Send {
+    fn columns(&self) -> &[ColumnMeta];
+    fn is_exhausted(&self) -> bool;
+    async fn next_batch(&mut self, n: usize) -> Result<Vec<Vec<Option<Vec<u8>>>>>;
+    async fn finish(&mut self);
 }
 
 enum PostgresBind {
@@ -223,6 +255,30 @@ impl RowCursor {
             let _ = backend.finish_statement().await;
             self.savepoint_held = false;
         }
+    }
+}
+
+struct PostgresCursorAdapter {
+    cursor: RowCursor,
+    backend: Arc<PostgresBackend>,
+}
+
+#[async_trait::async_trait]
+impl OracleCursor for PostgresCursorAdapter {
+    fn columns(&self) -> &[ColumnMeta] {
+        self.cursor.columns()
+    }
+
+    fn is_exhausted(&self) -> bool {
+        self.cursor.is_exhausted()
+    }
+
+    async fn next_batch(&mut self, n: usize) -> Result<Vec<Vec<Option<Vec<u8>>>>> {
+        self.cursor.next_batch(&self.backend, n).await
+    }
+
+    async fn finish(&mut self) {
+        self.cursor.finish(&self.backend).await;
     }
 }
 
@@ -954,6 +1010,42 @@ async fn preflight(client: &Client, pg_user: &str) {
 
 /// Session-local Oracle data-dictionary views and niladic/built-in helpers that
 /// orafce does not provide. Each entry is applied independently, best-effort.
+#[async_trait::async_trait]
+impl OracleBackend for Arc<PostgresBackend> {
+    async fn open_cursor(
+        &self,
+        sql: &str,
+        binds: &[BindValue],
+        caps: DescribeCaps,
+    ) -> Result<Box<dyn OracleCursor>> {
+        let cursor = self.open_cursor_with_binds(sql, binds, caps).await?;
+        Ok(Box::new(PostgresCursorAdapter {
+            cursor,
+            backend: Arc::clone(self),
+        }))
+    }
+
+    async fn execute_simple(&self, sql: &str, binds: &[BindValue]) -> Result<u64> {
+        self.execute_simple_with_binds(sql, binds).await
+    }
+
+    async fn execute_ddl(&self, sql: &str, binds: &[BindValue]) -> Result<u64> {
+        self.execute_ddl_with_binds(sql, binds).await
+    }
+
+    async fn execute_returning(
+        &self,
+        sql: &str,
+        binds: &[BindValue],
+    ) -> Result<(u64, Vec<Vec<Option<Vec<u8>>>>)> {
+        PostgresBackend::execute_returning(self, sql, binds).await
+    }
+
+    async fn cancel(&self) {
+        PostgresBackend::cancel(self).await;
+    }
+}
+
 /// Read-only Oracle catalog facade. `pg_table_is_visible` is evaluated per
 /// query, so these are safe as ordinary (non-temp) `CREATE OR REPLACE` views;
 /// they are recreated on every connect for resilience but cost one batch.

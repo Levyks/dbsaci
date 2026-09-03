@@ -1778,6 +1778,7 @@ name = "pgsaci"
 version = "0.0.9"
 dependencies = [
  "aes",
+ "async-trait",
  "bytes",
  "cbc",
  "chrono",
