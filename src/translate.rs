@@ -345,11 +345,20 @@ fn rewrite_mariadb_cast_number(sql: &str) -> String {
         let body = &sql[open + 1..close];
         let body_upper = body.to_ascii_uppercase();
         if let Some(as_pos) = body_upper.rfind(" AS NUMBER") {
-            let suffix = &body[as_pos + 10..];
-            if suffix.trim().is_empty() {
+            let suffix = body[as_pos + 10..].trim();
+            let target = if suffix.is_empty() {
+                "DECIMAL(65,30)".to_string()
+            } else if suffix.starts_with('(') && suffix.ends_with(')') {
+                format!("DECIMAL{}", suffix)
+            } else {
+                String::new()
+            };
+            if !target.is_empty() {
                 out.push_str("CAST(");
                 out.push_str(&body[..as_pos]);
-                out.push_str(" AS DECIMAL(65,30))");
+                out.push_str(" AS ");
+                out.push_str(&target);
+                out.push(')');
                 cursor = close + 1;
                 continue;
             }
