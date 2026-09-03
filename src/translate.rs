@@ -34,7 +34,7 @@ pub fn oracle_to_mariadb(sql: &str) -> Result<String> {
         .replace("AS SMALLINT", "AS SIGNED")
         .replace("AS BIGINT", "AS SIGNED")
         .replace("AS INTEGER", "AS SIGNED")
-        .replace("AS TEXT", "AS CHAR")
+        .replace("AS TEXT", "AS CHAR(255)")
         .replace("AS TIMESTAMP WITH TIME ZONE", "AS DATETIME")
         .replace("AS TIMESTAMP", "AS DATETIME")
         .replace("AS NVARCHAR2", "AS VARCHAR")
