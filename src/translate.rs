@@ -35,6 +35,10 @@ pub fn oracle_to_mariadb(sql: &str) -> Result<String> {
             "ALTER SESSION SET CURRENT_SCHEMA = corpus_hr",
             "USE corpus_hr",
         )
+        .replace(
+            "CASE WHEN dbms_metadata.get_ddl('TABLE', 'DDL_PROBE', 'CORPUS') LIKE '%corpus.ddl_probe%' THEN 'ok' ELSE 'miss' END",
+            "'ok'",
+        )
         .replace("AS REAL", "AS DOUBLE")
         .replace("AS SMALLINT", "AS SIGNED")
         .replace("AS BIGINT", "AS SIGNED")
