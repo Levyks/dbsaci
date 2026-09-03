@@ -232,6 +232,9 @@ impl CorpusAdmin {
 
 impl TestBackend {
     async fn start(fixtures: Vec<String>) -> Result<Self, String> {
+        if std::env::var("PGSACI_CORPUS_BACKEND").as_deref() == Ok("mariadb") {
+            return Self::start_mariadb(fixtures).await;
+        }
         // `PGSACI_TEST_PG_IMAGE` (e.g. `pgsaci-test-pg:16`) lets CI run the
         // corpus against several PostgreSQL majors; the default matches the
         // image `clients/run.sh` and the docs build.
@@ -305,6 +308,85 @@ impl TestBackend {
         Ok(Self {
             _container: container,
             admin: tokio::sync::Mutex::new(CorpusAdmin::Postgres(admin)),
+            proxy_port,
+            oracle,
+        })
+    }
+
+    async fn start_mariadb(fixtures: Vec<String>) -> Result<Self, String> {
+        let container = GenericImage::new("mariadb", "11.4")
+            .with_wait_for(WaitFor::seconds(8))
+            .with_exposed_port(ContainerPort::Tcp(3306))
+            .with_env_var("MARIADB_ALLOW_EMPTY_ROOT_PASSWORD", "yes")
+            .with_env_var("MARIADB_DATABASE", "postgres")
+            .start()
+            .await
+            .map_err(|e| format!("start MariaDB container: {e}"))?;
+        let host = container.get_host().await.map_err(|e| e.to_string())?;
+        let host = if host.to_string() == "localhost" {
+            "127.0.0.1".to_string()
+        } else {
+            host.to_string()
+        };
+        let port = container
+            .get_host_port_ipv4(3306)
+            .await
+            .map_err(|e| e.to_string())?;
+        let mut admin = connect_maria_admin(&host, port).await?;
+        admin
+            .query_drop("CREATE USER IF NOT EXISTS 'corpus'@'%' IDENTIFIED BY 'corpus'")
+            .await
+            .map_err(|e| format!("create MariaDB corpus user: {e}"))?;
+        admin
+            .query_drop("GRANT ALL PRIVILEGES ON postgres.* TO 'corpus'@'%'")
+            .await
+            .map_err(|e| format!("grant MariaDB corpus user: {e}"))?;
+        for statement in MARIADB_BASELINE_SQL
+            .split(';')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            admin
+                .query_drop(statement)
+                .await
+                .map_err(|e| format!("seed MariaDB baseline `{statement}`: {e}"))?;
+        }
+        for fixture in &fixtures {
+            for statement in fixture.split(';').map(str::trim).filter(|s| !s.is_empty()) {
+                // Fixtures are intentionally shared with PostgreSQL. MariaDB
+                // should still start and report the affected cases when a
+                // fixture uses PostgreSQL-only DDL (COMMENT ON, extensions,
+                // PL/pgSQL, etc.); those cases remain visible as failures.
+                if let Err(e) = admin.query_drop(statement).await {
+                    eprintln!("mariadb fixture unavailable, continuing: `{statement}`: {e}");
+                }
+            }
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .map_err(|e| e.to_string())?;
+        let proxy_port = listener.local_addr().map_err(|e| e.to_string())?.port();
+        let backend_host = host.clone();
+        tokio::spawn(async move {
+            let _ = Server::new(PgSaciConfig {
+                backend: pgsaci::BackendKind::MariaDb,
+                listen_addr: format!("127.0.0.1:{proxy_port}"),
+                pg_host: backend_host,
+                pg_port: port,
+                pg_db: "postgres".into(),
+                credentials: pgsaci::Credentials::with_fallback(CORPUS_USER),
+                statement_timeout: Some(Duration::from_secs(2)),
+                idle_timeout: Some(Duration::from_secs(30)),
+                ..Default::default()
+            })
+            .run_with_listener(listener)
+            .await;
+        });
+        let oracle = tokio::sync::Mutex::new(connect_oracle(proxy_port).await?);
+        Ok(Self {
+            _container: container,
+            admin: tokio::sync::Mutex::new(CorpusAdmin::MariaDb(admin)),
             proxy_port,
             oracle,
         })
@@ -566,6 +648,19 @@ const BASELINE_SQL: &str = "
         (1, 'Ada', 1), (2, 'Grace', 1), (3, 'Linus', 2), (4, 'Margaret', NULL);
 ";
 
+const MARIADB_BASELINE_SQL: &str = "
+    DROP TABLE IF EXISTS people, teams;
+    CREATE TABLE teams (id INTEGER PRIMARY KEY, name VARCHAR(255) NOT NULL);
+    CREATE TABLE people (
+        id INTEGER PRIMARY KEY,
+        name VARCHAR(255) NOT NULL,
+        team_id INTEGER REFERENCES teams(id)
+    );
+    INSERT INTO teams (id, name) VALUES (1, 'Engineering'), (2, 'Sales'), (3, 'Marketing');
+    INSERT INTO people (id, name, team_id) VALUES
+        (1, 'Ada', 1), (2, 'Grace', 1), (3, 'Linus', 2), (4, 'Margaret', NULL);
+";
+
 async fn connect_admin(host: &str, port: u16) -> Result<Client, String> {
     let conn_str =
         format!("host={host} port={port} user=postgres password=postgres dbname=postgres");
@@ -585,6 +680,22 @@ async fn connect_admin(host: &str, port: u16) -> Result<Client, String> {
         }
     }
     Err(format!("admin connect to postgres: {last}"))
+}
+
+async fn connect_maria_admin(host: &str, port: u16) -> Result<MariaConn, String> {
+    let url = format!("mysql://root@{host}:{port}/postgres");
+    let opts = mysql_async::Opts::from_url(&url).map_err(|e| e.to_string())?;
+    let mut last = String::new();
+    for _ in 0..50 {
+        match MariaConn::new(opts.clone()).await {
+            Ok(conn) => return Ok(conn),
+            Err(e) => {
+                last = e.to_string();
+                tokio::time::sleep(Duration::from_millis(150)).await;
+            }
+        }
+    }
+    Err(format!("admin connect to MariaDB: {last}"))
 }
 
 async fn connect_oracle(proxy_port: u16) -> Result<OracleConnection, String> {
