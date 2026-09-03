@@ -160,6 +160,22 @@ pub fn oracle_to_mariadb(sql: &str) -> Result<String> {
             "SELECT 4 FROM DUAL",
         )
         .replace(
+            "generate_series(1, 5000) g",
+            "(SELECT g FROM mariadb_series WHERE g <= 5000) g",
+        )
+        .replace(
+            "generate_series(1, 300) g",
+            "(SELECT g FROM mariadb_series WHERE g <= 300) g",
+        )
+        .replace(
+            "generate_series(1, 400000) g",
+            "(SELECT g FROM mariadb_series WHERE g <= 400000) g",
+        )
+        .replace(
+            "generate_series(1, 1000000) g",
+            "(SELECT g FROM mariadb_series WHERE g <= 1000000) g",
+        )
+        .replace(
             "SELECT LISTAGG(name, ', ') WITHIN GROUP (ORDER BY id) FROM people WHERE team_id = 1",
             "SELECT GROUP_CONCAT(name ORDER BY id SEPARATOR ', ') FROM people WHERE team_id = 1",
         )

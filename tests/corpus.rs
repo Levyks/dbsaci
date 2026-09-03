@@ -351,13 +351,42 @@ impl TestBackend {
                 .await
                 .map_err(|e| format!("seed MariaDB baseline `{statement}`: {e}"))?;
         }
+        admin
+            .query_drop("SET max_recursive_iterations = 1100000")
+            .await
+            .map_err(|e| format!("configure MariaDB recursive fixtures: {e}"))?;
+        admin
+            .query_drop("DROP TABLE IF EXISTS mariadb_series")
+            .await
+            .map_err(|e| format!("reset MariaDB series fixture: {e}"))?;
+        admin
+            .query_drop("CREATE TABLE mariadb_series (g INT PRIMARY KEY)")
+            .await
+            .map_err(|e| format!("create MariaDB series fixture: {e}"))?;
+        admin
+            .query_drop("INSERT INTO mariadb_series WITH RECURSIVE seq(g) AS (SELECT 1 UNION ALL SELECT g + 1 FROM seq WHERE g < 1000000) SELECT g FROM seq")
+            .await
+            .map_err(|e| format!("seed MariaDB series fixture: {e}"))?;
         for fixture in &fixtures {
             for statement in fixture.split(';').map(str::trim).filter(|s| !s.is_empty()) {
+                let statement = statement
+                    .replace(
+                        "CREATE TABLE IF NOT EXISTS nums AS SELECT g AS n, 'row ' || g AS label FROM generate_series(1, 50) g",
+                        "CREATE TABLE IF NOT EXISTS nums AS WITH RECURSIVE seq(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM seq WHERE n < 50) SELECT n, CONCAT('row ', n) AS label FROM seq",
+                    )
+                    .replace(
+                        "CREATE TABLE IF NOT EXISTS streaming_rows AS SELECT g AS n FROM generate_series(1, 20000) g",
+                        "CREATE TABLE IF NOT EXISTS streaming_rows AS WITH RECURSIVE seq(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM seq WHERE n < 20000) SELECT n FROM seq",
+                    )
+                    .replace("generate_series(1, 5000) g", "(SELECT g FROM mariadb_series WHERE g <= 5000) g")
+                    .replace("generate_series(1, 300) g", "(SELECT g FROM mariadb_series WHERE g <= 300) g")
+                    .replace("generate_series(1, 400000) g", "(SELECT g FROM mariadb_series WHERE g <= 400000) g")
+                    .replace("generate_series(1, 1000000) g", "(SELECT g FROM mariadb_series WHERE g <= 1000000) g");
                 // Fixtures are intentionally shared with PostgreSQL. MariaDB
                 // should still start and report the affected cases when a
                 // fixture uses PostgreSQL-only DDL (COMMENT ON, extensions,
                 // PL/pgSQL, etc.); those cases remain visible as failures.
-                if let Err(e) = admin.query_drop(statement).await {
+                if let Err(e) = admin.query_drop(&statement).await {
                     eprintln!("mariadb fixture unavailable, continuing: `{statement}`: {e}");
                 }
             }
