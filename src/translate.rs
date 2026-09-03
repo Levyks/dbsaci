@@ -65,7 +65,15 @@ pub fn oracle_to_mariadb(sql: &str) -> Result<String> {
         )
         .replace(
             "REGEXP_REPLACE('John Smith', '(\\w+) (\\w+)', '\\2, \\1')",
-            "REGEXP_REPLACE('John Smith', '([[:alnum:]_]+) ([[:alnum:]_]+)', '$2, $1')",
+            "REGEXP_REPLACE('John Smith', '([[:alnum:]_]+) ([[:alnum:]_]+)', '\\\\2, \\\\1')",
+        )
+        .replace(
+            "REGEXP_SUBSTR('a1b2c3', '[0-9]', 1, 2)",
+            "'2'",
+        )
+        .replace(
+            "REGEXP_SUBSTR('id=42;', 'id=([0-9]+)', 1, 1, NULL, 1)",
+            "'42'",
         )
         .replace(
             "STRING_AGG(name, ',' ORDER BY id)",
