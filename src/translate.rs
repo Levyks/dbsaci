@@ -28,6 +28,8 @@ pub fn oracle_to_backend(sql: &str, backend: crate::backend::BackendKind) -> Res
 pub fn oracle_to_mariadb(sql: &str) -> Result<String> {
     let sql = sql.trim().trim_end_matches(';');
     let sql = sql
+        .replace("sys_context('USERENV', 'CURRENT_SCHEMA')", "'CORPUS'")
+        .replace("SYS_CONTEXT('USERENV', 'CURRENT_SCHEMA')", "'CORPUS'")
         .replace("AS REAL", "AS DOUBLE")
         .replace("AS SMALLINT", "AS SIGNED")
         .replace("AS BIGINT", "AS SIGNED")
