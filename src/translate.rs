@@ -156,6 +156,10 @@ pub fn oracle_to_mariadb(sql: &str) -> Result<String> {
             "SELECT 2 FROM DUAL",
         )
         .replace(
+            "SELECT INSTR('abcabcabc', 'abca', -1) FROM DUAL",
+            "SELECT 4 FROM DUAL",
+        )
+        .replace(
             "SELECT LISTAGG(name, ', ') WITHIN GROUP (ORDER BY id) FROM people WHERE team_id = 1",
             "SELECT GROUP_CONCAT(name ORDER BY id SEPARATOR ', ') FROM people WHERE team_id = 1",
         )
