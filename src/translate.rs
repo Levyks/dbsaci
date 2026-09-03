@@ -27,7 +27,18 @@ pub fn oracle_to_backend(sql: &str, backend: crate::backend::BackendKind) -> Res
 /// added only when a corpus case demonstrates that Oracle mode needs help.
 pub fn oracle_to_mariadb(sql: &str) -> Result<String> {
     let sql = sql.trim().trim_end_matches(';');
-    let sql = rewrite_mariadb_cast_number(sql);
+    let sql = sql
+        .replace("AS REAL", "AS DOUBLE")
+        .replace("AS TEXT", "AS CHAR")
+        .replace("AS TIMESTAMP WITH TIME ZONE", "AS DATETIME")
+        .replace("AS TIMESTAMP", "AS DATETIME")
+        .replace("AS NVARCHAR2", "AS VARCHAR")
+        .replace("AS CLOB", "AS LONGTEXT")
+        .replace("NVARCHAR2(", "VARCHAR(")
+        .replace(" CLOB", " LONGTEXT")
+        .replace("decode(", "UNHEX(")
+        .replace(", 'hex')", ")");
+    let sql = rewrite_mariadb_cast_number(&sql);
     Ok(sql
         .replace(
             "STRING_AGG(name, ',' ORDER BY id)",

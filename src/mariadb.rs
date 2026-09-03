@@ -69,6 +69,9 @@ impl MariaDbBackend {
         conn.query_drop("SET sql_mode = 'ORACLE'")
             .await
             .map_err(|e| Error::Postgres(format!("MariaDB Oracle mode failed: {e}")))?;
+        conn.query_drop("SET NAMES utf8mb4")
+            .await
+            .map_err(|e| Error::Postgres(format!("MariaDB charset setup failed: {e}")))?;
         conn.query_drop("START TRANSACTION")
             .await
             .map_err(|e| Error::Postgres(format!("MariaDB transaction setup failed: {e}")))?;
