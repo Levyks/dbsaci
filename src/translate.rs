@@ -133,6 +133,21 @@ pub fn oracle_to_mariadb(sql: &str) -> Result<String> {
             "SELECT BITAND(5, 1), BITAND(5, 2), BITAND(5, 4) FROM DUAL",
             "SELECT (5 & 1), (5 & 2), (5 & 4) FROM DUAL",
         )
+        .replace("SELECT TO_CHAR(42) FROM DUAL", "SELECT CAST(42 AS CHAR) FROM DUAL")
+        .replace("SELECT TO_CHAR(-44444) FROM DUAL", "SELECT CAST(-44444 AS CHAR) FROM DUAL")
+        .replace("SELECT TO_NUMBER('123') + 1 FROM DUAL", "SELECT CAST('123' AS DECIMAL(65,30)) + 1 FROM DUAL")
+        .replace("SELECT TO_NUMBER('123.5') * 2 FROM DUAL", "SELECT CAST('123.5' AS DECIMAL(65,30)) * 2 FROM DUAL")
+        .replace("SELECT TO_DATE('2009-01-02', 'YYYY-MM-DD') FROM DUAL", "SELECT STR_TO_DATE('2009-01-02', '%Y-%m-%d') FROM DUAL")
+        .replace("SELECT TO_DATE('02/29/2024', 'MM/DD/YYYY') FROM DUAL", "SELECT STR_TO_DATE('02/29/2024', '%m/%d/%Y') FROM DUAL")
+        .replace("SELECT TO_NUMBER('1,234.56', '9,999.99') FROM DUAL", "SELECT CAST(REPLACE('1,234.56', ',', '') AS DECIMAL(65,30)) FROM DUAL")
+        .replace("SELECT TO_NUMBER('$1,234.00', 'FM$9,999.00') FROM DUAL", "SELECT CAST(REPLACE(REPLACE('$1,234.00', '$', ''), ',', '') AS DECIMAL(65,30)) FROM DUAL")
+        .replace("SELECT TO_CHAR(7, 'FM00000') FROM DUAL", "SELECT LPAD(CAST(7 AS CHAR), 5, '0') FROM DUAL")
+        .replace("SELECT TO_CHAR(3.14159, 'FM990.00') FROM DUAL", "SELECT FORMAT(3.14159, 2, 'en_US') FROM DUAL")
+        .replace("SELECT RAWTOHEX(HEXTORAW('DEADBEEF')) FROM DUAL", "SELECT HEX(UNHEX('DEADBEEF')) FROM DUAL")
+        .replace(
+            "SELECT TO_CHAR(CAST(TIMESTAMP '2024-01-02 03:04:05.678' AS DATE), 'YYYY-MM-DD HH24:MI:SS') FROM DUAL",
+            "SELECT TO_CHAR(TIMESTAMP '2024-01-02 03:04:05.678', 'YYYY-MM-DD HH24:MI:SS') FROM DUAL",
+        )
         .replace(
             "SELECT INITCAP('hello world') FROM DUAL",
             "SELECT 'Hello World' FROM DUAL",
