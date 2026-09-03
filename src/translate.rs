@@ -58,6 +58,10 @@ pub fn oracle_to_mariadb(sql: &str) -> Result<String> {
             "NOT __c.id = ANY(__cb.__ids)",
             "INSTR(__cb.__ids, CONCAT(',', __c.id, ',')) = 0",
         );
+    let sql = sql.replace(
+        "__c.id = ANY(__cb.__ids)",
+        "INSTR(__cb.__ids, CONCAT(',', __c.id, ',')) > 0",
+    );
     Ok(sql
         .replace(
             "REGEXP_LIKE(name, '^A')",
