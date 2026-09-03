@@ -53,6 +53,7 @@ pub fn oracle_to_mariadb(sql: &str) -> Result<String> {
         .replace("__ids || __c.id", "CONCAT(__ids, ',', __c.id, ',')")
         .replace("__sib || __c.name", "CONCAT(__sib, '/', __c.name)")
         .replace("__cb.CONCAT(__ids", "CONCAT(__cb.__ids")
+        .replace("__cb.CONCAT(__sib", "CONCAT(__cb.__sib")
         .replace(
             "NOT __c.id = ANY(__cb.__ids)",
             "INSTR(__cb.__ids, CONCAT(',', __c.id, ',')) = 0",
