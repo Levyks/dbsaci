@@ -41,6 +41,22 @@ pub fn oracle_to_mariadb(sql: &str) -> Result<String> {
         .replace(" CLOB", " TEXT")
         .replace("decode(", "UNHEX(")
         .replace(", 'hex')", ")");
+    let sql = sql
+        .replace("CREATE GLOBAL TEMPORARY TABLE", "CREATE TEMPORARY TABLE")
+        .replace(" ON COMMIT PRESERVE ROWS", "")
+        .replace(" ENABLE", "")
+        .replace(" DISABLE", "")
+        .replace(" CHAR)", ")")
+        .replace(" BYTE)", ")")
+        .replace(" DEFAULT ON NULL ", " DEFAULT ")
+        .replace("COMMENT ON COLUMN com_demo.x IS ", "ALTER TABLE com_demo MODIFY x COMMENT = ")
+        .replace("COMMENT ON TABLE people IS ", "ALTER TABLE people COMMENT = ")
+        .replace("COMMENT ON TABLE dd_demo IS ", "ALTER TABLE dd_demo COMMENT = ")
+        .replace("COMMENT ON TABLE ", "ALTER TABLE ")
+        .replace("TABLESPACE users", "")
+        .replace("PCTFREE 10 INITRANS 2 STORAGE (INITIAL 64K NEXT 1M) LOGGING PARALLEL 4 SEGMENT CREATION IMMEDIATE", "")
+        .replace("DROP (obsolete_a, obsolete_b)", "DROP obsolete_a, DROP obsolete_b")
+        .replace("SET UNUSED (obsolete)", "DROP obsolete");
     let sql = rewrite_legacy_outer_join_text(&sql).unwrap_or(sql);
     let sql = rewrite_mariadb_cast_number(&sql);
     let sql = rewrite_connect_by(&sql)
