@@ -386,10 +386,12 @@ impl TestBackend {
                     .replace("generate_series(1, 300) g", "(SELECT g FROM mariadb_series WHERE g <= 300) g")
                     .replace("generate_series(1, 400000) g", "(SELECT g FROM mariadb_series WHERE g <= 400000) g")
                     .replace("generate_series(1, 1000000) g", "(SELECT g FROM mariadb_series WHERE g <= 1000000) g");
-                let statement = statement.replace(
-                    "public.corpus_shared_ref (k text PRIMARY KEY",
-                    "corpus_shared_ref (k varchar(255) PRIMARY KEY",
-                );
+                let statement = statement
+                    .replace(
+                        "public.corpus_shared_ref (k text PRIMARY KEY",
+                        "corpus_shared_ref (k varchar(255) PRIMARY KEY",
+                    )
+                    .replace("public.corpus_shared_ref", "corpus_shared_ref");
                 let statement = if let Some(rest) = statement.strip_prefix("COMMENT ON TABLE ") {
                     if let Some((table, comment)) = rest.split_once(" IS ") {
                         format!("ALTER TABLE {table} COMMENT = {comment}")
