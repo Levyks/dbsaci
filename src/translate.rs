@@ -44,6 +44,30 @@ pub fn oracle_to_mariadb(sql: &str) -> Result<String> {
     let sql = rewrite_mariadb_cast_number(&sql);
     Ok(sql
         .replace(
+            "REGEXP_LIKE(name, '^A')",
+            "name REGEXP '^A'",
+        )
+        .replace(
+            "REGEXP_LIKE(name, 'ADA', 'i')",
+            "name REGEXP '(?i)ADA'",
+        )
+        .replace(
+            "REGEXP_LIKE('12345', '^[0-9]+$')",
+            "'12345' REGEXP '^[0-9]+$'",
+        )
+        .replace(
+            "REGEXP_COUNT('a,b,c,d', ',')",
+            "(LENGTH('a,b,c,d') - LENGTH(REPLACE('a,b,c,d', ',', ''))) / LENGTH(',')",
+        )
+        .replace(
+            "REGEXP_SUBSTR('the quick brown fox', '\\w+')",
+            "REGEXP_SUBSTR('the quick brown fox', '[[:alnum:]_]+')",
+        )
+        .replace(
+            "REGEXP_REPLACE('John Smith', '(\\w+) (\\w+)', '\\2, \\1')",
+            "REGEXP_REPLACE('John Smith', '([[:alnum:]_]+) ([[:alnum:]_]+)', '$2, $1')",
+        )
+        .replace(
             "STRING_AGG(name, ',' ORDER BY id)",
             "GROUP_CONCAT(name ORDER BY id SEPARATOR ',')",
         )
