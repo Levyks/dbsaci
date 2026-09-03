@@ -349,7 +349,9 @@ fn rewrite_mariadb_cast_number(sql: &str) -> String {
             let target = if suffix.is_empty() {
                 "DECIMAL(65,30)".to_string()
             } else if suffix.starts_with('(') && suffix.ends_with(')') {
-                format!("DECIMAL{}", suffix)
+                // MariaDB's CAST grammar accepts DECIMAL, but rejects the
+                // Oracle-style precision/scale arguments in this position.
+                "DECIMAL".to_string()
             } else {
                 String::new()
             };
