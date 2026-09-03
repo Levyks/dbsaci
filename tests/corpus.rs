@@ -233,6 +233,7 @@ impl TestBackend {
         let proxy_port = listener.local_addr().map_err(|e| e.to_string())?.port();
         tokio::spawn(async move {
             let _ = Server::new(PgSaciConfig {
+                backend: pgsaci::BackendKind::Postgres,
                 listen_addr: format!("127.0.0.1:{proxy_port}"),
                 pg_host: host,
                 pg_port: port,

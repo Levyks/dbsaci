@@ -9,7 +9,7 @@ use tokio::task::AbortHandle;
 use tracing::{Instrument, debug, info, info_span, warn};
 
 use crate::auth::{AuthState, hex_upper};
-use crate::backend::PostgresBackend;
+use crate::backend::{BackendKind, PostgresBackend};
 use crate::credentials::Credentials;
 use crate::error::{Error, Result};
 use crate::tns::{PacketType, SduMode, TnsStream, build_accept_response};
@@ -147,6 +147,8 @@ fn render_sessions_json() -> String {
 
 #[derive(Clone)]
 pub struct Config {
+    /// Database engine behind the Oracle wire protocol.
+    pub backend: BackendKind,
     pub listen_addr: String,
     pub pg_host: String,
     pub pg_port: u16,
@@ -219,6 +221,7 @@ impl OracleVersion {
 impl Default for Config {
     fn default() -> Self {
         Self {
+            backend: BackendKind::Postgres,
             listen_addr: "0.0.0.0:1521".to_string(),
             pg_host: "localhost".to_string(),
             pg_port: 5432,
@@ -813,7 +816,12 @@ async fn handle_connection(stream: TcpStream, session_id: u64, config: Config) -
     };
     tns.write_packet(PacketType::Data, &auth2_response).await?;
 
-    // 8. Connect to Postgres backend using Oracle credentials.
+    // 8. Connect to the selected backend using Oracle credentials.
+    if config.backend == BackendKind::MariaDb {
+        return Err(Error::Postgres(
+            "MariaDB backend is selected but not implemented yet".into(),
+        ));
+    }
     let backend = match PostgresBackend::connect(
         &config.pg_host,
         config.pg_port,

@@ -16,6 +16,16 @@ use crate::wire::{
     temporal_bind_text,
 };
 
+/// Database engines supported behind the Oracle wire protocol.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BackendKind {
+    /// PostgreSQL with the `orafce` extension.
+    #[default]
+    Postgres,
+    /// MariaDB running with `SQL_MODE=ORACLE`.
+    MariaDb,
+}
+
 enum PostgresBind {
     Text(Option<String>),
     Bytes(Vec<u8>),

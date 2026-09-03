@@ -32,13 +32,16 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use pgsaci::{Config, Credentials, OracleVersion, Server};
 
 /// Oracle TNS/TTC proxy in front of PostgreSQL + orafce.
 #[derive(Parser, Debug)]
 #[command(name = "pgsaci", version, about)]
 struct Cli {
+    /// Database engine behind the Oracle wire protocol.
+    #[arg(long, env = "PGSACI_BACKEND", value_enum, default_value = "postgres")]
+    backend: CliBackend,
     /// Oracle TNS listen address.
     #[arg(long, env = "PGSACI_LISTEN")]
     listen: Option<String>,
@@ -92,6 +95,12 @@ struct Cli {
     oracle_version: Option<String>,
 }
 
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum CliBackend {
+    Postgres,
+    Mariadb,
+}
+
 fn parse_oracle_version(raw: Option<&str>) -> OracleVersion {
     match raw {
         Some("11" | "11g" | "11.2") => OracleVersion::V11g,
@@ -137,6 +146,10 @@ async fn main() {
     };
 
     let config = Config {
+        backend: match cli.backend {
+            CliBackend::Postgres => pgsaci::BackendKind::Postgres,
+            CliBackend::Mariadb => pgsaci::BackendKind::MariaDb,
+        },
         listen_addr: cli.listen.unwrap_or(default.listen_addr),
         pg_host: cli.pg_host.unwrap_or(default.pg_host),
         pg_port: cli.pg_port.unwrap_or(default.pg_port),

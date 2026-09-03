@@ -9,5 +9,6 @@ pub mod tns;
 pub mod translate;
 pub mod wire;
 
+pub use backend::BackendKind;
 pub use credentials::Credentials;
 pub use server::{Config, OracleVersion, Server};
