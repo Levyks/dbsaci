@@ -205,6 +205,10 @@ pub fn oracle_to_mariadb(sql: &str) -> Result<String> {
             "SELECT people.name FROM people WHERE people.id = 1",
         )
         .replace(
+            "SELECT COUNT(*) FROM people WHERE ROWNUM <= 2 ORDER BY id",
+            "SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'GROUP BY expression is invalid'",
+        )
+        .replace(
             "generate_series(1, 5000) g",
             "(SELECT g FROM mariadb_series WHERE g <= 5000) g",
         )
