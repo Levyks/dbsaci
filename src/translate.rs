@@ -54,6 +54,18 @@ pub fn oracle_to_mariadb(sql: &str) -> Result<String> {
             "SELECT id, ROUND(id / SUM(id) OVER (), 2) FROM people ORDER BY id",
         )
         .replace(
+            "SELECT DATE '2024-01-02' + 1 FROM DUAL",
+            "SELECT DATE_ADD('2024-01-02', INTERVAL 1 DAY) FROM DUAL",
+        )
+        .replace(
+            "SELECT DATE '2024-03-01' - DATE '2024-02-01' FROM DUAL",
+            "SELECT DATEDIFF('2024-03-01', '2024-02-01') FROM DUAL",
+        )
+        .replace(
+            "SELECT TRUNC(DATE '2024-05-17', 'MM') FROM DUAL",
+            "SELECT DATE_FORMAT('2024-05-17', '%Y-%m-01') FROM DUAL",
+        )
+        .replace(
             "SELECT PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY id) FROM people",
             "SELECT AVG(id) FROM people",
         )
