@@ -382,6 +382,15 @@ impl TestBackend {
                     .replace("generate_series(1, 300) g", "(SELECT g FROM mariadb_series WHERE g <= 300) g")
                     .replace("generate_series(1, 400000) g", "(SELECT g FROM mariadb_series WHERE g <= 400000) g")
                     .replace("generate_series(1, 1000000) g", "(SELECT g FROM mariadb_series WHERE g <= 1000000) g");
+                let statement = if let Some(rest) = statement.strip_prefix("COMMENT ON TABLE ") {
+                    if let Some((table, comment)) = rest.split_once(" IS ") {
+                        format!("ALTER TABLE {table} COMMENT = {comment}")
+                    } else {
+                        statement.to_string()
+                    }
+                } else {
+                    statement.to_string()
+                };
                 // Fixtures are intentionally shared with PostgreSQL. MariaDB
                 // should still start and report the affected cases when a
                 // fixture uses PostgreSQL-only DDL (COMMENT ON, extensions,

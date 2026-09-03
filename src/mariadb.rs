@@ -77,10 +77,13 @@ impl MariaDbBackend {
         // used by the corpus and by common migration tools in this schema.
         for ddl in [
             "CREATE OR REPLACE VIEW user_tables AS SELECT UPPER(table_name) AS table_name FROM information_schema.tables WHERE table_schema = DATABASE() AND table_type = 'BASE TABLE'",
-            "CREATE OR REPLACE VIEW all_tables AS SELECT UPPER(table_schema) AS owner, UPPER(table_name) AS table_name FROM information_schema.tables WHERE table_type = 'BASE TABLE'",
+            "CREATE OR REPLACE VIEW all_tables AS SELECT 'PUBLIC' AS owner, UPPER(table_name) AS table_name FROM information_schema.tables WHERE table_schema = DATABASE() AND table_type = 'BASE TABLE'",
             "CREATE OR REPLACE VIEW user_tab_columns AS SELECT UPPER(table_name) AS table_name, UPPER(column_name) AS column_name, ordinal_position AS column_id FROM information_schema.columns WHERE table_schema = DATABASE()",
             "CREATE OR REPLACE VIEW all_tab_columns AS SELECT UPPER(table_schema) AS owner, UPPER(table_name) AS table_name, UPPER(column_name) AS column_name, ordinal_position AS column_id FROM information_schema.columns",
             "CREATE OR REPLACE VIEW user_objects AS SELECT UPPER(table_name) AS object_name, 'TABLE' AS object_type FROM information_schema.tables WHERE table_schema = DATABASE() AND table_type = 'BASE TABLE'",
+            "CREATE OR REPLACE VIEW user_constraints AS SELECT UPPER(table_name) AS table_name, CASE WHEN constraint_type = 'PRIMARY KEY' THEN 'P' WHEN constraint_type = 'UNIQUE' THEN 'U' ELSE 'R' END AS constraint_type FROM information_schema.table_constraints WHERE constraint_schema = DATABASE()",
+            "CREATE OR REPLACE VIEW user_indexes AS SELECT UPPER(table_name) AS table_name, UPPER(index_name) AS index_name FROM information_schema.statistics WHERE table_schema = DATABASE()",
+            "CREATE OR REPLACE VIEW user_tab_comments AS SELECT UPPER(table_name) AS table_name, table_comment AS comments FROM information_schema.tables WHERE table_schema = DATABASE()",
             "CREATE OR REPLACE VIEW user_sequences AS SELECT UPPER(table_name) AS sequence_name FROM information_schema.tables WHERE table_schema = DATABASE() AND table_type = 'SEQUENCE'",
             "CREATE OR REPLACE VIEW all_sequences AS SELECT UPPER(table_schema) AS sequence_owner, UPPER(table_name) AS sequence_name FROM information_schema.tables WHERE table_type = 'SEQUENCE'",
         ] {
