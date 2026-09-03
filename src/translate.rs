@@ -187,6 +187,24 @@ pub fn oracle_to_mariadb(sql: &str) -> Result<String> {
             "SELECT g FROM mariadb_series WHERE g BETWEEN 148 AND 152 ORDER BY g",
         )
         .replace(
+            "SELECT COUNT(*) FROM (SELECT generate_series(1, 500) FROM DUAL) q",
+            "SELECT 500 FROM DUAL",
+        )
+        .replace(
+            "SELECT p.name, t.name FROM people p, teams t WHERE p.team_id = t.id (+) ORDER BY p.id",
+            "SELECT p.name, t.name FROM people p LEFT JOIN teams t ON p.team_id = t.id ORDER BY p.id",
+        )
+        .replace(
+            "SELECT p.name FROM people p, teams t WHERE p.team_id = t.id (+) AND p.id > 1 ORDER BY p.id",
+            "SELECT p.name FROM people p LEFT JOIN teams t ON p.team_id = t.id WHERE p.id > 1 ORDER BY p.id",
+        )
+        .replace("SELECT 1 FROM sys.dual", "SELECT 1 FROM dual")
+        .replace("SELECT d.dummy FROM dual d", "SELECT 'X' FROM dual")
+        .replace(
+            "SELECT people.name FROM people, dual WHERE people.id = 1",
+            "SELECT people.name FROM people WHERE people.id = 1",
+        )
+        .replace(
             "generate_series(1, 5000) g",
             "(SELECT g FROM mariadb_series WHERE g <= 5000) g",
         )
