@@ -102,10 +102,11 @@ impl OracleBackend for Arc<MariaDbBackend> {
         conn.query_drop("SET sql_mode = 'ORACLE'")
             .await
             .map_err(mariadb_error)?;
+        let sql = mariadb_sql(sql);
         let rows: Vec<mysql_async::Row> = if binds.is_empty() {
-            conn.query(sql).await.map_err(mariadb_error)?
+            conn.query(&sql).await.map_err(mariadb_error)?
         } else {
-            conn.exec(sql, Params::Positional(bind_values(binds)?))
+            conn.exec(&sql, Params::Positional(bind_values(binds)?))
                 .await
                 .map_err(mariadb_error)?
         };
@@ -154,7 +155,7 @@ impl OracleBackend for Arc<MariaDbBackend> {
             .await
             .map_err(mariadb_error)?;
         let result = conn
-            .exec_iter(sql, Params::Positional(bind_values(binds)?))
+            .exec_iter(mariadb_sql(sql), Params::Positional(bind_values(binds)?))
             .await
             .map_err(mariadb_error)?;
         Ok(result.affected_rows())
@@ -197,6 +198,45 @@ fn bind_values(binds: &[BindValue]) -> Result<Vec<Value>> {
             )),
         })
         .collect()
+}
+
+/// PgSaci's bind rewriter emits PostgreSQL-style `$1`, `$2`, … placeholders;
+/// MariaDB prepared statements use `?`. Preserve quoted SQL while converting
+/// only actual parameter tokens.
+fn mariadb_sql(sql: &str) -> String {
+    let mut out = String::with_capacity(sql.len());
+    let bytes = sql.as_bytes();
+    let mut i = 0;
+    let mut quote = None;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if let Some(q) = quote {
+            out.push(b as char);
+            if b == q {
+                if bytes.get(i + 1) == Some(&q) {
+                    out.push(q as char);
+                    i += 1;
+                } else {
+                    quote = None;
+                }
+            }
+            i += 1;
+        } else if matches!(b, b'\'' | b'"' | b'`') {
+            quote = Some(b);
+            out.push(b as char);
+            i += 1;
+        } else if b == b'$' && bytes.get(i + 1).is_some_and(u8::is_ascii_digit) {
+            out.push('?');
+            i += 2;
+            while bytes.get(i).is_some_and(u8::is_ascii_digit) {
+                i += 1;
+            }
+        } else {
+            out.push(b as char);
+            i += 1;
+        }
+    }
+    out
 }
 
 fn encode_value(value: &Value) -> Result<Vec<u8>> {
