@@ -19,7 +19,7 @@ micro-workload (`python-oracledb` thin) against:
 Everything — the workload client, Oracle XE, PostgreSQL and pgSaci — runs in
 Docker on one user-defined bridge network, so every hop is a container-to-
 container veth with no host port-proxy in the path and both targets are reached
-identically. pgSaci runs from its **published image** (`levyks/pgsaci:0.0.8`, a
+identically. pgSaci runs from its **published image** (`levyks/pgsaci:0.0.9`, a
 static musl build), so the number reflects what you ship.
 
 Both database containers get **2 CPU / 2.5 GiB**:

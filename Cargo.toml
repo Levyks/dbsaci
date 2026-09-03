@@ -1,6 +1,6 @@
 [package]
 name = "pgsaci"
-version = "0.0.8"
+version = "0.0.9"
 edition = "2024"
 license = "WTFPL"
 description = "A proxy that speaks Oracle's TNS/TTC wire protocol on the front and PostgreSQL on the back"

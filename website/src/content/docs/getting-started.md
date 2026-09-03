@@ -8,7 +8,7 @@ extension available, and a PostgreSQL login role for the proxy to use. Below,
 "the client" is any supported Oracle driver.
 
 :::note[Getting the image / binary]
-`docker pull levyks/pgsaci:0.0.8` — a **~12 MB** image (a static musl binary on
+`docker pull levyks/pgsaci:0.0.9` — a **~12 MB** image (a static musl binary on
 `scratch`; pgSaci has no C dependencies). It is also buildable from the repo's
 [`Dockerfile`](https://github.com/Levyks/pgsaci/blob/main/Dockerfile), and
 [building from source](#option-d--build-from-source) is a single `cargo build`.
@@ -39,7 +39,7 @@ services:
     ports: ["5432:5432"]
 
   pgsaci:
-    image: levyks/pgsaci:0.0.8
+    image: levyks/pgsaci:0.0.9
     depends_on: [postgres]
     environment:
       PGSACI_LISTEN: 0.0.0.0:1521
@@ -73,7 +73,7 @@ docker run --rm -p 1521:1521 -p 9500:9500 \
   -e PGSACI_PG_PASSWORD=pgpw \
   -e PGSACI_ORACLE_VERSION=19 \
   -e PGSACI_HEALTH_ADDR=0.0.0.0:9500 \
-  levyks/pgsaci:0.0.8
+  levyks/pgsaci:0.0.9
 ```
 
 Your PostgreSQL must have `orafce` installed in the target database
@@ -188,7 +188,24 @@ PostgreSQL schema named after the user exists (`CREATE SCHEMA IF NOT EXISTS
 If the backend role lacks `CREATE` on the database the connection still
 succeeds; objects then resolve via `oracle` / `public` and a warning is logged.
 
-## Which Oracle version to claim
+## Provisioning (read-only / least-privilege roles)
+
+pgSaci installs a set of **global** objects once: the `pgsaci` and `sys`
+schemas, the `SYS.*` catalog views, and `public.*` / `dbms_*` helper functions.
+Creating them needs `CREATE` on the database and on `public` — more than a
+read-only integration role has.
+
+It is a one-time install, not per-session. When those objects are already
+present at the running version, **every login role skips the install entirely
+and just uses them** — and the installing connection grants read / execute on
+them to `PUBLIC`, so an unprivileged role needs no per-role grants.
+
+So for a least-privilege setup: make **one** connection with a role that can
+create them (any superuser, or a role with `CREATE` on the database + `public`),
+then point your read-only roles at pgSaci. If the objects are missing and the
+connecting role cannot create them, pgSaci logs one actionable line and the
+session still serves plain queries (`orafce` functions included) — only the
+`SYS.*` catalog and a few helpers are unavailable until an admin provisions.
 
 `PGSACI_ORACLE_VERSION` (`--oracle-version`) picks which release pgSaci claims to
 be — `19` (default) or `11`. It changes the banner, the `AUTH_VERSION_*` values,

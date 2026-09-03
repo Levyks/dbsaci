@@ -70,8 +70,8 @@ cargo run --bin pgsaci
 
 Then connect any Oracle client to `//host:1521/FREEPDB1`.
 
-Or run it from a container (`levyks/pgsaci:0.0.8`, ~12 MB) —
-`docker run -p 1521:1521 -e PGSACI_PG_HOST=… levyks/pgsaci:0.0.8`. See the
+Or run it from a container (`levyks/pgsaci:0.0.9`, ~12 MB) —
+`docker run -p 1521:1521 -e PGSACI_PG_HOST=… levyks/pgsaci:0.0.9`. See the
 [docs](https://levyks.github.io/pgsaci/getting-started/) for a full
 docker-compose.
 
@@ -209,7 +209,7 @@ One sample run — 2 000 iterations/op (30 for the heavy ops), single connection
 Everything runs in Docker on one bridge network — the client, Oracle XE,
 PostgreSQL and pgSaci — so every hop is a container veth with no host
 port-proxy in the path. pgSaci runs from its published image
-(`levyks/pgsaci:0.0.8`, a static musl build). Both database containers get
+(`levyks/pgsaci:0.0.9`, a static musl build). Both database containers get
 **2 CPU / 2.5 GiB**: Oracle XE spends its full 2 GiB licence (`INIT_SGA_SIZE`
 1536M + `INIT_PGA_SIZE` 512M), PostgreSQL is **tuned to that envelope**
 (`shared_buffers` 768 MB, 64 MB `work_mem`, parallel workers, `jit=off`). A

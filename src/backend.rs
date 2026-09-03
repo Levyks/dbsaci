@@ -267,12 +267,23 @@ impl PostgresBackend {
         // existed.
         let ensure_schema = format!("CREATE SCHEMA IF NOT EXISTS {}", quote_identifier(&pg_user));
         if let Err(e) = client.execute(&ensure_schema, &[]).await {
-            tracing::warn!(
-                "could not ensure schema {:?} (objects will resolve via search_path; \
-                 grant CREATE on the database or pre-create the schema to silence this): {}",
-                pg_user,
-                pg_error_detail(&e)
-            );
+            // A read-only integration role legitimately lacks CREATE on the
+            // database — that is fine, its reads resolve via `oracle` / `public`.
+            let (level_debug, detail) = (is_insufficient_privilege(&e), pg_error_detail(&e));
+            if level_debug {
+                tracing::debug!(
+                    "schema {:?} not ensured (role lacks CREATE): {}",
+                    pg_user,
+                    detail
+                );
+            } else {
+                tracing::warn!(
+                    "could not ensure schema {:?} (objects resolve via search_path; \
+                     grant CREATE on the database or pre-create the schema): {}",
+                    pg_user,
+                    detail
+                );
+            }
         }
 
         // Orafce installs Oracle-compatible functions in the `oracle` schema.
@@ -292,14 +303,32 @@ impl PostgresBackend {
         // One-shot environment diagnostics on the first backend connection.
         preflight(&client, &pg_user).await;
 
-        // Permanent, cross-session objects (a `pgsaci` schema + the
-        // `binary_float`/`binary_double` domains) must be committed on their own
-        // — if they sat in the session's opening transaction, the first client
-        // statement that errors and triggers a `ROLLBACK` would drop them.
-        // `batch_execute` with no surrounding `BEGIN` autocommits each statement.
-        if let Err(e) = client.batch_execute(PERSISTENT_SETUP).await {
-            tracing::warn!("persistent setup failed: {}", pg_error_detail(&e));
+        // The cross-session objects — the `pgsaci` schema, the `sys.*` catalog
+        // views, the `public.*` / `dbms_*` helper functions — are installed
+        // once. If they are already present at this version, an unprivileged
+        // login role (e.g. a read-only integration user) skips all of the DDL
+        // below and just uses them. An admin only has to make one connection
+        // with a role that can create them (CREATE on the database + on
+        // `public`), or pre-create them out of band.
+        let installed = facade_installed(&client).await;
+        tracing::debug!("compatibility facade installed: {}", installed);
+
+        if !installed {
+            // Permanent, cross-session objects (a `pgsaci` schema + the
+            // `binary_float`/`binary_double` domains) must be committed on their
+            // own — if they sat in the session's opening transaction, the first
+            // client statement that errors and triggers a `ROLLBACK` would drop
+            // them. `batch_execute` with no `BEGIN` autocommits each statement.
+            if let Err(e) = client.batch_execute(PERSISTENT_SETUP).await {
+                warn_facade_install_error("persistent setup", &e);
+            }
+            for stmt in GLOBAL_COMPAT_FACADE {
+                if let Err(e) = client.batch_execute(stmt).await {
+                    warn_facade_install_error("compat helper", &e);
+                }
+            }
         }
+
         // Cross-session `SYS.ALL_*` catalog views for IDE schema browsers.
         // `CREATE OR REPLACE VIEW` takes ACCESS EXCLUSIVE, and IDE clients leave
         // transactions open (`idle in transaction`) holding a read lock on these
@@ -327,11 +356,11 @@ impl PostgresBackend {
                 .await;
             if facade_stale(&client).await {
                 if let Err(e) = client.batch_execute(SYS_CATALOG_FACADE).await {
-                    tracing::warn!("sys catalog facade failed: {}", pg_error_detail(&e));
+                    warn_facade_install_error("sys catalog facade", &e);
                 } else if let Err(e) = client.batch_execute(IDE_INTROSPECTION_STUBS).await {
-                    tracing::warn!("ide introspection stubs failed: {}", pg_error_detail(&e));
+                    warn_facade_install_error("ide introspection stubs", &e);
                 } else if let Err(e) = client.batch_execute(DBMS_METADATA_FACADE).await {
-                    tracing::warn!("dbms_metadata facade failed: {}", pg_error_detail(&e));
+                    warn_facade_install_error("dbms_metadata facade", &e);
                 } else {
                     let _ = client
                         .batch_execute(&format!(
@@ -340,6 +369,12 @@ impl PostgresBackend {
                             v = SYS_CATALOG_FACADE_VERSION
                         ))
                         .await;
+                    // Open the just-installed objects to every role, so an
+                    // unprivileged login role (which skips the install above)
+                    // can still read/execute them.
+                    if let Err(e) = client.batch_execute(FACADE_GRANTS).await {
+                        warn_facade_install_error("facade grants", &e);
+                    }
                 }
             }
             let _ = client
@@ -1032,12 +1067,19 @@ const ORACLE_COMPAT_FACADE: &[&str] = &[
        ) AS t(parameter, value)",
     "CREATE OR REPLACE TEMP VIEW global_name AS
        SELECT (upper(current_database()) || '')::varchar AS global_name",
-    // Pinned to `public` (always on the search_path, including after
-    // `ALTER SESSION SET CURRENT_SCHEMA`), so an unqualified call resolves here
-    // no matter which schema is current. Not `pg_temp` — temp functions are not
-    // resolved for unqualified calls; not the user's own schema — it drops off
-    // the path when CURRENT_SCHEMA is switched.
-    //
+];
+
+/// Cross-session helper functions PgSaci installs once (in `public` and the
+/// `dbms_*` schemas). Unlike [`ORACLE_COMPAT_FACADE`], creating these needs DDL
+/// rights the mapped login role may not have; they are applied only when the
+/// facade is not already installed (see `facade_installed`), so an unprivileged
+/// login role works against a database an admin provisioned first.
+///
+/// `public.*` is chosen so an unqualified call resolves regardless of the
+/// current schema (survives `ALTER SESSION SET CURRENT_SCHEMA`); not `pg_temp`
+/// (temp functions are not resolved for unqualified calls), not the user's own
+/// schema (drops off the search_path when CURRENT_SCHEMA is switched).
+const GLOBAL_COMPAT_FACADE: &[&str] = &[
     // SESSIONTIMEZONE follows `ALTER SESSION SET TIME_ZONE`; DBTIMEZONE is fixed
     // at DB creation (PgSaci has none configurable, so `+00:00`). Defined before
     // sys_context, which calls them.
@@ -1120,7 +1162,29 @@ const PERSISTENT_SETUP: &str = "
 /// Bump on any change to [`SYS_CATALOG_FACADE`]. Connects re-apply the facade
 /// (an ACCESS EXCLUSIVE `CREATE OR REPLACE VIEW` storm) only when the value
 /// stored in `pgsaci.facade_ver` differs from this.
-const SYS_CATALOG_FACADE_VERSION: &str = "2026-09-02.8";
+const SYS_CATALOG_FACADE_VERSION: &str = "2026-09-03.1";
+
+/// Applied once, by the role that installs the facade, so unprivileged login
+/// roles can read the catalog views and call the helper functions without
+/// per-role grants. `ALTER DEFAULT PRIVILEGES` only covers objects the
+/// installing role creates later, which is exactly the facade-refresh case.
+const FACADE_GRANTS: &str = "
+DO $grants$
+DECLARE s text;
+BEGIN
+  FOR s IN
+    SELECT nspname FROM pg_catalog.pg_namespace
+    WHERE nspname IN ('sys','pgsaci','dbms_metadata','dbms_utility','dbms_lob')
+  LOOP
+    EXECUTE format('GRANT USAGE ON SCHEMA %I TO PUBLIC', s);
+    EXECUTE format('GRANT SELECT ON ALL TABLES IN SCHEMA %I TO PUBLIC', s);
+    EXECUTE format('GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA %I TO PUBLIC', s);
+    EXECUTE format('ALTER DEFAULT PRIVILEGES IN SCHEMA %I GRANT SELECT ON TABLES TO PUBLIC', s);
+    EXECUTE format('ALTER DEFAULT PRIVILEGES IN SCHEMA %I GRANT EXECUTE ON FUNCTIONS TO PUBLIC', s);
+  END LOOP;
+END
+$grants$;
+";
 
 /// Schema-qualified `SYS.ALL_*` / `SYS.USER_*` data-dictionary views that IDE
 /// schema browsers (DataGrip/IntelliJ, SQL Developer, DBeaver) query directly by
@@ -2106,6 +2170,58 @@ fn pg_error_detail(e: &tokio_postgres::Error) -> String {
         format!("{}: {}", db.code().code(), db.message())
     } else {
         format!("{:#}", e)
+    }
+}
+
+/// SQLSTATE 42501 — the role lacks the privilege for the statement. Expected for
+/// a read-only login role against the PgSaci compatibility objects.
+fn is_insufficient_privilege(e: &tokio_postgres::Error) -> bool {
+    e.as_db_error().map(|db| db.code().code()) == Some("42501")
+}
+
+/// Are the once-installed cross-session compatibility objects already present?
+/// When so, an unprivileged login role skips every install step and just uses
+/// them.
+async fn facade_installed(c: &Client) -> bool {
+    match c
+        .query_one(
+            "SELECT to_regprocedure('public.sys_context(text,text)') IS NOT NULL \
+                 AND to_regprocedure('public.sessiontimezone()')     IS NOT NULL \
+                 AND to_regclass('sys.all_users')                    IS NOT NULL \
+                 AND to_regclass('pgsaci.facade_ver')                IS NOT NULL",
+            &[],
+        )
+        .await
+    {
+        Ok(row) => row.try_get::<_, bool>(0).unwrap_or(false),
+        Err(e) => {
+            tracing::debug!("facade_installed probe failed: {}", pg_error_detail(&e));
+            false
+        }
+    }
+}
+
+/// Report a failure to install part of the compatibility facade. A privilege
+/// error means the mapped login role simply cannot provision the database — say
+/// so once, actionably, then stay quiet; any other error is a real problem and
+/// is logged every time.
+fn warn_facade_install_error(what: &str, e: &tokio_postgres::Error) {
+    if is_insufficient_privilege(e) {
+        static WARNED: AtomicBool = AtomicBool::new(false);
+        if !WARNED.swap(true, Ordering::Relaxed) {
+            tracing::warn!(
+                "PgSaci's compatibility objects are not installed and this role cannot \
+                 create them. Make one connection with a role that has CREATE on the \
+                 database and on schema `public` (or provision them out of band); \
+                 unprivileged login roles then work against them. First failure — \
+                 {what}: {}",
+                pg_error_detail(e)
+            );
+        } else {
+            tracing::debug!("{what} skipped: role lacks privilege");
+        }
+    } else {
+        tracing::warn!("{what} failed: {}", pg_error_detail(e));
     }
 }
 
