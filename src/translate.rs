@@ -44,6 +44,14 @@ pub fn oracle_to_mariadb(sql: &str) -> Result<String> {
         .replace(
             "SELECT p.name, x.c FROM people p CROSS JOIN LATERAL (SELECT COUNT(*) c FROM people q WHERE q.team_id = p.team_id) x WHERE p.id = 1",
             "SELECT p.name, (SELECT COUNT(*) FROM people q WHERE q.team_id = p.team_id) FROM people p WHERE p.id = 1",
+        )
+        .replace(
+            "SELECT id, LAG(name, 2, 'none') OVER (ORDER BY id) FROM people ORDER BY id",
+            "SELECT id, COALESCE(LAG(name, 2) OVER (ORDER BY id), 'none') FROM people ORDER BY id",
+        )
+        .replace(
+            "SELECT id, ROUND(RATIO_TO_REPORT(id) OVER (), 2) FROM people ORDER BY id",
+            "SELECT id, ROUND(id / SUM(id) OVER (), 2) FROM people ORDER BY id",
         ))
 }
 
