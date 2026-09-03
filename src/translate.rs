@@ -29,13 +29,16 @@ pub fn oracle_to_mariadb(sql: &str) -> Result<String> {
     let sql = sql.trim().trim_end_matches(';');
     let sql = sql
         .replace("AS REAL", "AS DOUBLE")
+        .replace("AS SMALLINT", "AS SIGNED")
+        .replace("AS BIGINT", "AS SIGNED")
+        .replace("AS INTEGER", "AS SIGNED")
         .replace("AS TEXT", "AS CHAR")
         .replace("AS TIMESTAMP WITH TIME ZONE", "AS DATETIME")
         .replace("AS TIMESTAMP", "AS DATETIME")
         .replace("AS NVARCHAR2", "AS VARCHAR")
-        .replace("AS CLOB", "AS LONGTEXT")
+        .replace("AS CLOB", "AS CHAR")
         .replace("NVARCHAR2(", "VARCHAR(")
-        .replace(" CLOB", " LONGTEXT")
+        .replace(" CLOB", " TEXT")
         .replace("decode(", "UNHEX(")
         .replace(", 'hex')", ")");
     let sql = rewrite_mariadb_cast_number(&sql);
