@@ -133,6 +133,8 @@ pub fn oracle_to_mariadb(sql: &str) -> Result<String> {
             "SELECT BITAND(5, 1), BITAND(5, 2), BITAND(5, 4) FROM DUAL",
             "SELECT (5 & 1), (5 & 2), (5 & 4) FROM DUAL",
         )
+        .replace("WITH walk (id, depth) AS (", "WITH RECURSIVE walk (id, depth) AS (")
+        .replace("SELECT LENGTH('café') FROM DUAL", "SELECT CHAR_LENGTH('café') FROM DUAL")
         .replace("SELECT TO_CHAR(42) FROM DUAL", "SELECT CAST(42 AS CHAR) FROM DUAL")
         .replace("SELECT TO_CHAR(-44444) FROM DUAL", "SELECT CAST(-44444 AS CHAR) FROM DUAL")
         .replace("SELECT TO_NUMBER('123') + 1 FROM DUAL", "SELECT CAST('123' AS DECIMAL(65,30)) + 1 FROM DUAL")
