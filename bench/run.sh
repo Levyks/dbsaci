@@ -9,7 +9,7 @@
 # client, Oracle XE, PostgreSQL and pgSaci. Every hop is a container-to-container
 # veth inside the Docker VM: no host port-proxy, and both targets are reached
 # over an identical path. pgSaci runs from its published image
-# (levyks/pgsaci:0.0.6 by default; PGSACI_IMAGE=... to override), so the number
+# (levyks/pgsaci:0.0.7 by default; PGSACI_IMAGE=... to override), so the number
 # reflects what you actually ship — a static musl build.
 #
 # Fairness: both database containers get --cpus=2 and --memory=$BENCH_MEM
@@ -45,7 +45,7 @@ else hostpath() { printf '%s' "$1"; }; fi
 
 ora_image="gvenzl/oracle-xe:21-slim"
 pg_image="${PGSACI_TEST_PG_IMAGE:-pgsaci-test-pg:18}"
-pgsaci_image="${PGSACI_IMAGE:-levyks/pgsaci:0.0.6}"
+pgsaci_image="${PGSACI_IMAGE:-levyks/pgsaci:0.0.7}"
 client_image="bench-client:local"
 
 cpus="${BENCH_CPUS:-2}"

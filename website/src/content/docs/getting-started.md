@@ -8,7 +8,7 @@ extension available, and a PostgreSQL login role for the proxy to use. Below,
 "the client" is any supported Oracle driver.
 
 :::note[Getting the image / binary]
-`docker pull levyks/pgsaci:0.0.6` — a **~10 MB** image (a static musl binary on
+`docker pull levyks/pgsaci:0.0.7` — a **~10 MB** image (a static musl binary on
 `scratch`; pgSaci has no C dependencies). It is also buildable from the repo's
 [`Dockerfile`](https://github.com/Levyks/pgsaci/blob/main/Dockerfile), and
 [building from source](#option-d--build-from-source) is a single `cargo build`.
@@ -39,7 +39,7 @@ services:
     ports: ["5432:5432"]
 
   pgsaci:
-    image: levyks/pgsaci:0.0.6
+    image: levyks/pgsaci:0.0.7
     depends_on: [postgres]
     environment:
       PGSACI_LISTEN: 0.0.0.0:1521
@@ -73,7 +73,7 @@ docker run --rm -p 1521:1521 -p 9500:9500 \
   -e PGSACI_PG_PASSWORD=pgpw \
   -e PGSACI_ORACLE_VERSION=19 \
   -e PGSACI_HEALTH_ADDR=0.0.0.0:9500 \
-  levyks/pgsaci:0.0.6
+  levyks/pgsaci:0.0.7
 ```
 
 Your PostgreSQL must have `orafce` installed in the target database
@@ -131,6 +131,7 @@ var ds = new oracle.jdbc.pool.OracleDataSource();
 ds.setURL("jdbc:oracle:thin:@//localhost:1521/FREEPDB1");
 ds.setUser("appuser");
 ds.setPassword("apppw");
+ds.setConnectionProperty("oracle.jdbc.timezoneAsRegion", "false"); // see notes below
 try (var c = ds.getConnection();
      var rs = c.createStatement().executeQuery("SELECT sysdate FROM dual")) {
     rs.next();
@@ -197,10 +198,42 @@ successfully.
 
 ## Health & metrics
 
-With `PGSACI_HEALTH_ADDR` set, pgSaci serves three dependency-free endpoints:
+With `PGSACI_HEALTH_ADDR` set, pgSaci serves these dependency-free endpoints:
 
 | Path | Purpose |
 | --- | --- |
-| `/healthz` | process is up |
-| `/readyz` | backend PostgreSQL reachable |
-| `/metrics` | Prometheus text format |
+| `GET /healthz` | process is up |
+| `GET /readyz` | backend PostgreSQL reachable |
+| `GET /metrics` | Prometheus text format |
+| `GET /sessions` | JSON list of live Oracle sessions — `id`, `addr`, `user`, `age_seconds` |
+| `DELETE /sessions/<id>` | abort one session (drops its backend PostgreSQL connection, releasing any locks it held) |
+
+Idle clients are reaped after `--idle-timeout-ms` (`PGSACI_IDLE_TIMEOUT_MS`,
+default 15 min; `0` disables). The effective value is logged at startup.
+
+## Preflight diagnostics
+
+On its first backend connection pgSaci logs a one-time check of the target
+database: whether `orafce` is installed, the effective `search_path`, and
+whether the login user's schema contains any upper/mixed-case identifiers (see
+below). A missing assumption shows up here as one line instead of an opaque
+PostgreSQL error later.
+
+## Identifier case
+
+PostgreSQL folds unquoted identifiers to **lower** case; Oracle folds them to
+**UPPER**. pgSaci bridges this by mapping an Oracle client's quoted ALL-CAPS
+name (`"EMPLOYEES"`) to its lower-case form (`"employees"`) — so it lines up
+with a PostgreSQL schema that uses ordinary lower-case identifiers, which is the
+normal PostgreSQL convention. Quoted **mixed**-case names (`"MixedCase"`) stay
+case-sensitive on both sides, as they are in Oracle.
+
+The practical rule: **use lower-case identifiers in the target schema.** A
+table created in PostgreSQL as `"Employees"` (quoted, mixed case) is not
+reachable from an Oracle client, exactly as it would not be in Oracle itself.
+
+## Oracle JDBC thin driver
+
+Set `oracle.jdbc.timezoneAsRegion=false` on the connection. The thin driver
+otherwise negotiates the session time zone as a named region, which pgSaci does
+not yet handle; the flag makes it send a fixed offset instead.

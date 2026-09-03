@@ -1,4 +1,5 @@
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use chrono::{DateTime, Datelike, NaiveDate, NaiveDateTime, Timelike, Utc};
@@ -200,6 +201,9 @@ impl PostgresBackend {
             tracing::error!("postgres SET search_path failed: {}", detail);
             return Err(Error::Postgres(detail));
         }
+
+        // One-shot environment diagnostics on the first backend connection.
+        preflight(&client, &pg_user).await;
 
         // Permanent, cross-session objects (a `pgsaci` schema + the
         // `binary_float`/`binary_double` domains) must be committed on their own
@@ -725,6 +729,63 @@ impl PostgresBackend {
 
 fn quote_identifier(identifier: &str) -> String {
     format!("\"{}\"", identifier.replace('"', "\"\""))
+}
+
+/// One-time environment diagnostics, logged on the first backend connection.
+/// PgSaci's compatibility rests on a few implicit assumptions about the target
+/// database (orafce installed, PostgreSQL-native lower-case identifiers); when
+/// one is missing the failure otherwise surfaces later as an opaque PostgreSQL
+/// error. Surface it once, up front, as a single line. Best-effort: every probe
+/// is optional and a failure here never blocks a connection.
+async fn preflight(client: &Client, pg_user: &str) {
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if DONE.swap(true, Ordering::Relaxed) {
+        return;
+    }
+
+    match client
+        .query_opt(
+            "SELECT extversion FROM pg_extension WHERE extname = 'orafce'",
+            &[],
+        )
+        .await
+    {
+        Ok(Some(row)) => tracing::info!(
+            "preflight: orafce {} present",
+            row.try_get::<_, String>(0).unwrap_or_default()
+        ),
+        Ok(None) => tracing::warn!(
+            "preflight: the `orafce` extension is NOT installed in this database — \
+             most Oracle scalar functions (NVL, DECODE, TO_DATE, SYSDATE, …) will \
+             fail. Run `CREATE EXTENSION orafce;` in the target database."
+        ),
+        Err(e) => tracing::debug!("preflight: orafce probe failed: {}", pg_error_detail(&e)),
+    }
+
+    if let Ok(row) = client.query_one("SHOW search_path", &[]).await {
+        let sp: String = row.get(0);
+        tracing::info!("preflight: search_path = {sp}");
+    }
+
+    if let Ok(row) = client
+        .query_one(
+            "SELECT count(*) FROM pg_catalog.pg_class c \
+             JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+             WHERE n.nspname = $1 AND c.relkind IN ('r','p','v','m','S') \
+               AND c.relname <> lower(c.relname)",
+            &[&pg_user],
+        )
+        .await
+        && let Ok(n) = row.try_get::<_, i64>(0)
+        && n > 0
+    {
+        tracing::warn!(
+            "preflight: {n} object(s) in schema \"{pg_user}\" have upper- or mixed-case \
+             names. An Oracle client's unquoted names fold to UPPER and its quoted \
+             ALL-CAPS names map to lower-case — neither resolves to a mixed-case \
+             PostgreSQL object. Use lower-case identifiers in the target schema."
+        );
+    }
 }
 
 /// Session-local Oracle data-dictionary views and niladic/built-in helpers that

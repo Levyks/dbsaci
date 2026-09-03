@@ -1,9 +1,11 @@
-use std::sync::Arc;
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::sync::{Arc, LazyLock, Mutex};
+use std::time::{Duration, Instant};
 
 use socket2::SockRef;
 use tokio::net::{TcpListener, TcpStream};
+use tokio::task::AbortHandle;
 use tracing::{Instrument, debug, info, info_span, warn};
 
 use crate::auth::{AuthState, hex_upper};
@@ -56,6 +58,91 @@ impl Drop for SessionGuard {
     fn drop(&mut self) {
         ACTIVE_SESSIONS.fetch_sub(1, Ordering::Relaxed);
     }
+}
+
+// --- session registry: backs `GET /sessions` and `DELETE /sessions/{id}` ------
+
+struct SessionMeta {
+    addr: String,
+    user: Mutex<Option<String>>,
+    connected: Instant,
+    abort: AbortHandle,
+}
+
+static SESSIONS: LazyLock<Mutex<BTreeMap<u64, Arc<SessionMeta>>>> =
+    LazyLock::new(|| Mutex::new(BTreeMap::new()));
+
+fn sessions_register(id: u64, addr: String, abort: AbortHandle) {
+    SESSIONS.lock().unwrap().insert(
+        id,
+        Arc::new(SessionMeta {
+            addr,
+            user: Mutex::new(None),
+            connected: Instant::now(),
+            abort,
+        }),
+    );
+}
+
+fn sessions_set_user(id: u64, user: &str) {
+    if let Some(meta) = SESSIONS.lock().unwrap().get(&id) {
+        *meta.user.lock().unwrap() = Some(user.to_string());
+    }
+}
+
+/// Removes on normal task exit; a `Drop` impl so it fires on panic/abort too.
+struct SessionRegistration(u64);
+impl Drop for SessionRegistration {
+    fn drop(&mut self) {
+        SESSIONS.lock().unwrap().remove(&self.0);
+    }
+}
+
+/// Aborts the session's task (which drops its TNS stream and backend PostgreSQL
+/// connection, releasing any locks it held). Returns false if no such session.
+fn sessions_kill(id: u64) -> bool {
+    match SESSIONS.lock().unwrap().get(&id) {
+        Some(meta) => {
+            meta.abort.abort();
+            true
+        }
+        None => false,
+    }
+}
+
+fn json_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+fn render_sessions_json() -> String {
+    let map = SESSIONS.lock().unwrap();
+    let mut out = String::from("[");
+    for (i, (id, meta)) in map.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        let user = meta.user.lock().unwrap().clone().unwrap_or_default();
+        out.push_str(&format!(
+            "{{\"id\":{id},\"addr\":\"{}\",\"user\":\"{}\",\"age_seconds\":{}}}",
+            json_escape(&meta.addr),
+            json_escape(&user),
+            meta.connected.elapsed().as_secs(),
+        ));
+    }
+    out.push(']');
+    out
 }
 
 #[derive(Clone)]
@@ -162,6 +249,10 @@ impl Server {
 
     pub async fn run_with_listener(self, listener: TcpListener) -> Result<()> {
         info!("PgSaci listening on {}", listener.local_addr()?);
+        match self.config.idle_timeout {
+            Some(d) => info!("idle client reaping after {}s", d.as_secs()),
+            None => info!("idle client reaping disabled"),
+        }
 
         if let Some(addr) = self.config.health_addr.clone() {
             let probe = HealthProbe {
@@ -171,7 +262,10 @@ impl Server {
             };
             match TcpListener::bind(&addr).await {
                 Ok(l) => {
-                    info!("health endpoint on {} (/healthz, /readyz)", addr);
+                    info!(
+                        "health endpoint on {} (/healthz, /readyz, /metrics, /sessions)",
+                        addr
+                    );
                     tokio::spawn(serve_health(l, probe));
                 }
                 Err(e) => warn!(%addr, %e, "could not bind health endpoint"),
@@ -194,15 +288,17 @@ impl Server {
             }
             info!(session_id, %addr, "new connection");
             let config = self.config.clone();
-            tokio::spawn(
+            let handle = tokio::spawn(
                 async move {
                     let _guard = SessionGuard::enter();
-                    if let Err(e) = handle_connection(stream, config).await {
+                    let _reg = SessionRegistration(session_id);
+                    if let Err(e) = handle_connection(stream, session_id, config).await {
                         warn!("connection handler error: {}", e);
                     }
                 }
                 .instrument(info_span!("oracle_session", session_id, %addr)),
             );
+            sessions_register(session_id, addr.to_string(), handle.abort_handle());
         }
 
         // Graceful drain: give live sessions a bounded window to finish.
@@ -252,7 +348,10 @@ struct HealthProbe {
 
 /// Minimal HTTP/1.1 health server. `/healthz` = process/listener up;
 /// `/readyz` = a fresh TCP connection to the configured PostgreSQL port
-/// succeeds. No external HTTP dependency: one request line, one response.
+/// succeeds; `/metrics` = Prometheus text; `GET /sessions` = JSON list of live
+/// Oracle sessions (id, addr, user, age); `DELETE /sessions/<id>` = abort one
+/// (drops its backend PostgreSQL connection, releasing any locks it held). No
+/// external HTTP dependency: one request line, one response.
 async fn serve_health(listener: TcpListener, probe: HealthProbe) {
     loop {
         let Ok((mut stream, _)) = listener.accept().await else {
@@ -266,12 +365,29 @@ async fn serve_health(listener: TcpListener, probe: HealthProbe) {
             let mut buf = [0u8; 1024];
             let n = stream.read(&mut buf).await.unwrap_or(0);
             let head = String::from_utf8_lossy(&buf[..n]);
-            let path = head
-                .lines()
-                .next()
-                .and_then(|l| l.split_whitespace().nth(1))
-                .unwrap_or("/");
-            let (status, body): (&str, String) = if path.starts_with("/readyz") {
+            let request_line = head.lines().next().unwrap_or("");
+            let mut parts = request_line.split_whitespace();
+            let method = parts.next().unwrap_or("GET");
+            let path = parts.next().unwrap_or("/");
+            let (status, body): (&str, String) = if path == "/sessions" || path == "/sessions/" {
+                ("200 OK", render_sessions_json())
+            } else if let Some(rest) = path.strip_prefix("/sessions/") {
+                let id_str = rest.split(['/', '?']).next().unwrap_or("");
+                match id_str.parse::<u64>() {
+                    Ok(id) if method == "DELETE" || method == "POST" => {
+                        if sessions_kill(id) {
+                            ("200 OK", format!("killed session {id}"))
+                        } else {
+                            ("404 Not Found", format!("no session {id}"))
+                        }
+                    }
+                    Ok(_) => (
+                        "405 Method Not Allowed",
+                        "use DELETE /sessions/<id> to kill a session".to_string(),
+                    ),
+                    Err(_) => ("400 Bad Request", "session id must be a number".to_string()),
+                }
+            } else if path.starts_with("/readyz") {
                 let ok = tokio::time::timeout(
                     Duration::from_secs(3),
                     tokio::net::TcpStream::connect((probe_host.as_str(), probe_port)),
@@ -291,8 +407,13 @@ async fn serve_health(listener: TcpListener, probe: HealthProbe) {
             } else {
                 ("404 Not Found", "not found".to_string())
             };
+            let ctype = if body.starts_with('[') || body.starts_with('{') {
+                "application/json"
+            } else {
+                "text/plain"
+            };
             let resp = format!(
-                "HTTP/1.1 {status}\r\ncontent-type: text/plain\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                "HTTP/1.1 {status}\r\ncontent-type: {ctype}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
                 body.len()
             );
             let _ = stream.write_all(resp.as_bytes()).await;
@@ -300,7 +421,7 @@ async fn serve_health(listener: TcpListener, probe: HealthProbe) {
     }
 }
 
-async fn handle_connection(stream: TcpStream, config: Config) -> Result<()> {
+async fn handle_connection(stream: TcpStream, session_id: u64, config: Config) -> Result<()> {
     let mut tns = TnsStream::new(stream);
     tns.set_idle_timeout(config.idle_timeout);
 
@@ -513,6 +634,8 @@ async fn handle_connection(stream: TcpStream, config: Config) -> Result<()> {
         );
         username
     };
+
+    sessions_set_user(session_id, &username);
 
     // Resolve the Oracle username to a pre-declared PostgreSQL password. The
     // login is a challenge/response, so PgSaci must already hold the password to
@@ -1858,5 +1981,27 @@ mod tests {
         assert!(metrics.contains("pgsaci_sessions_active"));
         assert!(metrics.contains("pgsaci_statements_total"));
         assert!(metrics.contains("# TYPE pgsaci_backend_errors_total counter"));
+
+        let sessions = get(health_port, "/sessions").await;
+        assert!(sessions.contains("200 OK"));
+        assert!(sessions.contains("application/json"));
+        assert!(sessions.trim_end().ends_with("[]"));
+        // GET on a session path is method-not-allowed (kill is DELETE/POST).
+        assert!(
+            get(health_port, "/sessions/999999")
+                .await
+                .contains("405 Method Not Allowed")
+        );
+        assert!(
+            get(health_port, "/sessions/notanumber")
+                .await
+                .contains("400 Bad Request")
+        );
+    }
+
+    #[test]
+    fn sessions_json_escapes_and_shapes() {
+        assert_eq!(render_sessions_json(), "[]");
+        assert_eq!(json_escape(r#"a"b\c"#), r#"a\"b\\c"#);
     }
 }
