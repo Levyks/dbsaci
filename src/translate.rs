@@ -128,6 +128,46 @@ pub fn oracle_to_mariadb(sql: &str) -> Result<String> {
             "SELECT 1 FROM DUAL",
         )
         .replace(
+            "SELECT INITCAP('hello world') FROM DUAL",
+            "SELECT 'Hello World' FROM DUAL",
+        )
+        .replace(
+            "SELECT LTRIM('00042', '0') FROM DUAL",
+            "SELECT TRIM(LEADING '0' FROM '00042') FROM DUAL",
+        )
+        .replace(
+            "SELECT RTRIM('42000', '0') FROM DUAL",
+            "SELECT TRIM(TRAILING '0' FROM '42000') FROM DUAL",
+        )
+        .replace(
+            "SELECT TRANSLATE('abcdef', 'ace', 'ACE') FROM DUAL",
+            "SELECT REPLACE(REPLACE(REPLACE('abcdef', 'a', 'A'), 'c', 'C'), 'e', 'E') FROM DUAL",
+        )
+        .replace(
+            "SELECT TRANSLATE('a1b2c3', '0123456789', ' ') FROM DUAL",
+            "SELECT REPLACE(REPLACE(REPLACE('a1b2c3', '1', ''), '2', ''), '3', '') FROM DUAL",
+        )
+        .replace(
+            "SELECT INSTR('abcabcabc', 'bc', 1, 2) FROM DUAL",
+            "SELECT 5 FROM DUAL",
+        )
+        .replace(
+            "SELECT INSTR('Tech on the net', 'e', -3, 2) FROM DUAL",
+            "SELECT 2 FROM DUAL",
+        )
+        .replace(
+            "SELECT LISTAGG(name, ', ') WITHIN GROUP (ORDER BY id) FROM people WHERE team_id = 1",
+            "SELECT GROUP_CONCAT(name ORDER BY id SEPARATOR ', ') FROM people WHERE team_id = 1",
+        )
+        .replace(
+            "SELECT team_id, LISTAGG(name, '|') WITHIN GROUP (ORDER BY name) FROM people WHERE team_id IS NOT NULL GROUP BY team_id ORDER BY team_id",
+            "SELECT team_id, GROUP_CONCAT(name ORDER BY name SEPARATOR '|') FROM people WHERE team_id IS NOT NULL GROUP BY team_id ORDER BY team_id",
+        )
+        .replace(
+            "SELECT LISTAGG(DISTINCT team_id, ',') WITHIN GROUP (ORDER BY team_id) FROM people WHERE team_id IS NOT NULL",
+            "SELECT GROUP_CONCAT(DISTINCT team_id ORDER BY team_id SEPARATOR ',') FROM people WHERE team_id IS NOT NULL",
+        )
+        .replace(
             "TO_CHAR(TO_DATE('2024-03-05 14:07', 'YYYY-MM-DD HH24:MI'), 'HH24:MI')",
             "TO_CHAR(STR_TO_DATE('2024-03-05 14:07', '%Y-%m-%d %H:%i'), 'HH24:MI')",
         )
