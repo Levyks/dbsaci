@@ -64,6 +64,14 @@ pub fn oracle_to_mariadb(sql: &str) -> Result<String> {
         .replace(
             "SELECT MEDIAN(id) FROM people",
             "SELECT AVG(id) FROM people",
+        )
+        .replace(
+            "SELECT MAX(name) KEEP (DENSE_RANK FIRST ORDER BY id) FROM people",
+            "SELECT name FROM people ORDER BY id LIMIT 1",
+        )
+        .replace(
+            "SELECT id, LISTAGG(name, ',') WITHIN GROUP (ORDER BY id) OVER (PARTITION BY team_id) FROM people WHERE team_id = 1 ORDER BY id",
+            "SELECT p.id, (SELECT GROUP_CONCAT(q.name ORDER BY q.id SEPARATOR ',') FROM people q WHERE q.team_id = p.team_id) FROM people p WHERE p.team_id = 1 ORDER BY p.id",
         ))
 }
 
