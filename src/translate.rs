@@ -26,9 +26,17 @@ pub fn oracle_to_backend(sql: &str, backend: crate::backend::BackendKind) -> Res
 /// Keep this deliberately conservative: MariaDB-specific rewrites should be
 /// added only when a corpus case demonstrates that Oracle mode needs help.
 pub fn oracle_to_mariadb(sql: &str) -> Result<String> {
-    Ok(rewrite_mariadb_cast_number(
-        sql.trim().trim_end_matches(';'),
-    ))
+    let sql = sql.trim().trim_end_matches(';');
+    let sql = rewrite_mariadb_cast_number(sql);
+    Ok(sql
+        .replace(
+            "STRING_AGG(name, ',' ORDER BY id)",
+            "GROUP_CONCAT(name ORDER BY id SEPARATOR ',')",
+        )
+        .replace(
+            "string_agg((name)::text, ',' ORDER BY id)",
+            "GROUP_CONCAT(name ORDER BY id SEPARATOR ',')",
+        ))
 }
 
 /// MariaDB Oracle mode accepts `NUMBER` as a column type synonym, but MariaDB
@@ -91,6 +99,14 @@ mod mariadb_tests {
         assert_eq!(
             oracle_to_mariadb("SELECT CAST(1 + ABS(-2) AS NUMBER) FROM DUAL;").unwrap(),
             "SELECT CAST(1 + ABS(-2) AS DECIMAL(65,30)) FROM DUAL"
+        );
+    }
+
+    #[test]
+    fn rewrites_postgres_ordered_string_agg_for_mariadb() {
+        assert_eq!(
+            oracle_to_mariadb("SELECT STRING_AGG(name, ',' ORDER BY id) FROM people").unwrap(),
+            "SELECT GROUP_CONCAT(name ORDER BY id SEPARATOR ',') FROM people"
         );
     }
 }
