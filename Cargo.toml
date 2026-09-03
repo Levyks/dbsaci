@@ -9,6 +9,7 @@ repository = "https://github.com/Levyks/pgsaci"
 [dependencies]
 tokio = { version = "1", features = ["full"] }
 tokio-postgres = { version = "0.7", features = ["with-chrono-0_4"] }
+mysql_async = { version = "0.37", default-features = false, features = ["default-rustls"] }
 bytes = "1"
 thiserror = "1"
 tracing = "0.1"

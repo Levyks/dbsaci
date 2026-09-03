@@ -3,6 +3,7 @@ pub mod backend;
 pub mod buffer;
 pub mod credentials;
 pub mod error;
+pub mod mariadb;
 pub mod profile;
 pub mod server;
 pub mod tns;
