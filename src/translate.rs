@@ -361,8 +361,18 @@ fn rewrite_mariadb_cast_number(sql: &str) -> String {
                 String::new()
             };
             if !target.is_empty() {
+                let expression = if suffix.starts_with('(') {
+                    suffix
+                        .trim_matches(['(', ')'])
+                        .split_once(',')
+                        .and_then(|(_, scale)| scale.trim().parse::<u32>().ok())
+                        .map(|scale| format!("ROUND(({}), {})", &body[..as_pos], scale))
+                        .unwrap_or_else(|| body[..as_pos].to_string())
+                } else {
+                    body[..as_pos].to_string()
+                };
                 out.push_str("CAST(");
-                out.push_str(&body[..as_pos]);
+                out.push_str(&expression);
                 out.push_str(" AS ");
                 out.push_str(&target);
                 out.push(')');
