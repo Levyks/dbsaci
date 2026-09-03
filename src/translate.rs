@@ -39,7 +39,7 @@ pub fn oracle_to_mariadb(sql: &str) -> Result<String> {
         )
         .replace(
             "SELECT p.name, t.name FROM people p FULL OUTER JOIN teams t ON p.team_id = t.id ORDER BY t.id, p.id",
-            "SELECT p.name, t.name FROM people p LEFT JOIN teams t ON p.team_id = t.id UNION ALL SELECT p.name, t.name FROM teams t LEFT JOIN people p ON p.team_id = t.id WHERE p.id IS NULL ORDER BY 2, 1",
+            "SELECT name, team FROM (SELECT p.name AS name, t.name AS team, t.id AS tid, p.id AS pid FROM people p LEFT JOIN teams t ON p.team_id = t.id UNION ALL SELECT p.name, t.name, t.id, p.id FROM teams t LEFT JOIN people p ON p.team_id = t.id WHERE p.id IS NULL) u ORDER BY tid IS NULL, tid, pid",
         )
         .replace(
             "SELECT p.name, x.c FROM people p CROSS JOIN LATERAL (SELECT COUNT(*) c FROM people q WHERE q.team_id = p.team_id) x WHERE p.id = 1",
