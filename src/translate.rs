@@ -30,6 +30,7 @@ pub fn oracle_to_mariadb(sql: &str) -> Result<String> {
     let sql = sql
         .replace("sys_context('USERENV', 'CURRENT_SCHEMA')", "'CORPUS'")
         .replace("SYS_CONTEXT('USERENV', 'CURRENT_SCHEMA')", "'CORPUS'")
+        .replace("public.corpus_shared_ref", "corpus_shared_ref")
         .replace("AS REAL", "AS DOUBLE")
         .replace("AS SMALLINT", "AS SIGNED")
         .replace("AS BIGINT", "AS SIGNED")
