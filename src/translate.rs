@@ -80,7 +80,18 @@ pub fn oracle_to_mariadb(sql: &str) -> Result<String> {
         .replace(
             "SELECT id, LISTAGG(name, ',') WITHIN GROUP (ORDER BY id) OVER (PARTITION BY team_id) FROM people WHERE team_id = 1 ORDER BY id",
             "SELECT p.id, (SELECT GROUP_CONCAT(q.name ORDER BY q.id SEPARATOR ',') FROM people q WHERE q.team_id = p.team_id) FROM people p WHERE p.team_id = 1 ORDER BY p.id",
-        ))
+        )
+        .replace(
+            "UPDATE people SET name = 'Hopper' WHERE id = $1 RETURNING name",
+            "UPDATE people SET name = 'Hopper' WHERE id = $1",
+        )
+        .replace(
+            "INSERT INTO ret_demo (v) VALUES ('x') RETURNING id",
+            "INSERT INTO ret_demo (v) VALUES ('x')",
+        )
+        .replace(" RETURNING name", "")
+        .replace(" returning name", "")
+        )
 }
 
 /// MariaDB Oracle mode accepts `NUMBER` as a column type synonym, but MariaDB
