@@ -26,7 +26,73 @@ pub fn oracle_to_backend(sql: &str, backend: crate::backend::BackendKind) -> Res
 /// Keep this deliberately conservative: MariaDB-specific rewrites should be
 /// added only when a corpus case demonstrates that Oracle mode needs help.
 pub fn oracle_to_mariadb(sql: &str) -> Result<String> {
-    Ok(sql.trim().trim_end_matches(';').to_string())
+    Ok(rewrite_mariadb_cast_number(
+        sql.trim().trim_end_matches(';'),
+    ))
+}
+
+/// MariaDB Oracle mode accepts `NUMBER` as a column type synonym, but MariaDB
+/// 11.4 does not accept it in a `CAST` target. Use a wide decimal for this
+/// expression form; the server still applies Oracle mode's numeric semantics.
+fn rewrite_mariadb_cast_number(sql: &str) -> String {
+    let upper = sql.to_ascii_uppercase();
+    let mut out = String::with_capacity(sql.len());
+    let mut cursor = 0;
+    while let Some(relative) = upper[cursor..].find("CAST(") {
+        let start = cursor + relative;
+        out.push_str(&sql[cursor..start]);
+        let open = start + 4;
+        let Some(close) = mariadb_matching_paren(&upper, open) else {
+            out.push_str(&sql[start..]);
+            return out;
+        };
+        let body = &sql[open + 1..close];
+        let body_upper = body.to_ascii_uppercase();
+        if let Some(as_pos) = body_upper.rfind(" AS NUMBER") {
+            let suffix = &body[as_pos + 10..];
+            if suffix.trim().is_empty() {
+                out.push_str("CAST(");
+                out.push_str(&body[..as_pos]);
+                out.push_str(" AS DECIMAL(65,30))");
+                cursor = close + 1;
+                continue;
+            }
+        }
+        out.push_str(&sql[start..close + 1]);
+        cursor = close + 1;
+    }
+    out.push_str(&sql[cursor..]);
+    out
+}
+
+fn mariadb_matching_paren(sql: &str, open: usize) -> Option<usize> {
+    let mut depth = 0;
+    for (i, byte) in sql.as_bytes().iter().enumerate().skip(open) {
+        match byte {
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod mariadb_tests {
+    use super::oracle_to_mariadb;
+
+    #[test]
+    fn rewrites_number_casts_but_keeps_nested_expression() {
+        assert_eq!(
+            oracle_to_mariadb("SELECT CAST(1 + ABS(-2) AS NUMBER) FROM DUAL;").unwrap(),
+            "SELECT CAST(1 + ABS(-2) AS DECIMAL(65,30)) FROM DUAL"
+        );
+    }
 }
 
 /// Parse one Oracle statement and render its PostgreSQL-compatible form.
