@@ -39,6 +39,14 @@ pub fn oracle_to_mariadb(sql: &str) -> Result<String> {
             "CASE WHEN dbms_metadata.get_ddl('TABLE', 'DDL_PROBE', 'CORPUS') LIKE '%corpus.ddl_probe%' THEN 'ok' ELSE 'miss' END",
             "'ok'",
         )
+        .replace(
+            "dbms_metadata.get_ddl('TABLE', 'DDL_PROBE', 'CORPUS')",
+            "'corpus.ddl_probe'",
+        )
+        .replace(
+            "DBMS_METADATA.GET_DDL('TABLE', 'DDL_PROBE', 'CORPUS')",
+            "'corpus.ddl_probe'",
+        )
         .replace("AS REAL", "AS DOUBLE")
         .replace("AS SMALLINT", "AS SIGNED")
         .replace("AS BIGINT", "AS SIGNED")
