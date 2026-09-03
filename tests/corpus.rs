@@ -17,6 +17,7 @@ use std::thread;
 use std::time::Duration;
 
 use libtest_mimic::{Arguments, Failed, Trial};
+use mysql_async::{Conn as MariaConn, prelude::Queryable};
 use oracle_rs::types::OracleDate;
 use oracle_rs::{Config as OracleConfig, Connection as OracleConnection, Value};
 use testcontainers::core::{ContainerPort, WaitFor};
@@ -121,14 +122,7 @@ fn start_worker(
             rt.block_on(async move {
                 let env = match TestBackend::start(fixtures).await {
                     Ok(env) => {
-                        let major = env
-                            .admin
-                            .query_one("SHOW server_version_num", &[])
-                            .await
-                            .ok()
-                            .and_then(|r| r.get::<_, String>(0).parse::<u32>().ok())
-                            .map(|n| n / 10_000)
-                            .unwrap_or(0);
+                        let major = env.admin.lock().await.server_major().await.unwrap_or(0);
                         let _ = ready_tx.send(Ok(major));
                         env
                     }
@@ -173,9 +167,67 @@ fn run_trial(job_tx: &Sender<Job>, case: Case) -> Result<(), Failed> {
 
 struct TestBackend {
     _container: testcontainers::ContainerAsync<GenericImage>,
-    admin: Client,
+    admin: tokio::sync::Mutex<CorpusAdmin>,
     proxy_port: u16,
     oracle: tokio::sync::Mutex<OracleConnection>,
+}
+
+enum CorpusAdmin {
+    Postgres(Client),
+    #[allow(dead_code)]
+    MariaDb(MariaConn),
+}
+
+impl CorpusAdmin {
+    async fn batch_execute(&mut self, sql: &str) -> Result<(), String> {
+        match self {
+            Self::Postgres(client) => client.batch_execute(sql).await.map_err(|e| e.to_string()),
+            Self::MariaDb(conn) => {
+                for statement in sql.split(';').map(str::trim).filter(|s| !s.is_empty()) {
+                    conn.query_drop(statement)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                }
+                Ok(())
+            }
+        }
+    }
+
+    async fn server_major(&mut self) -> Result<u32, String> {
+        match self {
+            Self::Postgres(client) => client
+                .query_one("SHOW server_version_num", &[])
+                .await
+                .map(|r| r.get::<_, String>(0).parse::<u32>().unwrap_or(0) / 10_000)
+                .map_err(|e| e.to_string()),
+            Self::MariaDb(conn) => conn
+                .query_first::<String, _>("SELECT VERSION()")
+                .await
+                .map_err(|e| e.to_string())
+                .map(|v| {
+                    v.and_then(|v| v.split('.').next()?.parse().ok())
+                        .unwrap_or(0)
+                }),
+        }
+    }
+
+    async fn scalar_text(&mut self, sql: &str) -> Result<String, String> {
+        match self {
+            Self::Postgres(client) => client
+                .query_one(sql, &[])
+                .await
+                .map(|row| pg_scalar_text(&row))
+                .map_err(|e| e.to_string()),
+            Self::MariaDb(conn) => conn
+                .query_first::<mysql_async::Value, _>(sql)
+                .await
+                .map(|row| {
+                    row.map(|r| maria_scalar_text(&r))
+                        .unwrap_or_else(|| "NULL".into())
+                })
+                .map_err(|e| e.to_string()),
+        }
+    }
 }
 
 impl TestBackend {
@@ -252,7 +304,7 @@ impl TestBackend {
         let oracle = tokio::sync::Mutex::new(connect_oracle(proxy_port).await?);
         Ok(Self {
             _container: container,
-            admin,
+            admin: tokio::sync::Mutex::new(CorpusAdmin::Postgres(admin)),
             proxy_port,
             oracle,
         })
@@ -264,9 +316,10 @@ impl TestBackend {
         // A single case must never wedge the whole run (e.g. an accidental
         // non-terminating recursive CTE). On timeout, force a reconnect below.
         let mut timed_out = false;
+        let mut admin = self.admin.lock().await;
         let result = match tokio::time::timeout(
             Duration::from_secs(20),
-            run_case_body(&conn, &self.admin, case),
+            run_case_body(&conn, &mut admin, case),
         )
         .await
         {
@@ -305,7 +358,7 @@ impl TestBackend {
         // Best-effort teardown on the admin connection, for the handful of cases
         // that COMMIT and therefore escape the reset above.
         for stmt in &case.teardown {
-            let _ = self.admin.batch_execute(stmt).await;
+            let _ = admin.batch_execute(stmt).await;
         }
 
         // `ROLLBACK` above also dropped the per-session catalog-facade temp
@@ -387,7 +440,7 @@ async fn query_all(
 
 async fn run_case_body(
     oracle: &OracleConnection,
-    admin: &Client,
+    admin: &mut CorpusAdmin,
     case: &Case,
 ) -> Result<(), String> {
     for setup in &case.setup {
@@ -480,11 +533,10 @@ async fn run_case_body(
     }
 
     if let Some(verify) = &case.verify {
-        let row = admin
-            .query_one(&verify.sql, &[])
+        let actual = admin
+            .scalar_text(&verify.sql)
             .await
             .map_err(|e| format!("`-- verify` query failed: {e}"))?;
-        let actual: String = pg_scalar_text(&row);
         if actual != verify.expected {
             return Err(format!(
                 "independent connection sees `{actual}`, expected `{}` (state was not committed as expected)",
@@ -948,6 +1000,30 @@ fn pg_scalar_text(row: &tokio_postgres::Row) -> String {
         _ => row.get::<_, Option<String>>(0),
     }
     .unwrap_or_else(|| "NULL".to_string())
+}
+
+fn maria_scalar_text(value: &mysql_async::Value) -> String {
+    match value {
+        mysql_async::Value::NULL => "NULL".into(),
+        mysql_async::Value::Bytes(v) => String::from_utf8_lossy(v).into_owned(),
+        mysql_async::Value::Int(v) => v.to_string(),
+        mysql_async::Value::UInt(v) => v.to_string(),
+        mysql_async::Value::Float(v) => v.to_string(),
+        mysql_async::Value::Double(v) => v.to_string(),
+        mysql_async::Value::Date(y, m, d, h, min, s, micros) => {
+            format!("{y:04}-{m:02}-{d:02} {h:02}:{min:02}:{s:02}.{:06}", micros)
+        }
+        mysql_async::Value::Time(neg, days, h, min, s, micros) => {
+            format!(
+                "{}{}:{:02}:{:02}.{:06}",
+                if *neg { "-" } else { "" },
+                days * 24 + u32::from(*h),
+                min,
+                s,
+                micros
+            )
+        }
+    }
 }
 
 fn diff(what: &str, expected: &[String], actual: &[String]) -> String {
