@@ -66,6 +66,14 @@ pub fn oracle_to_mariadb(sql: &str) -> Result<String> {
             "SELECT AVG(id) FROM people",
         )
         .replace(
+            "NUMBER GENERATED ALWAYS AS IDENTITY,",
+            "INT AUTO_INCREMENT PRIMARY KEY,",
+        )
+        .replace(
+            "NUMBER GENERATED ALWAYS AS IDENTITY",
+            "INT AUTO_INCREMENT",
+        )
+        .replace(
             "SELECT MAX(name) KEEP (DENSE_RANK FIRST ORDER BY id) FROM people",
             "SELECT name FROM people ORDER BY id LIMIT 1",
         )
