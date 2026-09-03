@@ -9,7 +9,7 @@ use tokio::task::AbortHandle;
 use tracing::{Instrument, debug, info, info_span, warn};
 
 use crate::auth::{AuthState, hex_upper};
-use crate::backend::{BackendKind, PostgresBackend};
+use crate::backend::{BackendKind, OracleBackend, OracleCursor, PostgresBackend};
 use crate::credentials::Credentials;
 use crate::error::{Error, Result};
 use crate::tns::{PacketType, SduMode, TnsStream, build_accept_response};
@@ -822,7 +822,7 @@ async fn handle_connection(stream: TcpStream, session_id: u64, config: Config) -
             "MariaDB backend is selected but not implemented yet".into(),
         ));
     }
-    let backend = match PostgresBackend::connect(
+    let backend: Arc<dyn OracleBackend> = match PostgresBackend::connect(
         &config.pg_host,
         config.pg_port,
         &username,
@@ -832,7 +832,7 @@ async fn handle_connection(stream: TcpStream, session_id: u64, config: Config) -
     )
     .await
     {
-        Ok(backend) => Arc::new(backend),
+        Ok(backend) => Arc::new(Arc::new(backend)),
         Err(e) => {
             // Report the failure to the client with a sensible ORA- code (e.g.
             // PostgreSQL's `max_connections` -> ORA-00018) instead of dropping
@@ -857,7 +857,7 @@ async fn handle_connection(stream: TcpStream, session_id: u64, config: Config) -
     // 9. Main command loop. At most one streamed cursor is active at a time,
     // matching the way OCI/thin clients drive a single statement through
     // Execute + repeated Fetch.
-    let mut cursor: Option<crate::backend::RowCursor> = None;
+    let mut cursor: Option<Box<dyn OracleCursor>> = None;
     // The Oracle SQL text + bind datatype list of the statement last prepared on
     // this session's cursor. `REEXECUTE` / `REEXECUTE_AND_FETCH` re-run it
     // without re-sending either, so PgSaci has to remember them.
@@ -1161,7 +1161,7 @@ async fn handle_connection(stream: TcpStream, session_id: u64, config: Config) -
                             .unwrap_or(bound.binds.len());
                         match race_break(
                             &mut tns,
-                            &backend,
+                            backend.as_ref(),
                             backend.execute_returning(&pg_sql, &bound.binds),
                         )
                         .await?
@@ -1262,14 +1262,12 @@ async fn handle_connection(stream: TcpStream, session_id: u64, config: Config) -
                                 }
                             };
                             let res = if is_ddl {
-                                backend
-                                    .execute_ddl_with_binds(&pg_sql, &row_bound.binds)
-                                    .await
+                                backend.execute_ddl(&pg_sql, &row_bound.binds).await
                             } else {
                                 race_break(
                                     &mut tns,
-                                    &backend,
-                                    backend.execute_simple_with_binds(&pg_sql, &row_bound.binds),
+                                    backend.as_ref(),
+                                    backend.execute_simple(&pg_sql, &row_bound.binds),
                                 )
                                 .await?
                             };
@@ -1320,7 +1318,7 @@ async fn handle_connection(stream: TcpStream, session_id: u64, config: Config) -
                     if is_query_statement(&pg_sql) {
                         // Abandon any half-consumed prior cursor.
                         if let Some(mut old) = cursor.take() {
-                            old.finish(&backend).await;
+                            old.finish().await;
                         }
                         // Rows are pulled from PostgreSQL incrementally and
                         // delivered via Execute + client-driven Fetch. The first
@@ -1337,8 +1335,8 @@ async fn handle_connection(stream: TcpStream, session_id: u64, config: Config) -
                         };
                         let opened = race_break(
                             &mut tns,
-                            &backend,
-                            backend.open_cursor_with_binds(
+                            backend.as_ref(),
+                            backend.open_cursor(
                                 &pg_sql,
                                 &bound.binds,
                                 crate::backend::DescribeCaps::for_client(
@@ -1351,60 +1349,58 @@ async fn handle_connection(stream: TcpStream, session_id: u64, config: Config) -
                         )
                         .await?;
                         match opened {
-                            Ok(mut cur) => match race_break(
-                                &mut tns,
-                                &backend,
-                                cur.next_batch(&backend, batch),
-                            )
-                            .await?
-                            {
-                                Ok(rows) => {
-                                    let more = !cur.is_exhausted();
-                                    oci_rows_sent = rows.len() as u64;
-                                    let response = if oci_dialect {
-                                        // 0x4e REEXECUTE_AND_FETCH omits the
-                                        // leading DESCRIBE_INFO.
-                                        wire::build_query_response_oci_ex(
-                                            cur.columns(),
-                                            &rows,
-                                            cursor_id,
-                                            more,
-                                            func_code == 0x5E,
-                                        )
-                                    } else {
-                                        build_query_response(
-                                            cur.columns(),
-                                            &rows,
-                                            cursor_id,
-                                            more,
+                            Ok(mut cur) => {
+                                match race_break(&mut tns, backend.as_ref(), cur.next_batch(batch))
+                                    .await?
+                                {
+                                    Ok(rows) => {
+                                        let more = !cur.is_exhausted();
+                                        oci_rows_sent = rows.len() as u64;
+                                        let response = if oci_dialect {
+                                            // 0x4e REEXECUTE_AND_FETCH omits the
+                                            // leading DESCRIBE_INFO.
+                                            wire::build_query_response_oci_ex(
+                                                cur.columns(),
+                                                &rows,
+                                                cursor_id,
+                                                more,
+                                                func_code == 0x5E,
+                                            )
+                                        } else {
+                                            build_query_response(
+                                                cur.columns(),
+                                                &rows,
+                                                cursor_id,
+                                                more,
+                                                response_completion,
+                                                newer_describe_framing,
+                                                req_seq,
+                                            )
+                                        };
+                                        tns.write_packet(PacketType::Data, &response).await?;
+                                        if more {
+                                            cursor = Some(cur);
+                                        } else {
+                                            cur.finish().await;
+                                        }
+                                    }
+                                    Err(e) => {
+                                        warn!("postgres query error: {}", e);
+                                        let (code, message, error_pos) = oracle_error_for_pos(&e);
+                                        write_error_response(
+                                            &mut tns,
+                                            oci_dialect,
                                             response_completion,
                                             newer_describe_framing,
+                                            code,
+                                            &message,
+                                            error_pos,
                                             req_seq,
                                         )
-                                    };
-                                    tns.write_packet(PacketType::Data, &response).await?;
-                                    if more {
-                                        cursor = Some(cur);
-                                    } else {
-                                        cur.finish(&backend).await;
+                                        .await?;
                                     }
                                 }
-                                Err(e) => {
-                                    warn!("postgres query error: {}", e);
-                                    let (code, message, error_pos) = oracle_error_for_pos(&e);
-                                    write_error_response(
-                                        &mut tns,
-                                        oci_dialect,
-                                        response_completion,
-                                        newer_describe_framing,
-                                        code,
-                                        &message,
-                                        error_pos,
-                                        req_seq,
-                                    )
-                                    .await?;
-                                }
-                            },
+                            }
                             Err(e) => {
                                 warn!("postgres query error: {}", e);
                                 let (code, message, error_pos) = oracle_error_for_pos(&e);
@@ -1423,12 +1419,12 @@ async fn handle_connection(stream: TcpStream, session_id: u64, config: Config) -
                         }
                     } else {
                         let result = if is_ddl_statement(&pg_sql) {
-                            backend.execute_ddl_with_binds(&pg_sql, &bound.binds).await
+                            backend.execute_ddl(&pg_sql, &bound.binds).await
                         } else {
                             race_break(
                                 &mut tns,
-                                &backend,
-                                backend.execute_simple_with_binds(&pg_sql, &bound.binds),
+                                backend.as_ref(),
+                                backend.execute_simple(&pg_sql, &bound.binds),
                             )
                             .await?
                         };
@@ -1486,7 +1482,7 @@ async fn handle_connection(stream: TcpStream, session_id: u64, config: Config) -
                     };
                     match cursor.as_mut() {
                         Some(cur) => {
-                            match race_break(&mut tns, &backend, cur.next_batch(&backend, batch))
+                            match race_break(&mut tns, backend.as_ref(), cur.next_batch(batch))
                                 .await?
                             {
                                 Ok(rows) => {
@@ -1515,12 +1511,12 @@ async fn handle_connection(stream: TcpStream, session_id: u64, config: Config) -
                                     };
                                     tns.write_packet(PacketType::Data, &response).await?;
                                     if !more && let Some(mut done) = cursor.take() {
-                                        done.finish(&backend).await;
+                                        done.finish().await;
                                     }
                                 }
                                 Err(e) => {
                                     if let Some(mut done) = cursor.take() {
-                                        done.finish(&backend).await;
+                                        done.finish().await;
                                     }
                                     let (code, message, error_pos) = oracle_error_for_pos(&e);
                                     write_error_response(
@@ -1562,7 +1558,7 @@ async fn handle_connection(stream: TcpStream, session_id: u64, config: Config) -
                     // for the end-of-call reply before closing the socket;
                     // dropping it straight away surfaces as ORA-03113 client-side.
                     if let Some(mut cur) = cursor.take() {
-                        cur.finish(&backend).await;
+                        cur.finish().await;
                     }
                     if oci_dialect {
                         let _ = tns
@@ -1586,9 +1582,9 @@ async fn handle_connection(stream: TcpStream, session_id: u64, config: Config) -
                         "ROLLBACK"
                     };
                     if let Some(mut cur) = cursor.take() {
-                        cur.finish(&backend).await;
+                        cur.finish().await;
                     }
-                    match backend.execute_simple(verb).await {
+                    match backend.execute_simple(verb, &[]).await {
                         Ok(_) => {
                             let resp = if oci_dialect {
                                 wire::build_txn_response_oci()
@@ -1731,7 +1727,7 @@ fn is_query_statement(sql: &str) -> bool {
 /// and should tear the session down.
 async fn race_break<T>(
     tns: &mut TnsStream,
-    backend: &PostgresBackend,
+    backend: &dyn OracleBackend,
     fut: impl std::future::Future<Output = T>,
 ) -> Result<T> {
     tokio::pin!(fut);
