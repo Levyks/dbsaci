@@ -1,21 +1,20 @@
 //! MariaDB backend primitives.
 //!
 //! MariaDB's `SQL_MODE=ORACLE` performs the Oracle-language work in the
-//! database. This module deliberately starts with connection/session setup;
-//! query execution will be moved behind the same backend contract as the
-//! PostgreSQL implementation in a later step.
+//! database. The adapter keeps one backend connection per Oracle session so
+//! transactions, temporary objects, and session settings retain their state.
 
 use std::sync::Arc;
 
-use mysql_async::{Opts, Params, Pool, Value, prelude::Queryable};
+use mysql_async::{Conn, Opts, Params, Value, prelude::Queryable};
 
 use crate::backend::{DescribeCaps, OracleBackend, OracleCursor};
 use crate::error::{Error, Result};
 use crate::wire::{BindValue, ColumnMeta, encode_oracle_number_decimal};
 
-/// A MariaDB connection pool configured for Oracle compatibility mode.
+/// A MariaDB connection configured for Oracle compatibility mode.
 pub struct MariaDbBackend {
-    pool: Pool,
+    conn: tokio::sync::Mutex<Conn>,
 }
 
 struct MariaDbCursor {
@@ -44,9 +43,7 @@ impl OracleCursor for MariaDbCursor {
 }
 
 impl MariaDbBackend {
-    /// Connect and enable MariaDB's Oracle compatibility mode for the initial
-    /// session. The eventual execution adapter will apply the setting whenever
-    /// it checks out a pooled connection.
+    /// Connect and enable MariaDB's Oracle compatibility mode for this session.
     pub async fn connect(
         host: &str,
         port: u16,
@@ -66,26 +63,20 @@ impl MariaDbBackend {
         );
         let opts = Opts::from_url(&url)
             .map_err(|e| Error::Postgres(format!("invalid MariaDB connection URL: {e}")))?;
-        let pool = Pool::new(opts);
-        let mut conn = pool
-            .get_conn()
+        let mut conn = Conn::new(opts)
             .await
             .map_err(|e| Error::Postgres(format!("MariaDB connection failed: {e}")))?;
         conn.query_drop("SET sql_mode = 'ORACLE'")
             .await
             .map_err(|e| Error::Postgres(format!("MariaDB Oracle mode failed: {e}")))?;
-        drop(conn);
-        Ok(Self { pool })
+        Ok(Self {
+            conn: tokio::sync::Mutex::new(conn),
+        })
     }
 
-    /// Lightweight connectivity probe used while the backend contract is
-    /// being extracted.
+    /// Lightweight connectivity probe.
     pub async fn ping(&self) -> Result<()> {
-        let mut conn = self
-            .pool
-            .get_conn()
-            .await
-            .map_err(|e| Error::Postgres(format!("MariaDB connection failed: {e}")))?;
+        let mut conn = self.conn.lock().await;
         conn.query_drop("SELECT 1")
             .await
             .map_err(|e| Error::Postgres(format!("MariaDB query failed: {e}")))
@@ -100,7 +91,7 @@ impl OracleBackend for Arc<MariaDbBackend> {
         binds: &[BindValue],
         _caps: DescribeCaps,
     ) -> Result<Box<dyn OracleCursor>> {
-        let mut conn = self.pool.get_conn().await.map_err(mariadb_error)?;
+        let mut conn = self.conn.lock().await;
         conn.query_drop("SET sql_mode = 'ORACLE'")
             .await
             .map_err(mariadb_error)?;
@@ -152,7 +143,7 @@ impl OracleBackend for Arc<MariaDbBackend> {
     }
 
     async fn execute_simple(&self, sql: &str, binds: &[BindValue]) -> Result<u64> {
-        let mut conn = self.pool.get_conn().await.map_err(mariadb_error)?;
+        let mut conn = self.conn.lock().await;
         conn.query_drop("SET sql_mode = 'ORACLE'")
             .await
             .map_err(mariadb_error)?;

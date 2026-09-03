@@ -12,7 +12,7 @@ use testcontainers::{GenericImage, ImageExt};
 #[tokio::test]
 async fn mariadb_oracle_mode_executes_basic_queries_and_binds() {
     let _ = tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::DEBUG)
+        .with_max_level(tracing::Level::INFO)
         .try_init();
     let container = GenericImage::new("mariadb", "11.4")
         // The official image writes the readiness line through a stream that
@@ -43,7 +43,17 @@ async fn mariadb_oracle_mode_executes_basic_queries_and_binds() {
     let admin = Pool::new(
         Opts::from_url(&format!("mysql://root@{host}:{port}/postgres")).expect("MariaDB URL"),
     );
-    let mut conn = admin.get_conn().await.expect("MariaDB ready");
+    let mut conn = None;
+    for _ in 0..40 {
+        match admin.get_conn().await {
+            Ok(ready) => {
+                conn = Some(ready);
+                break;
+            }
+            Err(_) => tokio::time::sleep(Duration::from_millis(250)).await,
+        }
+    }
+    let mut conn = conn.expect("MariaDB ready");
     conn.query_drop("CREATE USER IF NOT EXISTS 'corpus'@'%' IDENTIFIED BY 'corpus'")
         .await
         .expect("create corpus user");
@@ -97,6 +107,33 @@ async fn mariadb_oracle_mode_executes_basic_queries_and_binds() {
         .await
         .expect("MariaDB NUMBER cast rewrite");
     assert_eq!(result.rows.len(), 1);
+
+    oracle
+        .execute(
+            "CREATE TABLE mariadb_smoke_items (id INT PRIMARY KEY, label VARCHAR(32))",
+            &[],
+        )
+        .await
+        .expect("create table");
+    oracle
+        .execute(
+            "INSERT INTO mariadb_smoke_items (id, label) VALUES (:1, :2)",
+            &[
+                oracle_rs::Value::Integer(9),
+                oracle_rs::Value::String("kept".into()),
+            ],
+        )
+        .await
+        .expect("insert row");
+    let result = oracle
+        .query(
+            "SELECT label FROM mariadb_smoke_items WHERE id = :1",
+            &[oracle_rs::Value::Integer(9)],
+        )
+        .await
+        .expect("query inserted row");
+    assert_eq!(result.rows.len(), 1);
+    oracle.execute("ROLLBACK", &[]).await.expect("rollback");
 
     drop(oracle);
     server.abort();
