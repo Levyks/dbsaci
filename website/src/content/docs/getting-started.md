@@ -8,7 +8,7 @@ extension available, and a PostgreSQL login role for the proxy to use. Below,
 "the client" is any supported Oracle driver.
 
 :::note[Getting the image / binary]
-`docker pull levyks/pgsaci:0.0.7` — a **~10 MB** image (a static musl binary on
+`docker pull levyks/pgsaci:0.0.8` — a **~12 MB** image (a static musl binary on
 `scratch`; pgSaci has no C dependencies). It is also buildable from the repo's
 [`Dockerfile`](https://github.com/Levyks/pgsaci/blob/main/Dockerfile), and
 [building from source](#option-d--build-from-source) is a single `cargo build`.
@@ -39,7 +39,7 @@ services:
     ports: ["5432:5432"]
 
   pgsaci:
-    image: levyks/pgsaci:0.0.7
+    image: levyks/pgsaci:0.0.8
     depends_on: [postgres]
     environment:
       PGSACI_LISTEN: 0.0.0.0:1521
@@ -73,7 +73,7 @@ docker run --rm -p 1521:1521 -p 9500:9500 \
   -e PGSACI_PG_PASSWORD=pgpw \
   -e PGSACI_ORACLE_VERSION=19 \
   -e PGSACI_HEALTH_ADDR=0.0.0.0:9500 \
-  levyks/pgsaci:0.0.7
+  levyks/pgsaci:0.0.8
 ```
 
 Your PostgreSQL must have `orafce` installed in the target database
@@ -131,7 +131,6 @@ var ds = new oracle.jdbc.pool.OracleDataSource();
 ds.setURL("jdbc:oracle:thin:@//localhost:1521/FREEPDB1");
 ds.setUser("appuser");
 ds.setPassword("apppw");
-ds.setConnectionProperty("oracle.jdbc.timezoneAsRegion", "false"); // see notes below
 try (var c = ds.getConnection();
      var rs = c.createStatement().executeQuery("SELECT sysdate FROM dual")) {
     rs.next();
@@ -232,8 +231,17 @@ The practical rule: **use lower-case identifiers in the target schema.** A
 table created in PostgreSQL as `"Employees"` (quoted, mixed case) is not
 reachable from an Oracle client, exactly as it would not be in Oracle itself.
 
-## Oracle JDBC thin driver
+## Time zones
 
-Set `oracle.jdbc.timezoneAsRegion=false` on the connection. The thin driver
-otherwise negotiates the session time zone as a named region, which pgSaci does
-not yet handle; the flag makes it send a fixed offset instead.
+pgSaci follows Oracle's model. `ALTER SESSION SET TIME_ZONE = …` sets the
+session zone — a named IANA region (`'America/Sao_Paulo'`), a fixed offset
+(`'-03:00'`), or `'local'`. `SESSIONTIMEZONE`, `DBTIMEZONE` and
+`SYS_CONTEXT('USERENV', 'SESSIONTIMEZONE')` report it. `CURRENT_TIMESTAMP` /
+`CURRENT_DATE` are in the session zone; `SYSTIMESTAMP` / `SYSDATE` are in the
+database zone (UTC).
+
+PostgreSQL `timestamptz` columns are converted to the session zone on the wire
+— with per-instant, DST-correct offsets for named regions — so a view returning
+one no longer needs an explicit `AT TIME ZONE` / `::timestamp` cast, and the
+Oracle JDBC thin driver does not need `oracle.jdbc.timezoneAsRegion=false`. PG
+`timestamp` (no zone) is returned unchanged.

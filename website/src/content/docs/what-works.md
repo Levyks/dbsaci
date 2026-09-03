@@ -36,6 +36,9 @@ Everything below has golden-corpus coverage. See the
   (nth match, capture group) / `REGEXP_INSTR` / `REGEXP_COUNT`.
 - **Sequences** (`seq.NEXTVAL` / `.CURRVAL`), identity columns.
 - `SYS_CONTEXT('USERENV', …)`, `USER`, `UID`.
+- **Session time zone** — `ALTER SESSION SET TIME_ZONE` (IANA region or fixed
+  offset), `SESSIONTIMEZONE` / `DBTIMEZONE`; `TIMESTAMPTZ` values are converted
+  to the session zone on the wire, DST-correct for named regions.
 
 ## Data dictionary
 

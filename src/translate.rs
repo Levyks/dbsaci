@@ -2825,6 +2825,11 @@ fn normalize_oracle_tokens(sql: &str) -> String {
                 || token.eq_ignore_ascii_case("SYSTIMESTAMP")
             {
                 Some("CURRENT_TIMESTAMP")
+            // Oracle niladic time-zone functions, usable without parens.
+            } else if token.eq_ignore_ascii_case("SESSIONTIMEZONE") && !followed_by_paren {
+                Some("public.sessiontimezone()")
+            } else if token.eq_ignore_ascii_case("DBTIMEZONE") && !followed_by_paren {
+                Some("public.dbtimezone()")
             // Oracle session pseudo-columns / niladic functions. `USER` is
             // upper-cased to match Oracle; only rewrite when it is not a
             // function call like `user(...)`.

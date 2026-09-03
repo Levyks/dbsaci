@@ -1,6 +1,6 @@
 [package]
 name = "pgsaci"
-version = "0.0.7"
+version = "0.0.8"
 edition = "2024"
 license = "WTFPL"
 description = "A proxy that speaks Oracle's TNS/TTC wire protocol on the front and PostgreSQL on the back"
@@ -24,6 +24,7 @@ hmac = "0.12"
 hex = "0.4"
 rand = "0.8"
 chrono = "0.4"
+chrono-tz = "0.10"
 futures-util = { version = "0.3.34", default-features = false, features = ["std"] }
 socket2 = "0.6"
 clap = { version = "4", features = ["derive", "env"] }

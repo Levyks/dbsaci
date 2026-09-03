@@ -2,7 +2,10 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use chrono::{DateTime, Datelike, NaiveDate, NaiveDateTime, Timelike, Utc};
+use chrono::{
+    DateTime, Datelike, FixedOffset, NaiveDate, NaiveDateTime, Offset, TimeZone, Timelike, Utc,
+};
+use chrono_tz::Tz;
 use futures_util::StreamExt;
 use tokio_postgres::types::{FromSql, ToSql, Type};
 use tokio_postgres::{Client, Config as PostgresConfig, NoTls, Row, RowStream};
@@ -17,6 +20,62 @@ enum PostgresBind {
     Text(Option<String>),
     Bytes(Vec<u8>),
     Boolean(bool),
+}
+
+/// The session time zone, tracked so `TIMESTAMPTZ` values are presented in it
+/// (as Oracle does with `SESSIONTIMEZONE`) rather than in UTC. Mirrors the
+/// backend connection's `TimeZone` GUC, which the client drives through
+/// `ALTER SESSION SET TIME_ZONE = …`. A named IANA zone gets per-instant
+/// (DST-correct) offsets; anything else falls back to a fixed offset.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum SessionTz {
+    Utc,
+    Fixed(FixedOffset),
+    Named(Tz),
+}
+
+impl SessionTz {
+    /// The wall-clock an Oracle client should see for a UTC instant.
+    fn wall_clock(self, utc: DateTime<Utc>) -> NaiveDateTime {
+        match self {
+            SessionTz::Utc => utc.naive_utc(),
+            SessionTz::Fixed(off) => utc.with_timezone(&off).naive_local(),
+            SessionTz::Named(tz) => utc.with_timezone(&tz).naive_local(),
+        }
+    }
+
+    /// `(hours, minutes)` UTC offset at `utc`, for `TIMESTAMP WITH TIME ZONE`
+    /// encoding. Both components carry the sign (`-03:30` → `(-3, -30)`).
+    fn offset_hm(self, utc: DateTime<Utc>) -> (i8, i8) {
+        let secs = match self {
+            SessionTz::Utc => 0,
+            SessionTz::Fixed(off) => off.local_minus_utc(),
+            SessionTz::Named(tz) => tz
+                .offset_from_utc_datetime(&utc.naive_utc())
+                .fix()
+                .local_minus_utc(),
+        };
+        ((secs / 3600) as i8, ((secs % 3600) / 60) as i8)
+    }
+
+    /// Parse PostgreSQL's `TimeZone` setting. `offset_secs` is its current
+    /// numeric offset, used only when the name is not a resolvable IANA zone.
+    fn parse(name: &str, offset_secs: i32) -> SessionTz {
+        if matches!(
+            name,
+            "UTC" | "GMT" | "Etc/UTC" | "Etc/GMT" | "Zulu" | "Universal"
+        ) {
+            return SessionTz::Utc;
+        }
+        if let Ok(tz) = name.parse::<Tz>() {
+            return SessionTz::Named(tz);
+        }
+        if offset_secs == 0 {
+            SessionTz::Utc
+        } else {
+            FixedOffset::east_opt(offset_secs).map_or(SessionTz::Utc, SessionTz::Fixed)
+        }
+    }
 }
 
 impl PostgresBind {
@@ -59,6 +118,27 @@ pub struct PostgresBackend {
     /// A repeated statement skips the Parse/Describe round trip. Entries are
     /// dropped on any prepare/execute error (stale plan, reset connection).
     stmt_cache: tokio::sync::Mutex<std::collections::HashMap<String, tokio_postgres::Statement>>,
+    /// Session time zone, mirroring the backend `TimeZone` GUC. `TIMESTAMPTZ`
+    /// values are presented in it (Oracle's `SESSIONTIMEZONE` behaviour).
+    session_tz: std::sync::Mutex<SessionTz>,
+}
+
+/// Read the backend connection's effective time zone.
+async fn read_session_tz(client: &Client) -> SessionTz {
+    match client
+        .query_one(
+            "SELECT current_setting('TimeZone'), (EXTRACT(TIMEZONE FROM now()))::int",
+            &[],
+        )
+        .await
+    {
+        Ok(row) => {
+            let name: String = row.try_get(0).unwrap_or_default();
+            let offset: i32 = row.try_get(1).unwrap_or(0);
+            SessionTz::parse(&name, offset)
+        }
+        Err(_) => SessionTz::Utc,
+    }
 }
 
 /// Upper bound on cached prepared statements per backend connection.
@@ -97,9 +177,16 @@ impl RowCursor {
         while out.len() < n {
             match self.stream.next().await {
                 Some(Ok(row)) => {
+                    let tz = backend.session_tz();
                     let mut enc = Vec::with_capacity(self.columns.len());
                     for (i, col) in self.columns.iter().enumerate() {
-                        enc.push(pg_value_to_oracle_bytes(&row, i, col.oracle_type, self.oci));
+                        enc.push(pg_value_to_oracle_bytes(
+                            &row,
+                            i,
+                            col.oracle_type,
+                            self.oci,
+                            tz,
+                        ));
                     }
                     out.push(enc);
                 }
@@ -300,6 +387,7 @@ impl PostgresBackend {
                 }
             }
         }
+        let session_tz = read_session_tz(&client).await;
         let _ = client.batch_execute("BEGIN").await;
 
         let cancel_token = client.cancel_token();
@@ -308,7 +396,19 @@ impl PostgresBackend {
             statement_timeout,
             cancel_token,
             stmt_cache: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+            session_tz: std::sync::Mutex::new(session_tz),
         })
+    }
+
+    /// Re-read the backend `TimeZone` after the client changes it (via a
+    /// translated `SET TIME ZONE`, from `ALTER SESSION SET TIME_ZONE`).
+    pub(crate) async fn refresh_session_tz(&self) {
+        let tz = read_session_tz(&self.client).await;
+        *self.session_tz.lock().unwrap() = tz;
+    }
+
+    pub(crate) fn session_tz(&self) -> SessionTz {
+        *self.session_tz.lock().unwrap()
     }
 
     /// Prepare `sql`, reusing a cached `Statement` when the same text was
@@ -552,6 +652,17 @@ impl PostgresBackend {
         // also destroys every savepoint established after it, so the wrapper
         // would silently discard a client `SAVEPOINT` the moment it was made.
         let upper = command.to_ascii_uppercase();
+        // A time-zone change (translated from `ALTER SESSION SET TIME_ZONE`)
+        // must also update the tracked session zone so `TIMESTAMPTZ` values and
+        // `SESSIONTIMEZONE` follow it.
+        if upper.starts_with("SET TIME ZONE") || upper.starts_with("SET TIMEZONE") {
+            self.client
+                .batch_execute(command)
+                .await
+                .map_err(|e| Error::Postgres(pg_error_detail(&e)))?;
+            self.refresh_session_tz().await;
+            return Ok(0);
+        }
         if upper.starts_with("SAVEPOINT ")
             || upper.starts_with("RELEASE SAVEPOINT ")
             || upper.starts_with("RELEASE ")
@@ -743,6 +854,14 @@ async fn preflight(client: &Client, pg_user: &str) {
         return;
     }
 
+    // Pre-0.0.5 builds created `sys_context` unqualified, so it could land in
+    // the `oracle` schema and now shadows `public.sys_context` (which resolves
+    // later on the search_path). Drop that stale copy; orafce has no
+    // `sys_context` of its own, so this only removes PgSaci's. Best-effort.
+    let _ = client
+        .batch_execute("DROP FUNCTION IF EXISTS oracle.sys_context(text, text)")
+        .await;
+
     match client
         .query_opt(
             "SELECT extversion FROM pg_extension WHERE extname = 'orafce'",
@@ -918,6 +1037,20 @@ const ORACLE_COMPAT_FACADE: &[&str] = &[
     // no matter which schema is current. Not `pg_temp` — temp functions are not
     // resolved for unqualified calls; not the user's own schema — it drops off
     // the path when CURRENT_SCHEMA is switched.
+    //
+    // SESSIONTIMEZONE follows `ALTER SESSION SET TIME_ZONE`; DBTIMEZONE is fixed
+    // at DB creation (PgSaci has none configurable, so `+00:00`). Defined before
+    // sys_context, which calls them.
+    "CREATE OR REPLACE FUNCTION public.sessiontimezone() RETURNS varchar
+       LANGUAGE sql STABLE AS $fn$
+         SELECT (CASE
+           WHEN current_setting('TimeZone') IN ('UTC','GMT','Etc/UTC','Etc/GMT','Zulu','Universal')
+             THEN '+00:00'
+           WHEN current_setting('TimeZone') LIKE '%/%' THEN current_setting('TimeZone')
+           ELSE to_char(now(), 'TZH:TZM')
+         END)::varchar $fn$",
+    "CREATE OR REPLACE FUNCTION public.dbtimezone() RETURNS varchar
+       LANGUAGE sql IMMUTABLE AS $fn$ SELECT '+00:00'::varchar $fn$",
     "
     CREATE OR REPLACE FUNCTION public.sys_context(p_namespace text, p_parameter text)
       RETURNS text LANGUAGE sql STABLE AS $fn$
@@ -934,6 +1067,8 @@ const ORACLE_COMPAT_FACADE: &[&str] = &[
           WHEN 'DB_NAME'        THEN current_database()
           WHEN 'DB_UNIQUE_NAME' THEN current_database()
           WHEN 'SID'            THEN pg_backend_pid()::text
+          WHEN 'SESSIONTIMEZONE' THEN public.sessiontimezone()
+          WHEN 'DB_TIMEZONE'    THEN public.dbtimezone()
           ELSE NULL
         END
       $fn$",
@@ -2301,7 +2436,13 @@ fn pg_column_to_oracle_meta(
     }
 }
 
-fn pg_value_to_oracle_bytes(row: &Row, idx: usize, oracle_type: u8, oci: bool) -> Option<Vec<u8>> {
+fn pg_value_to_oracle_bytes(
+    row: &Row,
+    idx: usize,
+    oracle_type: u8,
+    oci: bool,
+    tz: SessionTz,
+) -> Option<Vec<u8>> {
     use tokio_postgres::types::Type;
     let col = row.columns().get(idx)?;
 
@@ -2353,7 +2494,7 @@ fn pg_value_to_oracle_bytes(row: &Row, idx: usize, oracle_type: u8, oci: bool) -
             }
             Type::TIMESTAMPTZ => {
                 let v: Option<DateTime<Utc>> = row.try_get(idx).ok().flatten();
-                v.map(|v| encode_oracle_date(v.naive_utc()))
+                v.map(|v| encode_oracle_date(tz.wall_clock(v)))
             }
             _ => {
                 let v: Option<NaiveDate> = row.try_get(idx).ok().flatten();
@@ -2365,10 +2506,12 @@ fn pg_value_to_oracle_bytes(row: &Row, idx: usize, oracle_type: u8, oci: bool) -
         let value: Option<NaiveDateTime> = row.try_get(idx).ok().flatten();
         value.map(|value| encode_oracle_timestamp(value, None))
     } else if oracle_type == 181 {
-        // Oracle TIMESTAMP WITH TIME ZONE: 11-byte form + 2 tz bytes.
-        // PostgreSQL hands back UTC, so the offset is +00:00.
+        // Oracle TIMESTAMP WITH TIME ZONE: the datetime bytes hold the UTC
+        // instant, the trailing 2 bytes its offset in the session zone (the
+        // client renders `utc + offset`). PostgreSQL hands back UTC; attach the
+        // session zone's real offset at that instant instead of a bare +00:00.
         let value: Option<DateTime<Utc>> = row.try_get(idx).ok().flatten();
-        value.map(|value| encode_oracle_timestamp_tz(value.naive_utc(), (0, 0), oci))
+        value.map(|value| encode_oracle_timestamp_tz(value.naive_utc(), tz.offset_hm(value), oci))
     } else if oracle_type == 182 {
         // Oracle INTERVAL YEAR TO MONTH (5 bytes).
         let v: Option<PgInterval> = row.try_get(idx).ok().flatten();
