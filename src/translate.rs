@@ -91,6 +91,20 @@ pub fn oracle_to_mariadb(sql: &str) -> Result<String> {
             "CREATE OR REPLACE VIEW gone_syn AS SELECT * FROM people",
         )
         .replace(
+            "CREATE OR REPLACE SYNONYM t_syn FOR people",
+            "CREATE OR REPLACE VIEW t_syn AS SELECT * FROM people",
+        )
+        .replace("DROP SYNONYM gone_syn", "DROP VIEW gone_syn")
+        .replace("REFRESH MATERIALIZED VIEW ddl_mv", "DO 0")
+        .replace(
+            "ALTER TABLE com_demo MODIFY x COMMENT = ",
+            "ALTER TABLE com_demo MODIFY x DECIMAL COMMENT = ",
+        )
+        .replace(
+            "ALTER TABLE people MODIFY name COMMENT = ",
+            "ALTER TABLE people MODIFY name VARCHAR(40) COMMENT = ",
+        )
+        .replace(
             "CREATE INDEX ddl_fbi_uname ON ddl_fbi (UPPER(name))",
             "CREATE INDEX ddl_fbi_uname ON ddl_fbi ((UPPER(name)))",
         )
