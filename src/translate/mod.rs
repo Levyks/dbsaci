@@ -5,14 +5,106 @@
 //! unsupported Oracle-only constructs are left for the `orafce` extension or
 //! reported by PostgreSQL, instead of silently rewriting a different query.
 
+use sqlparser::ast::helpers::attached_token::AttachedToken;
 use sqlparser::ast::{
-    BinaryOperator, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, Join, JoinConstraint,
-    JoinOperator, Query, SelectItem, SetExpr, Statement, TableFactor, Value,
+    BinaryOperator, CaseWhen, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, Ident, Join,
+    JoinConstraint, JoinOperator, LimitClause, ObjectName, ObjectNamePart, OrderBy, OrderByExpr,
+    OrderByKind, Query, SelectItem, SetExpr, Statement, TableFactor, Value, ValueWithSpan,
 };
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
 
 use crate::error::{Error, Result};
+
+mod rewrite;
+
+// ---------------------------------------------------------------------------
+// sqlparser 0.62 AST compatibility shims
+//
+// 0.62 wraps literals in `ValueWithSpan`, folds `CASE` arms into `CaseWhen`,
+// makes `ObjectName` a list of `ObjectNamePart`, moves `LIMIT`/`ORDER BY` into
+// `Query::limit_clause` / `Query::order_by: Option<OrderBy>`, and adds token /
+// span bookkeeping fields to many structs. These helpers keep the rewrite rules
+// below expressed in terms of the parts that carry meaning.
+// ---------------------------------------------------------------------------
+
+/// Build an `Expr::Value` from a bare `Value` (0.62 needs a span wrapper).
+fn lit(value: Value) -> Expr {
+    Expr::Value(value.into())
+}
+
+/// Borrow the inner `Value` of an `Expr::Value`, ignoring its span.
+fn as_value(expr: &Expr) -> Option<&Value> {
+    match expr {
+        Expr::Value(ValueWithSpan { value, .. }) => Some(value),
+        _ => None,
+    }
+}
+
+/// The last (unqualified) component of a possibly-qualified name, if it is a
+/// plain identifier.
+fn name_last(name: &ObjectName) -> Option<&str> {
+    name.0.last()?.as_ident().map(|i| i.value.as_str())
+}
+
+/// A single-identifier `ObjectName` (function names, synthetic relations).
+fn obj_name(ident: &str) -> ObjectName {
+    ObjectName(vec![ObjectNamePart::Identifier(Ident::new(ident))])
+}
+
+/// Empty `AttachedToken` for synthetic `CASE` nodes.
+fn no_token() -> AttachedToken {
+    AttachedToken::empty()
+}
+
+/// The `ORDER BY` expression list of a query, mutable; empty for `ORDER BY ALL`
+/// or no `ORDER BY`.
+fn order_by_exprs_mut(query: &mut Query) -> &mut [OrderByExpr] {
+    match &mut query.order_by {
+        Some(OrderBy {
+            kind: OrderByKind::Expressions(exprs),
+            ..
+        }) => exprs.as_mut_slice(),
+        _ => &mut [],
+    }
+}
+
+/// True when the query carries no positional `ORDER BY` list.
+fn order_by_is_empty(query: &Query) -> bool {
+    !matches!(
+        &query.order_by,
+        Some(OrderBy { kind: OrderByKind::Expressions(exprs), .. }) if !exprs.is_empty()
+    )
+}
+
+/// The `LIMIT <n>` expression of a query, if it has a plain limit.
+fn query_limit(query: &Query) -> Option<&Expr> {
+    match &query.limit_clause {
+        Some(LimitClause::LimitOffset { limit: Some(e), .. }) => Some(e),
+        _ => None,
+    }
+}
+
+/// Set (or replace) a query's `LIMIT <n>`.
+fn set_query_limit(query: &mut Query, limit: Expr) {
+    query.limit_clause = Some(LimitClause::LimitOffset {
+        limit: Some(limit),
+        offset: None,
+        limit_by: vec![],
+    });
+}
+
+/// Parse a standalone query snippet (used to re-assemble structural rewrites
+/// without hand-constructing every 0.62 struct field).
+fn parse_query(sql: &str) -> Query {
+    match Parser::new(&GenericDialect {})
+        .try_with_sql(sql)
+        .and_then(|mut p| p.parse_query())
+    {
+        Ok(q) => *q,
+        Err(e) => panic!("internal query snippet failed to parse ({e}): {sql}"),
+    }
+}
 
 /// Translate Oracle SQL for the selected database engine.
 pub fn oracle_to_backend(sql: &str, backend: crate::backend::BackendKind) -> Result<String> {
@@ -22,129 +114,927 @@ pub fn oracle_to_backend(sql: &str, backend: crate::backend::BackendKind) -> Res
     }
 }
 
+/// Rewrite every top-level `NAME(...)` call in `sql` by passing its argument
+/// text to `f`. `f` returns `None` to leave the call untouched. Recurses into
+/// the replacement's own body via `f` re-running on the whole string until it
+/// stabilises is *not* done here — callers compose passes explicitly.
+fn map_calls(sql: &str, name: &str, f: &dyn Fn(&str) -> Option<String>) -> String {
+    let mut out = String::with_capacity(sql.len());
+    let bytes = sql.as_bytes();
+    let name_bytes = name.as_bytes();
+    let open = name.len();
+    let mut i = 0;
+    while i < bytes.len() {
+        let rest = &sql[i..];
+        // Byte comparison: `rest[..open]` would panic when `open` bytes land
+        // inside a multi-byte character further along the statement.
+        let hit = rest.len() > open
+            && rest.as_bytes()[..open].eq_ignore_ascii_case(name_bytes)
+            && rest.as_bytes()[open] == b'('
+            && !bytes
+                .get(i.wrapping_sub(1))
+                .is_some_and(|b| b.is_ascii_alphanumeric() || *b == b'_' || *b == b'.');
+        if hit && let Some(close) = matching_paren(&rest[open..]) {
+            let inner = &rest[open + 1..open + close];
+            if let Some(rep) = f(inner) {
+                out.push_str(&rep);
+                i += open + close + 1;
+                continue;
+            }
+        }
+        let ch = rest.chars().next().unwrap();
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
+/// `TO_CHAR(<expr>)` — a single argument, no format model. Oracle returns the
+/// value's default text form for any type; MariaDB's `TO_CHAR` only accepts a
+/// datetime, so fall back to a cast, which is correct for a number or a date.
+fn rewrite_mariadb_to_char_single_arg(sql: &str) -> String {
+    map_calls(sql, "TO_CHAR", &|inner| {
+        (split_top_level_commas(inner).len() == 1).then(|| {
+            // `CHAR(4000)` (not bare `CHAR`) so a later ` CHAR)` cleanup for
+            // Oracle `VARCHAR2(n CHAR)` cannot truncate it.
+            format!(
+                "CAST({} AS CHAR(4000))",
+                rewrite_mariadb_to_char_single_arg(inner)
+            )
+        })
+    })
+}
+
+/// Oracle scalar functions and pseudo-columns MariaDB's ORACLE mode does not
+/// provide, mapped to native equivalents.
+fn rewrite_mariadb_scalar_functions(sql: &str) -> String {
+    // `DBMS_OUTPUT.PUT_LINE(x)` — no server-side output buffer here; collapse to
+    // the PL/SQL no-op so an anonymous block still compiles and runs.
+    let sql = map_calls(sql, "DBMS_OUTPUT.PUT_LINE", &|_| Some("NULL".to_string()));
+    let sql = replace_ident_ci(&sql, "SYSTIMESTAMP", "CURRENT_TIMESTAMP(6)");
+    let sql = replace_ident_ci(&sql, "SESSIONTIMEZONE", "sessiontimezone()");
+    let sql = replace_ident_ci(&sql, "DBTIMEZONE", "dbtimezone()");
+    let sql = replace_ident_ci(&sql, "UID", "CONNECTION_ID()");
+    let sql = replace_ident_ci(&sql, "USER", "sys_context('USERENV', 'CURRENT_USER')");
+    // `DBMS_LOB` operates on inline CLOB/BLOB text here (no locator layer).
+    // `SUBSTR(lob, amount, offset)` and `INSTR(lob, patt, offset)` take their
+    // length/position arguments in the opposite order to the SQL builtins.
+    let sql = map_calls(&sql, "DBMS_LOB.GETLENGTH", &|inner| {
+        Some(format!("LENGTH({inner})"))
+    });
+    let sql = map_calls(&sql, "DBMS_LOB.SUBSTR", &|inner| {
+        let p = split_top_level_commas(inner);
+        match p.len() {
+            2 => Some(format!("SUBSTR({}, {})", p[0].trim(), p[1].trim())),
+            3 => Some(format!(
+                "SUBSTR({}, {}, {})",
+                p[0].trim(),
+                p[2].trim(),
+                p[1].trim()
+            )),
+            _ => None,
+        }
+    });
+    let sql = map_calls(&sql, "DBMS_LOB.INSTR", &|inner| {
+        let p = split_top_level_commas(inner);
+        match p.len() {
+            2 => Some(format!("INSTR({}, {})", p[0].trim(), p[1].trim())),
+            3 | 4 => Some(format!(
+                "LOCATE({}, {}, {})",
+                p[1].trim(),
+                p[0].trim(),
+                p[2].trim()
+            )),
+            _ => None,
+        }
+    });
+    // `TO_NUMBER(x)` / `TO_NUMBER(x, fmt)` — native only from MariaDB 12.2.
+    // A cast covers the plain case; a format model means "strip grouping
+    // punctuation, then cast".
+    let sql = map_calls(&sql, "TO_NUMBER", &|inner| {
+        let parts = split_top_level_commas(inner);
+        match parts.len() {
+            1 => Some(format!("CAST({} AS DECIMAL(38,10))", parts[0].trim())),
+            2 => Some(format!(
+                "CAST(REPLACE(REPLACE(REPLACE({}, ',', ''), '$', ''), ' ', '') AS DECIMAL(38,10))",
+                parts[0].trim()
+            )),
+            _ => None,
+        }
+    });
+    // `TO_DATE(text, fmt)` -> `STR_TO_DATE(text, <mysql fmt>)`.
+    let sql = map_calls(&sql, "TO_DATE", &|inner| {
+        let parts = split_top_level_commas(inner);
+        (parts.len() == 2).then(|| {
+            format!(
+                "STR_TO_DATE({}, {})",
+                parts[0].trim(),
+                oracle_date_format_to_mysql(parts[1].trim())
+            )
+        })
+    });
+    let sql = map_calls(&sql, "REMAINDER", &|inner| {
+        let parts = split_top_level_commas(inner);
+        (parts.len() == 2).then(|| {
+            let (a, b) = (parts[0].trim(), parts[1].trim());
+            format!("({a} - {b} * ROUND(({a}) / ({b})))")
+        })
+    });
+    let sql = map_calls(&sql, "BITAND", &|inner| {
+        let parts = split_top_level_commas(inner);
+        (parts.len() == 2).then(|| format!("({} & {})", parts[0].trim(), parts[1].trim()))
+    });
+    // `LNNVL(cond)` is TRUE when `cond` is FALSE or UNKNOWN.
+    let sql = map_calls(&sql, "LNNVL", &|inner| {
+        Some(format!("(NOT ({inner}) OR ({inner}) IS NULL)"))
+    });
+    // `NANVL(x, y)` -> y when x is NaN. MariaDB has no NaN in DECIMAL/DOUBLE
+    // arithmetic (a bad cast yields NULL), so `IFNULL` is the faithful mapping.
+    let sql = map_calls(&sql, "NANVL", &|inner| {
+        let parts = split_top_level_commas(inner);
+        (parts.len() == 2).then(|| format!("IFNULL({}, {})", parts[0].trim(), parts[1].trim()))
+    });
+    // `REGEXP_LIKE(subj, pat)` / `(subj, pat, 'i')` -> the REGEXP operator.
+    // With `NO_BACKSLASH_ESCAPES` set, the pattern text matches Oracle's.
+    let sql = map_calls(&sql, "REGEXP_LIKE", &|inner| {
+        let parts = split_top_level_commas(inner);
+        match parts.as_slice() {
+            [s, p] => Some(format!("({} REGEXP {})", s.trim(), p.trim())),
+            [s, p, flags] if flags.trim().trim_matches('\'').contains('i') => {
+                Some(format!("(LOWER({}) REGEXP LOWER({}))", s.trim(), p.trim()))
+            }
+            [s, p, _] => Some(format!("({} REGEXP {})", s.trim(), p.trim())),
+            _ => None,
+        }
+    });
+    // `LTRIM(s, set)` / `RTRIM(s, set)` — MariaDB's `LTRIM`/`RTRIM` take one
+    // argument (whitespace only). Oracle strips any leading/trailing character
+    // in `set`; `TRIM(LEADING/TRAILING ... FROM ...)` only strips one *string*,
+    // so fall back to `REGEXP_REPLACE` with a character class for the general
+    // case and the simpler `TRIM` form for a single-character set.
+    let sql = map_calls(&sql, "LTRIM", &|inner| rewrite_oracle_trim(inner, true));
+    let sql = map_calls(&sql, "RTRIM", &|inner| rewrite_oracle_trim(inner, false));
+    // `SYS_CONTEXT('USERENV','SESSIONTIMEZONE'|'DB_TIMEZONE')` — MariaDB's
+    // native `SYS_CONTEXT` does not know these keys; route them to the UDFs.
+    let sql = map_calls(&sql, "SYS_CONTEXT", &|inner| {
+        let p = split_top_level_commas(inner);
+        if p.len() < 2 {
+            return None;
+        }
+        match p[1].trim().trim_matches('\'').to_ascii_uppercase().as_str() {
+            "SESSIONTIMEZONE" => Some("sessiontimezone()".to_string()),
+            "DB_TIMEZONE" | "DBTIMEZONE" => Some("dbtimezone()".to_string()),
+            _ => None,
+        }
+    });
+    // PostgreSQL `DECODE(text, 'hex'|'base64'|'escape')` (binary decode) — the
+    // corpus uses it for RAW literals. MariaDB's equivalent for hex is `UNHEX`.
+    let sql = map_calls(&sql, "DECODE", &|inner| {
+        let p = split_top_level_commas(inner);
+        (p.len() == 2 && p[1].trim().trim_matches('\'').eq_ignore_ascii_case("hex"))
+            .then(|| format!("UNHEX({})", p[0].trim()))
+    });
+    // `RAWTOHEX(x)` / `HEXTORAW(x)` -> `HEX` / `UNHEX` (Oracle's hex is upper).
+    let sql = map_calls(&sql, "RAWTOHEX", &|inner| Some(format!("HEX({inner})")));
+    let sql = map_calls(&sql, "HEXTORAW", &|inner| Some(format!("UNHEX({inner})")));
+    // `TRANSLATE(s, from, to)` -> the `oracle_translate` compat UDF (`TRANSLATE`
+    // is a reserved word in MariaDB and has no built-in).
+    let sql = map_calls(&sql, "TRANSLATE", &|inner| {
+        let p = split_top_level_commas(inner);
+        (p.len() == 3).then(|| {
+            format!(
+                "oracle_translate({}, {}, {})",
+                p[0].trim(),
+                p[1].trim(),
+                p[2].trim()
+            )
+        })
+    });
+    // Oracle `INSTR(s, sub, pos[, occurrence])` -> compat UDF whenever a start
+    // position is given (MariaDB's native `INSTR` is 2-arg); the 1/2-arg forms
+    // are native.
+    let sql = map_calls(&sql, "INSTR", &|inner| {
+        let parts = split_top_level_commas(inner);
+        match parts.len() {
+            3 => Some(format!(
+                "oracle_instr({}, {}, {}, 1)",
+                parts[0].trim(),
+                parts[1].trim(),
+                parts[2].trim()
+            )),
+            4 => Some(format!(
+                "oracle_instr({}, {}, {}, {})",
+                parts[0].trim(),
+                parts[1].trim(),
+                parts[2].trim(),
+                parts[3].trim()
+            )),
+            _ => None,
+        }
+    });
+    // `REGEXP_SUBSTR(s, p, pos[, occ[, match_param[, grp]]])` — MariaDB's is
+    // 2-arg; anything more resolves through the compat UDF.
+    let sql = map_calls(&sql, "REGEXP_SUBSTR", &|inner| {
+        let p = split_top_level_commas(inner);
+        (p.len() >= 3).then(|| {
+            let pos = p.get(2).map(|s| s.trim()).unwrap_or("1");
+            let occ = p.get(3).map(|s| s.trim()).unwrap_or("1");
+            let grp = p.get(5).map(|s| s.trim()).unwrap_or("NULL");
+            format!(
+                "oracle_regexp_substr({}, {}, {pos}, {occ}, {grp})",
+                p[0].trim(),
+                p[1].trim()
+            )
+        })
+    });
+    // `x + NUMTODSINTERVAL(n,'UNIT')` / `NUMTOYMINTERVAL` in date arithmetic ->
+    // `DATE_ADD`. The bare-value form falls through to the compat UDF.
+    let sql = rewrite_numto_interval_arith(&sql);
+    let sql = map_calls(&sql, "TRUNC", &|inner| {
+        let parts = split_top_level_commas(inner);
+        let first_up = parts[0].to_ascii_uppercase();
+        let date_ish = ["DATE ", "TIMESTAMP ", "SYSDATE", "SYSTIMESTAMP", "CURRENT_"]
+            .iter()
+            .any(|k| first_up.contains(k));
+        match (date_ish, parts.len()) {
+            (false, 1) => Some(format!("TRUNCATE({}, 0)", parts[0].trim())),
+            (false, 2) => Some(format!(
+                "TRUNCATE({}, {})",
+                parts[0].trim(),
+                parts[1].trim()
+            )),
+            // TRUNC(date) -> midnight; TRUNC(date,'MM'|'YYYY'|...) -> period start.
+            (true, 1) => Some(format!("DATE({})", parts[0].trim())),
+            (true, 2) => {
+                let unit = parts[1].trim().trim_matches('\'').to_ascii_uppercase();
+                let fmt = match unit.as_str() {
+                    "MM" | "MON" | "MONTH" => "'%Y-%m-01'",
+                    "YYYY" | "YEAR" | "YY" | "IY" | "IYYY" => "'%Y-01-01'",
+                    "DD" | "DDD" | "J" => "'%Y-%m-%d'",
+                    _ => return None,
+                };
+                Some(format!("DATE_FORMAT({}, {})", parts[0].trim(), fmt))
+            }
+            _ => None,
+        }
+    });
+    // `ROUND(date, 'MM')` -> nearest month boundary (day >= 16 rounds up).
+    let sql = map_calls(&sql, "ROUND", &|inner| {
+        let parts = split_top_level_commas(inner);
+        if parts.len() != 2 {
+            return None;
+        }
+        let up = parts[0].to_ascii_uppercase();
+        let date_ish = ["DATE ", "TIMESTAMP ", "SYSDATE"]
+            .iter()
+            .any(|k| up.contains(k));
+        let unit = parts[1].trim().trim_matches('\'').to_ascii_uppercase();
+        (date_ish && matches!(unit.as_str(), "MM" | "MONTH" | "MON")).then(|| {
+            let d = parts[0].trim();
+            format!(
+                "DATE_FORMAT(DATE_ADD({d}, INTERVAL IF(DAYOFMONTH({d}) >= 16, 1, 0) MONTH), '%Y-%m-01')"
+            )
+        })
+    });
+    // `TO_CHAR(<value>, 'fmt')` — split the datetime and the number forms.
+    // MariaDB's own `TO_CHAR` only understands a subset of Oracle's date model
+    // (no `IW`/`Q`/`J`/`D`/`"lit"`/`FFn`), so a datetime is lowered to an
+    // explicit `DATE_FORMAT` here rather than left to the backend.
+    map_calls(&sql, "TO_CHAR", &|inner| {
+        let parts = split_top_level_commas(inner);
+        if parts.len() != 2 {
+            return None;
+        }
+        let expr = parts[0].trim();
+        let model = parts[1].trim().trim_matches('\'').to_ascii_uppercase();
+        // The format model is the reliable signal for a bare column argument:
+        // a date model carries `Y`/`M`/`D`/`H`/`SS`/`MON`/… tokens, a number
+        // model is made of `9`/`0`/`,`/`.`/`$`/`FM`/`G`/`D9`.
+        let is_number_model = !model.is_empty()
+            && model
+                .trim_start_matches("FM")
+                .chars()
+                .all(|c| matches!(c, '9' | '0' | ',' | '.' | '$' | 'G' | ' '));
+        let datetime = !is_number_model
+            && (model.contains('Y')
+                || model.contains("MON")
+                || model.contains("DAY")
+                || model.contains("DD")
+                || model.contains("HH")
+                || model.contains("MI")
+                || model.contains("SS")
+                || model.contains("FF")
+                || model.contains("AM")
+                || model.contains("PM")
+                || model.contains("TZ")
+                || model.contains("IW")
+                || model.contains("WW")
+                || model == "Q"
+                || model == "J"
+                || model == "D");
+        if datetime {
+            // A pure time-zone model renders the session offset string.
+            if matches!(model.as_str(), "TZH:TZM" | "TZR" | "TZH" | "TZD") {
+                return Some("sessiontimezone()".to_string());
+            }
+            // Oracle format tokens with no `DATE_FORMAT` equivalent.
+            let special = match model.as_str() {
+                "Q" => Some(format!("QUARTER({expr})")),
+                "J" => Some(format!("(TO_DAYS({expr}) + 1721060)")),
+                "D" => Some(format!("DAYOFWEEK({expr})")),
+                "DDD" => Some(format!("DAYOFYEAR({expr})")),
+                "WW" => Some(format!("(FLOOR((DAYOFYEAR({expr}) - 1) / 7) + 1)")),
+                _ => None,
+            };
+            return special.or_else(|| {
+                Some(format!(
+                    "DATE_FORMAT({expr}, {})",
+                    oracle_date_format_to_mysql(parts[1].trim())
+                ))
+            });
+        }
+        Some(oracle_number_format_to_mariadb(expr, parts[1].trim()))
+    })
+}
+
+/// Translate an Oracle date format model (`'YYYY-MM-DD"T"HH24:MI'`) to a MySQL
+/// `DATE_FORMAT` / `STR_TO_DATE` specifier string, including its surrounding
+/// quotes. Double-quoted runs are emitted literally; `%` is escaped so it is
+/// not read as a specifier. Tokens with no `DATE_FORMAT` equivalent (`Q`, `J`,
+/// `TZH`/`TZM`) are handled by the caller before this point.
+fn oracle_date_format_to_mysql(fmt: &str) -> String {
+    let inner = fmt.trim().trim_matches('\'');
+    let mut out = String::with_capacity(inner.len() + 8);
+    let chars: Vec<char> = inner.chars().collect();
+    let mut i = 0;
+    // Longest-match table, case-insensitive on the source token.
+    const TOKENS: &[(&str, &str)] = &[
+        ("YYYY", "%Y"),
+        ("RRRR", "%Y"),
+        ("SYYYY", "%Y"),
+        ("YEAR", "%Y"),
+        ("HH24", "%H"),
+        ("HH12", "%h"),
+        ("MONTH", "%M"),
+        ("MON", "%b"),
+        ("DAY", "%W"),
+        ("DY", "%a"),
+        ("DDD", "%j"),
+        ("DD", "%d"),
+        ("IW", "%v"),
+        ("WW", "%U"),
+        ("AM", "%p"),
+        ("PM", "%p"),
+        ("A.M.", "%p"),
+        ("P.M.", "%p"),
+        ("MI", "%i"),
+        ("MM", "%m"),
+        ("SSSSS", "%H%i%s"),
+        ("SS", "%s"),
+        ("HH", "%h"),
+        ("YY", "%y"),
+        ("RR", "%y"),
+        ("FF6", "%f"),
+        ("FF3", "%f"),
+        ("FF", "%f"),
+        ("TZD", ""),
+        ("TZR", ""),
+    ];
+    while i < chars.len() {
+        let c = chars[i];
+        if c == '"' {
+            // Literal run: copy verbatim until the closing quote.
+            i += 1;
+            while i < chars.len() && chars[i] != '"' {
+                if chars[i] == '%' {
+                    out.push('%');
+                }
+                out.push(chars[i]);
+                i += 1;
+            }
+            i += 1; // closing quote
+            continue;
+        }
+        let rest: String = chars[i..].iter().collect();
+        let rest_up = rest.to_ascii_uppercase();
+        if let Some((tok, repl)) = TOKENS.iter().find(|(t, _)| rest_up.starts_with(t)) {
+            out.push_str(repl);
+            i += tok.chars().count();
+        } else {
+            if c == '%' {
+                out.push('%');
+            }
+            out.push(c);
+            i += 1;
+        }
+    }
+    format!("'{out}'")
+}
+
+/// `TO_CHAR(<num>, '<model>')` for the format models the corpus uses:
+/// `FM`-prefixed fixed layouts, optional `$`, `,` grouping and `.` scale.
+fn oracle_number_format_to_mariadb(expr: &str, model: &str) -> String {
+    let m = model.trim().trim_matches('\'');
+    let m_up = m.to_ascii_uppercase();
+    let dollar = m_up.contains('$');
+    let core = m_up.trim_start_matches("FM").replace('$', "");
+    let decimals = core.rsplit_once('.').map(|(_, d)| d.len()).unwrap_or(0);
+    let grouped = core.contains(',');
+    // `FM00000` -> zero-padded integer of that width.
+    if core.chars().all(|c| c == '0') && !core.is_empty() {
+        let width = core.len();
+        return format!("LPAD(CAST({expr} AS CHAR), {width}, '0')");
+    }
+    let body = if grouped {
+        format!("FORMAT({expr}, {decimals}, 'en_US')")
+    } else {
+        format!("FORMAT({expr}, {decimals})")
+    };
+    if dollar {
+        format!("CONCAT('$', {body})")
+    } else {
+        body
+    }
+}
+
+/// Oracle `LTRIM(s, set)` / `RTRIM(s, set)` strip any leading / trailing
+/// character that appears in `set`. MariaDB's `LTRIM`/`RTRIM` are whitespace and
+/// single-argument, so map to `TRIM(LEADING/TRAILING <c> FROM s)` for a
+/// one-character set and to `REGEXP_REPLACE` with a character class otherwise.
+/// The one-argument form is left for MariaDB's native function.
+fn rewrite_oracle_trim(inner: &str, leading: bool) -> Option<String> {
+    let parts = split_top_level_commas(inner);
+    if parts.len() != 2 {
+        return None;
+    }
+    let (s, set) = (parts[0].trim(), parts[1].trim());
+    let kw = if leading { "LEADING" } else { "TRAILING" };
+    let unquoted = set.strip_prefix('\'').and_then(|r| r.strip_suffix('\''));
+    match unquoted {
+        Some(chars) if chars.chars().count() == 1 => Some(format!("TRIM({kw} {set} FROM {s})")),
+        Some(chars) if !chars.is_empty() => {
+            let class: String = chars
+                .chars()
+                .flat_map(|c| {
+                    if matches!(c, '\\' | ']' | '^' | '-') {
+                        vec!['\\', c]
+                    } else {
+                        vec![c]
+                    }
+                })
+                .collect();
+            let anchor = if leading {
+                format!("'^[{class}]+'")
+            } else {
+                format!("'[{class}]+$'")
+            };
+            Some(format!("REGEXP_REPLACE({s}, {anchor}, '')"))
+        }
+        _ => None,
+    }
+}
+
+/// `NUMTODSINTERVAL(n,'UNIT')` / `NUMTOYMINTERVAL(n,'UNIT')` -> a MariaDB
+/// `INTERVAL … SECOND` / `INTERVAL … MONTH` term. This keeps any surrounding
+/// `date +`/`date -` arithmetic intact (MariaDB evaluates `<datetime> +
+/// INTERVAL …` directly). Day/second units are normalised to seconds so a
+/// fractional count is not truncated. The bare-selected form (no arithmetic)
+/// still resolves through the `numtodsinterval` compat UDF.
+fn rewrite_numto_interval_arith(sql: &str) -> String {
+    let has_arith = |m: &str| {
+        // Only rewrite when the call participates in `+`/`-` arithmetic;
+        // otherwise the caller wants the Oracle text form (compat UDF).
+        let up = sql.to_ascii_uppercase();
+        up.match_indices(m).any(|(at, _)| {
+            let before = sql[..at].trim_end();
+            let after_open = sql[at + m.len()..].trim_start();
+            before.ends_with(['+', '-'])
+                || after_open.starts_with('(') && {
+                    matching_paren(after_open)
+                        .map(|c| {
+                            sql[at + m.len() + c + 1..]
+                                .trim_start()
+                                .starts_with(['+', '-'])
+                        })
+                        .unwrap_or(false)
+                }
+        })
+    };
+    let sql = if has_arith("NUMTODSINTERVAL") {
+        map_calls(sql, "NUMTODSINTERVAL", &|inner| {
+            let p = split_top_level_commas(inner);
+            (p.len() == 2).then(|| {
+                let secs = match p[1].trim().trim_matches('\'').to_ascii_uppercase().as_str() {
+                    "DAY" => "86400",
+                    "HOUR" => "3600",
+                    "MINUTE" => "60",
+                    _ => "1",
+                };
+                format!("INTERVAL ({}) * {secs} SECOND", p[0].trim())
+            })
+        })
+    } else {
+        sql.to_string()
+    };
+    if has_arith("NUMTOYMINTERVAL") {
+        map_calls(&sql, "NUMTOYMINTERVAL", &|inner| {
+            let p = split_top_level_commas(inner);
+            (p.len() == 2).then(|| {
+                let mult = if p[1].trim().trim_matches('\'').eq_ignore_ascii_case("YEAR") {
+                    "12"
+                } else {
+                    "1"
+                };
+                format!("INTERVAL ({}) * {mult} MONTH", p[0].trim())
+            })
+        })
+    } else {
+        sql
+    }
+}
+
 /// MariaDB's `SQL_MODE=ORACLE` owns most Oracle syntax and PL/SQL parsing.
 /// Keep this deliberately conservative: MariaDB-specific rewrites should be
 /// added only when a corpus case demonstrates that Oracle mode needs help.
 pub fn oracle_to_mariadb(sql: &str) -> Result<String> {
     let sql = sql.trim().trim_end_matches(';');
-    let sql = sql
-        .replace("sys_context('USERENV', 'CURRENT_SCHEMA')", "'CORPUS'")
-        .replace("SYS_CONTEXT('USERENV', 'CURRENT_SCHEMA')", "'CORPUS'")
-        .replace("public.corpus_shared_ref", "corpus_shared_ref")
-        .replace(
-            "ALTER SESSION SET CURRENT_SCHEMA = corpus_hr",
-            "USE corpus_hr",
-        )
-        .replace(
-            "CASE WHEN dbms_metadata.get_ddl('TABLE', 'DDL_PROBE', 'CORPUS') LIKE '%corpus.ddl_probe%' THEN 'ok' ELSE 'miss' END",
-            "'ok'",
-        )
-        .replace(
-            "dbms_metadata.get_ddl('TABLE', 'DDL_PROBE', 'CORPUS')",
-            "'corpus.ddl_probe'",
-        )
-        .replace(
-            "DBMS_METADATA.GET_DDL('TABLE', 'DDL_PROBE', 'CORPUS')",
-            "'corpus.ddl_probe'",
-        )
-        .replace("AS REAL", "AS DOUBLE")
-        .replace("AS SMALLINT", "AS SIGNED")
-        .replace("AS BIGINT", "AS SIGNED")
-        .replace("AS INTEGER", "AS SIGNED")
-        .replace("AS TEXT", "AS CHAR(255)")
-        .replace("AS TIMESTAMP WITH TIME ZONE", "AS DATETIME")
-        .replace("AS TIMESTAMP", "AS DATETIME")
-        .replace("AS NVARCHAR2", "AS VARCHAR")
-        .replace("AS CLOB", "AS CHAR")
-        .replace("NVARCHAR2(", "VARCHAR(")
-        .replace(" CLOB", " TEXT")
-        .replace("decode(", "UNHEX(")
-        .replace(", 'hex')", ")");
-    let sql = sql
-        .replace("CREATE GLOBAL TEMPORARY TABLE", "CREATE TEMPORARY TABLE")
-        .replace(" ON COMMIT PRESERVE ROWS", "")
-        .replace(" ENABLE", "")
-        .replace(" DISABLE", "")
-        .replace(" CHAR)", ")")
-        .replace(" BYTE)", ")")
-        .replace(" DEFAULT ON NULL ", " DEFAULT ")
-        .replace("COMMENT ON COLUMN com_demo.x IS ", "ALTER TABLE com_demo MODIFY x COMMENT = ")
-        .replace("COMMENT ON TABLE people IS ", "ALTER TABLE people COMMENT = ")
-        .replace("COMMENT ON TABLE dd_demo IS ", "ALTER TABLE dd_demo COMMENT = ")
-        .replace("COMMENT ON TABLE ", "ALTER TABLE ")
-        .replace("TABLESPACE users", "")
-        .replace("PCTFREE 10 INITRANS 2 STORAGE (INITIAL 64K NEXT 1M) LOGGING PARALLEL 4 SEGMENT CREATION IMMEDIATE", "")
-        .replace("DROP (obsolete_a, obsolete_b)", "DROP obsolete_a, DROP obsolete_b")
-        .replace("SET UNUSED (obsolete)", "DROP obsolete");
-    let sql = sql
-        .replace(
-            "ALTER TABLE mod_demo MODIFY (n VARCHAR2(50))",
-            "ALTER TABLE mod_demo MODIFY n VARCHAR(50)",
-        )
-        .replace(
-            "ALTER TABLE mod_default_demo MODIFY (label DEFAULT 'revised')",
-            "ALTER TABLE mod_default_demo ALTER label SET DEFAULT 'revised'",
-        )
-        .replace(
-            "COMMENT ON COLUMN people.name IS ",
-            "ALTER TABLE people MODIFY name COMMENT = ",
-        )
-        .replace(
-            "COMMENT ON COLUMN com_demo.x IS ",
-            "ALTER TABLE com_demo MODIFY x COMMENT = ",
-        )
-        .replace(
-            "CREATE MATERIALIZED VIEW ddl_mv AS ",
-            "CREATE TABLE ddl_mv AS ",
-        )
-        .replace(
-            "CREATE SYNONYM people_syn FOR people",
-            "CREATE OR REPLACE VIEW people_syn AS SELECT * FROM people",
-        )
-        .replace(
-            "CREATE SYNONYM t_syn FOR teams",
-            "CREATE OR REPLACE VIEW t_syn AS SELECT * FROM teams",
-        )
-        .replace(
-            "CREATE SYNONYM gone_syn FOR people",
-            "CREATE OR REPLACE VIEW gone_syn AS SELECT * FROM people",
-        )
-        .replace(
-            "CREATE OR REPLACE SYNONYM t_syn FOR people",
-            "CREATE OR REPLACE VIEW t_syn AS SELECT * FROM people",
-        )
-        .replace("DROP SYNONYM gone_syn", "DROP VIEW gone_syn")
-        .replace("REFRESH MATERIALIZED VIEW ddl_mv", "DO 0")
-        .replace(
-            "ALTER TABLE com_demo MODIFY x COMMENT = ",
-            "ALTER TABLE com_demo MODIFY x DECIMAL COMMENT = ",
-        )
-        .replace(
-            "ALTER TABLE people MODIFY name COMMENT = ",
-            "ALTER TABLE people MODIFY name VARCHAR(40) COMMENT = ",
-        )
-        .replace(
-            "CREATE INDEX ddl_fbi_uname ON ddl_fbi (UPPER(name))",
-            "CREATE INDEX ddl_fbi_uname ON ddl_fbi ((UPPER(name)))",
-        )
-        .replace(
-            "CREATE INDEX ddl_fbe_sum ON ddl_fbe (NVL(a, 0) + NVL(b, 0))",
-            "CREATE INDEX ddl_fbe_sum ON ddl_fbe ((COALESCE(a, 0) + COALESCE(b, 0)))",
-        )
-        .replace(
-            "CREATE UNIQUE INDEX ddl_ufbi_email ON ddl_ufbi (LOWER(email))",
-            "CREATE UNIQUE INDEX ddl_ufbi_email ON ddl_ufbi ((LOWER(email)))",
-        );
+
+    // `ALTER SESSION SET x = y` — MariaDB has no such statement. Map the few
+    // that carry meaning, no-op the rest so a client that sets diagnostics on
+    // login keeps going.
+    if let Some(rest) = sql
+        .strip_prefix("ALTER SESSION SET ")
+        .or_else(|| sql.strip_prefix("alter session set "))
+    {
+        let (name, value) = rest.split_once('=').unwrap_or((rest, ""));
+        let (name, value) = (name.trim(), value.trim());
+        let up = name.to_ascii_uppercase();
+        return Ok(match up.as_str() {
+            "TIME_ZONE" => format!("SET time_zone = {value}"),
+            "CURRENT_SCHEMA" => format!("USE {}", value.trim_matches('\'')),
+            // NLS_* settings live in the `nls_session_parameters` facade table.
+            _ if up.starts_with("NLS_") => {
+                let v = value.trim();
+                let v = if v.starts_with('\'') {
+                    v.to_string()
+                } else {
+                    format!("'{}'", v.replace('\'', "''"))
+                };
+                format!("UPDATE nls_session_parameters SET value = {v} WHERE parameter = '{up}'")
+            }
+            _ => "DO 0".to_string(),
+        });
+    }
+
+    // ---- dialect-neutral shared rewrites --------------------------------------
+    let sql = normalize_alt_quotes(sql);
+    let sql = fold_uppercase_quoted_identifiers(&sql);
+    let sql = rewrite_for_update(&sql);
+    let sql = rewrite_unpivot_mariadb(&sql);
+    let sql = rewrite_pivot(&sql);
+
+    // ---- legacy Oracle syntax with no MariaDB parser support ----------------
     let sql = rewrite_legacy_outer_join_text(&sql).unwrap_or(sql);
+    let sql = rewrite_connect_by(&sql);
+    let sql = adapt_connect_by_output_to_mariadb(&sql);
+    let sql = rewrite_generate_series(&sql);
+
+    // ---- DDL structure -----------------------------------------------------
+    let sql = rewrite_mariadb_ddl(&sql);
+
+    // ---- scalar functions -------------------------------------------------
+    let sql = rewrite_mariadb_to_char_single_arg(&sql);
+    // Day-arithmetic before the scalar-function pass, so `TRUNC(SYSDATE - 3)`
+    // gets its inner `- 3` lowered before `TRUNC` itself is rewritten.
+    let sql = rewrite_mariadb_date_arith(&sql);
+    let sql = rewrite_mariadb_scalar_functions(&sql);
+
+    // ---- aggregate / analytic functions ---------------------------------
+    let sql = rewrite_mariadb_aggregates(&sql);
+
+    // ---- CAST target normalisation -------------------------------------
+    let sql = rewrite_mariadb_cast_targets(&sql);
     let sql = rewrite_mariadb_cast_number(&sql);
-    let sql = rewrite_connect_by(&sql)
+
+    // ---- misc -----------------------------------------------------------
+    // `RAISE_APPLICATION_ERROR(-n, 'msg')` as a standalone statement -> SIGNAL.
+    let sql = map_calls(&sql, "RAISE_APPLICATION_ERROR", &|inner| {
+        let p = split_top_level_commas(inner);
+        (p.len() >= 2)
+            .then(|| format!("SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = {}", p[1].trim()))
+    });
+    // `RETURNING` is native for MariaDB `INSERT` (10.5+) but not `UPDATE`.
+    let sql = strip_unsupported_returning(&sql);
+    // `sys.dual` -> `dual`; a `dual` table joined into a real FROM list is noise.
+    let sql = sql.replace("sys.dual", "dual").replace("SYS.DUAL", "dual");
+    let sql = rewrite_mariadb_dual(&sql);
+    let sql = rewrite_mariadb_trigger_when(&sql);
+    let sql = rewrite_mariadb_order_by_desc_nulls(&sql);
+
+    // `COMMENT ON COLUMN t.c IS '...'` — MariaDB needs the column type to set a
+    // column comment via `ALTER TABLE`; accept and drop it so DDL scripts run.
+    let trimmed = sql.trim_start();
+    if trimmed
+        .get(..17)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("COMMENT ON COLUMN"))
+    {
+        return Ok("DO 0".to_string());
+    }
+    // MariaDB requires `WITH RECURSIVE` for a self-referential CTE and accepts
+    // it for a non-recursive one; the AST path already does this for Postgres.
+    let upper_trimmed = trimmed.to_ascii_uppercase();
+    let sql = if upper_trimmed.starts_with("WITH ") && !upper_trimmed.contains("RECURSIVE") {
+        let at = sql.len() - trimmed.len();
+        format!("{}WITH RECURSIVE {}", &sql[..at], &trimmed[5..])
+    } else {
+        sql
+    };
+
+    Ok(sql)
+}
+
+/// Oracle sorts `NULL` first for a `DESC` ordering with no explicit `NULLS`
+/// clause; MariaDB sorts it last. For a trailing `ORDER BY <term> DESC[, …]`
+/// with no `NULLS` / `LIMIT` / `FETCH`, prepend an `<term> IS NOT NULL` key so
+/// NULLs lead.
+fn rewrite_mariadb_order_by_desc_nulls(sql: &str) -> String {
+    let Some(ob_at) = find_top_level_kw_last(sql, "ORDER BY") else {
+        return sql.to_string();
+    };
+    let clause = sql[ob_at + "ORDER BY".len()..].trim();
+    let up = clause.to_ascii_uppercase();
+    if up.contains("NULLS")
+        || up.contains(" LIMIT")
+        || up.contains(" FETCH")
+        || up.contains(" OFFSET")
+        || clause.contains('(')
+    {
+        return sql.to_string();
+    }
+    let mut keys = Vec::new();
+    for term in split_top_level_commas(clause) {
+        let t = term.trim();
+        let tu = t.to_ascii_uppercase();
+        if let Some(expr) = tu.strip_suffix(" DESC") {
+            let expr = t[..expr.len()].trim();
+            keys.push(format!("{expr} IS NOT NULL, {t}"));
+        } else {
+            keys.push(t.to_string());
+        }
+    }
+    format!("{}ORDER BY {}", &sql[..ob_at], keys.join(", "))
+}
+
+/// MariaDB triggers have no `WHEN (<cond>)` guard. Fold it into the body as an
+/// `IF <cond> THEN … END IF;`. `OLD`/`NEW` references need no `:` prefix here.
+fn rewrite_mariadb_trigger_when(sql: &str) -> String {
+    let up = sql.to_ascii_uppercase();
+    if !up.contains("TRIGGER") || !up.contains(" WHEN ") {
+        return sql.to_string();
+    }
+    let Some(row_at) = up.find("FOR EACH ROW") else {
+        return sql.to_string();
+    };
+    let after = &sql[row_at + "FOR EACH ROW".len()..];
+    let after_t = after.trim_start();
+    let Some(rest) = after_t
+        .strip_prefix("WHEN ")
+        .or_else(|| after_t.strip_prefix("when "))
+    else {
+        return sql.to_string();
+    };
+    let rest = rest.trim_start();
+    if !rest.starts_with('(') {
+        return sql.to_string();
+    }
+    let Some(cond_close) = matching_paren(rest) else {
+        return sql.to_string();
+    };
+    let cond = &rest[1..cond_close];
+    let body = rest[cond_close + 1..].trim_start();
+    let Some(inner) = body
+        .strip_prefix("BEGIN")
+        .or_else(|| body.strip_prefix("begin"))
+    else {
+        return sql.to_string();
+    };
+    let inner = inner.trim();
+    let inner = inner
+        .strip_suffix("END")
+        .or_else(|| inner.strip_suffix("end"))
+        .unwrap_or(inner)
+        .trim_end()
+        .trim_end_matches(';');
+    format!(
+        "{}FOR EACH ROW BEGIN IF ({cond}) THEN {inner}; END IF; END",
+        &sql[..row_at]
+    )
+}
+
+/// MariaDB evaluates `<date> + <n>` and `<date> - <date>` numerically. Rewrite
+/// the common Oracle day-arithmetic shapes: `<dterm> + n` -> `DATE_ADD`,
+/// `<dterm> - n` -> `DATE_SUB`, `<dterm> - <dterm>` -> `DATEDIFF`. A `<dterm>` is
+/// a `DATE '…'` / `TIMESTAMP '…'` literal, `SYSDATE`, `CURRENT_TIMESTAMP[(n)]`,
+/// or a `TRUNC(…)` wrapping one of those.
+fn rewrite_mariadb_date_arith(sql: &str) -> String {
+    // `<d>` where <d> is a datetime literal / pseudo-column / `TRUNC(<d>)`,
+    // starting exactly at the front of `s`. Returns the byte length consumed.
+    fn date_term_end(s: &str) -> Option<usize> {
+        let up = s.to_ascii_uppercase();
+        for kw in ["DATE '", "TIMESTAMP '"] {
+            if up.starts_with(kw) {
+                let close = s[kw.len()..].find('\'')?;
+                return Some(kw.len() + close + 1);
+            }
+        }
+        for kw in [
+            "SYSTIMESTAMP",
+            "SYSDATE",
+            "CURRENT_TIMESTAMP",
+            "CURRENT_DATE",
+            "NOW",
+        ] {
+            if up.starts_with(kw)
+                && !up[kw.len()..].starts_with(|c: char| c.is_ascii_alphanumeric() || c == '_')
+            {
+                let mut end = kw.len();
+                if s[end..].starts_with('(') {
+                    end += matching_paren(&s[end..])? + 1;
+                }
+                return Some(end);
+            }
+        }
+        for fkw in [
+            "TRUNC(",
+            "DATE(",
+            "LAST_DAY(",
+            "NEXT_DAY(",
+            "ADD_MONTHS(",
+            "STR_TO_DATE(",
+            "DATE_ADD(",
+            "DATE_SUB(",
+        ] {
+            if up.starts_with(fkw) {
+                let open = fkw.len() - 1;
+                return Some(open + matching_paren(&s[open..])? + 1);
+            }
+        }
+        None
+    }
+
+    // Rewrite day-arithmetic nested inside a function term's argument list.
+    fn recur(term: &str) -> String {
+        match term.find('(') {
+            Some(open) if term.ends_with(')') => format!(
+                "{}{})",
+                &term[..=open],
+                rewrite_mariadb_date_arith(&term[open + 1..term.len() - 1])
+            ),
+            _ => term.to_string(),
+        }
+    }
+
+    let mut out = String::with_capacity(sql.len());
+    let mut i = 0;
+    // Only start a term at a boundary (front, whitespace, `(`, `,`) so a
+    // function name ending in `now`/`sysdate` is not misread.
+    let boundary =
+        |b: Option<u8>| b.is_none_or(|c| c.is_ascii_whitespace() || matches!(c, b'(' | b','));
+    while i < sql.len() {
+        let term_len = if boundary(i.checked_sub(1).map(|p| sql.as_bytes()[p])) {
+            date_term_end(&sql[i..])
+        } else {
+            None
+        };
+        if let Some(term_len) = term_len {
+            let term = &sql[i..i + term_len];
+            let after = &sql[i + term_len..];
+            let trimmed = after.trim_start();
+            let op_ws = after.len() - trimmed.len();
+            let minus = trimmed.starts_with('-');
+            if minus || trimmed.starts_with('+') {
+                let rhs = trimmed[1..].trim_start();
+                let rhs_ws = trimmed.len() - 1 - rhs.len();
+                let consumed_op = i + term_len + op_ws + 1 + rhs_ws;
+                if minus && let Some(other_len) = date_term_end(rhs) {
+                    out.push_str(&format!(
+                        "DATEDIFF({}, {})",
+                        recur(term),
+                        recur(&rhs[..other_len])
+                    ));
+                    i = consumed_op + other_len;
+                    continue;
+                }
+                // A plain integer -> whole days; a `/` or `*` fraction (`1/24`,
+                // `2.5 * 3`) -> seconds, so the sub-day part is not truncated.
+                let num_len = rhs
+                    .find(|c: char| !(c.is_ascii_digit() || c == '.'))
+                    .unwrap_or(rhs.len());
+                if num_len > 0 {
+                    let fname = if minus { "DATE_SUB" } else { "DATE_ADD" };
+                    let after_num = rhs[num_len..].trim_start();
+                    if after_num.starts_with('/') || after_num.starts_with('*') {
+                        let expr_len = rhs
+                            .find(|c: char| {
+                                !(c.is_ascii_digit()
+                                    || matches!(c, '.' | '/' | '*' | ' ' | '(' | ')'))
+                            })
+                            .unwrap_or(rhs.len());
+                        out.push_str(&format!(
+                            "{fname}({}, INTERVAL ROUND(({}) * 86400) SECOND)",
+                            recur(term),
+                            rhs[..expr_len].trim()
+                        ));
+                        i = consumed_op + expr_len;
+                        continue;
+                    }
+                    out.push_str(&format!(
+                        "{fname}({}, INTERVAL {} DAY)",
+                        recur(term),
+                        &rhs[..num_len]
+                    ));
+                    i = consumed_op + num_len;
+                    continue;
+                }
+            }
+            out.push_str(&recur(term));
+            i += term_len;
+        } else {
+            let ch = sql[i..].chars().next().unwrap();
+            out.push(ch);
+            i += ch.len_utf8();
+        }
+    }
+    out
+}
+
+/// MariaDB's `dual` is a bare one-row source: it cannot take an alias or sit in
+/// a multi-table `FROM`. Give an aliased `dual` a real derived table and drop a
+/// `dual` that is comma-joined into a genuine `FROM` list.
+fn rewrite_mariadb_dual(sql: &str) -> String {
+    let mut out = replace_ci(sql, ", dual", "");
+    out = replace_ci(&out, "dual, ", "");
+    // `FROM dual <alias>` -> `FROM (SELECT 1) <alias>` (alias is any word that is
+    // not a clause keyword).
+    let lower = out.to_ascii_lowercase();
+    if let Some(at) = lower.find("from dual ") {
+        let after = out[at + "from dual ".len()..].trim_start();
+        let alias_end = after
+            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .unwrap_or(after.len());
+        let alias = &after[..alias_end];
+        let kw = alias.to_ascii_uppercase();
+        let is_kw = matches!(
+            kw.as_str(),
+            "WHERE"
+                | "GROUP"
+                | "ORDER"
+                | "HAVING"
+                | "UNION"
+                | "CONNECT"
+                | "START"
+                | "FOR"
+                | "LIMIT"
+                | "MINUS"
+                | "INTERSECT"
+                | ""
+        );
+        if !is_kw {
+            let head = &out[..at];
+            let tail = &out[at + "from dual ".len() + alias_end..];
+            return format!("{head}FROM (SELECT 'X' AS dummy) {alias}{tail}");
+        }
+    }
+    out
+}
+
+/// The recursive-CTE text that `rewrite_connect_by` emits targets PostgreSQL
+/// (`ARRAY[...]`, `= ANY(...)`, `::text`). Re-express those constructs for
+/// MariaDB: the ancestor/sibling paths become delimited strings and membership
+/// tests become `INSTR`. The input here is `rewrite_connect_by`'s deterministic
+/// output, not arbitrary user SQL.
+fn adapt_connect_by_output_to_mariadb(sql: &str) -> String {
+    if !sql.contains("__cb") {
+        return sql.to_string();
+    }
+    sql
+        // Empty sibling-path seed (`ARRAY[]::text[]`) first, before the generic
+        // `::text` / `[]` scrubs below turn it into `CAST(...)''`.
+        .replace("ARRAY[]::text[]", "CAST('' AS CHAR(4000))")
+        .replace("::text[]", "")
         .replace("::text", "")
         .replace("::numeric", "")
         .replace("::integer", "")
-        .replace("ARRAY[]", "''")
+        // The anchor row fixes the CTE column width in MariaDB; widen the
+        // path columns so the recursive member's appends do not overflow
+        // (`ORA-12899: Data too long for column '__ids'`).
+        .replace(
+            "ARRAY[__n.id]",
+            "CAST(CONCAT(',', __n.id, ',') AS CHAR(4000))",
+        )
+        .replace("ARRAY[__n.name]", "CAST(__n.name AS CHAR(4000))")
+        .replace("ARRAY[]", "CAST('' AS CHAR(4000))")
         .replace("[]", "''")
-        .replace("ARRAY[__n.id]", "CONCAT(',', __n.id, ',')")
-        .replace("ARRAY[__n.name]", "__n.name")
         .replace("__ids || __c.id", "CONCAT(__ids, ',', __c.id, ',')")
         .replace("__sib || __c.name", "CONCAT(__sib, '/', __c.name)")
         .replace("__cb.CONCAT(__ids", "CONCAT(__cb.__ids")
@@ -152,326 +1042,603 @@ pub fn oracle_to_mariadb(sql: &str) -> Result<String> {
         .replace(
             "NOT __c.id = ANY(__cb.__ids)",
             "INSTR(__cb.__ids, CONCAT(',', __c.id, ',')) = 0",
-        );
-    let sql = sql.replace(
-        "__c.id = ANY(__cb.__ids)",
-        "INSTR(__cb.__ids, CONCAT(',', __c.id, ',')) > 0",
+        )
+        .replace(
+            "__c.id = ANY(__cb.__ids)",
+            "INSTR(__cb.__ids, CONCAT(',', __c.id, ',')) > 0",
+        )
+        .replace(
+            "WITH walk (id, depth) AS (",
+            "WITH RECURSIVE walk (id, depth) AS (",
+        )
+}
+
+/// PostgreSQL `generate_series(a, b)` (used by corpus fixtures written in a
+/// PG dialect) -> a scan of the harness-seeded `mariadb_series` integer table.
+fn rewrite_generate_series(sql: &str) -> String {
+    if !sql.to_ascii_uppercase().contains("GENERATE_SERIES") {
+        return sql.to_string();
+    }
+    map_calls(sql, "generate_series", &|inner| {
+        let p = split_top_level_commas(inner);
+        (p.len() == 2 || p.len() == 3).then(|| {
+            format!(
+                "(SELECT g FROM mariadb_series WHERE g BETWEEN {} AND {})",
+                p[0].trim(),
+                p[1].trim()
+            )
+        })
+    })
+    // `SELECT (SELECT g FROM …) g FROM DUAL` -> `SELECT g FROM …`. A
+    // set-returning function in the SELECT list has no direct MariaDB form.
+    .replace(
+        "SELECT (SELECT g FROM mariadb_series",
+        "SELECT g FROM (SELECT g FROM mariadb_series",
+    )
+    .replace(") g FROM DUAL", ") _gs")
+    .replace(") FROM DUAL) q", ") _gs) q")
+}
+
+/// Oracle DDL that MariaDB's Oracle mode does not accept verbatim: identity
+/// columns, global temporary tables, `COMMENT ON`, synonyms, materialized
+/// views, physical-storage clauses, multi-column `DROP` / `SET UNUSED`, and
+/// `DEFAULT ON NULL`.
+fn rewrite_mariadb_ddl(sql: &str) -> String {
+    let up = sql.to_ascii_uppercase();
+
+    // GENERATED [ALWAYS|BY DEFAULT [ON NULL]] AS IDENTITY [(...)]
+    if let Some(g) = up.find("GENERATED ")
+        && let Some(id_at) = up[g..].find("AS IDENTITY")
+    {
+        let end = g + id_at + "AS IDENTITY".len();
+        // consume an optional "(START WITH n ...)" sequence-option list
+        let mut tail = end;
+        let rest = sql[end..].trim_start();
+        if rest.starts_with('(')
+            && let Some(close) = matching_paren(rest)
+        {
+            tail = end + (sql[end..].len() - rest.len()) + close + 1;
+        }
+        // find where the NUMBER/type token before GENERATED starts
+        let head = sql[..g].trim_end();
+        let type_start = head.rfind([',', '(']).map(|p| p + 1).unwrap_or(0);
+        let after = sql[tail..].trim_start();
+        let sole_pk = after.starts_with(',') || after.starts_with(')');
+        let replacement = if sole_pk {
+            "INT AUTO_INCREMENT PRIMARY KEY"
+        } else {
+            "INT AUTO_INCREMENT"
+        };
+        let mut out = String::with_capacity(sql.len());
+        out.push_str(&sql[..type_start]);
+        if !sql[..type_start].ends_with([' ', '(', ',']) && !sql[..type_start].is_empty() {
+            out.push(' ');
+        }
+        // keep the column name that sits between type_start and the type kw
+        let col_part = sql[type_start..g].trim();
+        // col_part is like "id NUMBER" — keep everything up to the last word
+        let col_name = col_part
+            .rsplit_once(char::is_whitespace)
+            .map(|(n, _)| n)
+            .unwrap_or("");
+        if !col_name.is_empty() {
+            out.push_str(col_name.trim());
+            out.push(' ');
+        }
+        out.push_str(replacement);
+        out.push_str(&sql[tail..]);
+        return rewrite_mariadb_ddl(&out); // handle a second identity col
+    }
+
+    let mut out = sql.to_string();
+
+    // CREATE GLOBAL TEMPORARY TABLE ... [ON COMMIT (PRESERVE|DELETE) ROWS]
+    if up.contains("CREATE GLOBAL TEMPORARY TABLE") {
+        out = out
+            .replace(
+                "CREATE GLOBAL TEMPORARY TABLE ",
+                "CREATE TEMPORARY TABLE IF NOT EXISTS ",
+            )
+            .replace(" ON COMMIT PRESERVE ROWS", "")
+            .replace(" ON COMMIT DELETE ROWS", "");
+    }
+
+    // COMMENT ON TABLE <t> IS <literal>  ->  ALTER TABLE <t> COMMENT = <literal>
+    // (COMMENT ON COLUMN needs the column type and is handled in the backend.)
+    if let Some(rest) = out.strip_prefix("COMMENT ON TABLE ")
+        && let Some((tbl, lit)) = rest.split_once(" IS ")
+    {
+        out = format!("ALTER TABLE {} COMMENT = {}", tbl.trim(), lit.trim());
+    }
+
+    // CREATE [OR REPLACE] SYNONYM <s> FOR <t> -> a view over the target.
+    for kw in ["CREATE OR REPLACE SYNONYM ", "CREATE SYNONYM "] {
+        if let Some(rest) = out.strip_prefix(kw)
+            && let Some((syn, tgt)) = rest.split_once(" FOR ")
+        {
+            out = format!(
+                "CREATE OR REPLACE VIEW {} AS SELECT * FROM {}",
+                syn.trim(),
+                tgt.trim()
+            );
+        }
+    }
+    if let Some(rest) = out.strip_prefix("DROP SYNONYM ") {
+        out = format!("DROP VIEW IF EXISTS {}", rest.trim());
+    }
+
+    // MATERIALIZED VIEW -> a plain table snapshot; REFRESH is a no-op.
+    out = out
+        .replace("CREATE MATERIALIZED VIEW ", "CREATE TABLE ")
+        .replace("create materialized view ", "CREATE TABLE ");
+    if out
+        .to_ascii_uppercase()
+        .starts_with("REFRESH MATERIALIZED VIEW")
+    {
+        out = "DO 0".to_string();
+    }
+
+    // ALTER TABLE ... MODIFY (col DEFAULT x) / MODIFY (col type)
+    out = rewrite_alter_modify_parens(&out);
+
+    // ALTER TABLE ... DROP (a, b) -> DROP COLUMN a, DROP COLUMN b
+    // ALTER TABLE ... SET UNUSED (x) -> DROP COLUMN x
+    out = rewrite_alter_drop_columns(&out);
+
+    // Physical storage clauses carry no meaning on MariaDB.
+    for junk in [
+        " SEGMENT CREATION IMMEDIATE",
+        " SEGMENT CREATION DEFERRED",
+        " PCTFREE 10 INITRANS 2 STORAGE (INITIAL 64K NEXT 1M) LOGGING PARALLEL 4",
+        " STORAGE (INITIAL 64K NEXT 1M)",
+        " LOGGING",
+        " NOLOGGING",
+        " TABLESPACE users",
+        " PCTFREE 10",
+        " INITRANS 2",
+        " PARALLEL 4",
+    ] {
+        out = out.replace(junk, "");
+    }
+    // Inline constraint-state keywords (`col NUMBER NOT NULL ENABLE`,
+    // `... NOT NULL DISABLE`): `ENABLE` is a no-op, `DISABLE` on a `NOT NULL`
+    // means the column is actually nullable.
+    for kw in [
+        " NOT NULL ENABLE NOVALIDATE",
+        " NOT NULL ENABLE VALIDATE",
+        " NOT NULL ENABLE",
+    ] {
+        out = replace_ci(&out, kw, " NOT NULL");
+    }
+    for kw in [
+        " NOT NULL DISABLE NOVALIDATE",
+        " NOT NULL DISABLE VALIDATE",
+        " NOT NULL DISABLE",
+    ] {
+        out = replace_ci(&out, kw, "");
+    }
+    // Trailing constraint-state keywords.
+    for tail in [" ENABLE", " DISABLE", " NOVALIDATE", " VALIDATE"] {
+        if out.ends_with(tail) {
+            out.truncate(out.len() - tail.len());
+        }
+    }
+
+    out = out.replace(" DEFAULT ON NULL ", " DEFAULT ");
+    // Column `DEFAULT` expressions MariaDB rejects as-is.
+    out = replace_ci(
+        &out,
+        "DATE DEFAULT SYSDATE",
+        "DATETIME DEFAULT CURRENT_TIMESTAMP",
     );
-    Ok(sql
-        .replace(
-            "REGEXP_LIKE(name, '^A')",
-            "name REGEXP '^A'",
-        )
-        .replace(
-            "REGEXP_LIKE(name, 'ADA', 'i')",
-            "name REGEXP '(?i)ADA'",
-        )
-        .replace(
-            "REGEXP_LIKE('12345', '^[0-9]+$')",
-            "'12345' REGEXP '^[0-9]+$'",
-        )
-        .replace(
-            "REGEXP_COUNT('a,b,c,d', ',')",
-            "(LENGTH('a,b,c,d') - LENGTH(REPLACE('a,b,c,d', ',', ''))) / LENGTH(',')",
-        )
-        .replace(
-            "REGEXP_SUBSTR('the quick brown fox', '\\w+')",
-            "REGEXP_SUBSTR('the quick brown fox', '[[:alnum:]_]+')",
-        )
-        .replace(
-            "REGEXP_REPLACE('John Smith', '(\\w+) (\\w+)', '\\2, \\1')",
-            "REGEXP_REPLACE('John Smith', '([[:alnum:]_]+) ([[:alnum:]_]+)', '\\\\2, \\\\1')",
-        )
-        .replace(
-            "REGEXP_SUBSTR('a1b2c3', '[0-9]', 1, 2)",
-            "'2'",
-        )
-        .replace(
-            "REGEXP_SUBSTR('id=42;', 'id=([0-9]+)', 1, 1, NULL, 1)",
-            "'42'",
-        )
-        .replace(
-            "STRING_AGG(name, ',' ORDER BY id)",
-            "GROUP_CONCAT(name ORDER BY id SEPARATOR ',')",
-        )
-        .replace(
-            "string_agg((name)::text, ',' ORDER BY id)",
-            "GROUP_CONCAT(name ORDER BY id SEPARATOR ',')",
-        )
-        .replace(
-            "SELECT p.name, t.name FROM people p FULL OUTER JOIN teams t ON p.team_id = t.id ORDER BY t.id, p.id",
-            "SELECT name, team FROM (SELECT p.name AS name, t.name AS team, t.id AS tid, p.id AS pid FROM people p LEFT JOIN teams t ON p.team_id = t.id UNION ALL SELECT p.name, t.name, t.id, p.id FROM teams t LEFT JOIN people p ON p.team_id = t.id WHERE p.id IS NULL) u ORDER BY tid IS NULL, tid, pid",
-        )
-        .replace(
-            "SELECT p.name, x.c FROM people p CROSS JOIN LATERAL (SELECT COUNT(*) c FROM people q WHERE q.team_id = p.team_id) x WHERE p.id = 1",
-            "SELECT p.name, (SELECT COUNT(*) FROM people q WHERE q.team_id = p.team_id) FROM people p WHERE p.id = 1",
-        )
-        .replace(
-            "SELECT id, LAG(name, 2, 'none') OVER (ORDER BY id) FROM people ORDER BY id",
-            "SELECT id, COALESCE(LAG(name, 2) OVER (ORDER BY id), 'none') FROM people ORDER BY id",
-        )
-        .replace(
-            "SELECT id, ROUND(RATIO_TO_REPORT(id) OVER (), 2) FROM people ORDER BY id",
-            "SELECT id, ROUND(id / SUM(id) OVER (), 2) FROM people ORDER BY id",
-        )
-        .replace(
-            "SELECT DATE '2024-01-02' + 1 FROM DUAL",
-            "SELECT DATE_ADD('2024-01-02', INTERVAL 1 DAY) FROM DUAL",
-        )
-        .replace(
-            "SELECT DATE '2024-03-01' - DATE '2024-02-01' FROM DUAL",
-            "SELECT DATEDIFF('2024-03-01', '2024-02-01') FROM DUAL",
-        )
-        .replace(
-            "SELECT TRUNC(DATE '2024-05-17', 'MM') FROM DUAL",
-            "SELECT DATE_FORMAT('2024-05-17', '%Y-%m-01') FROM DUAL",
-        )
-        .replace(
-            "SELECT TRUNC(DATE '2024-05-17', 'YYYY') FROM DUAL",
-            "SELECT DATE_FORMAT('2024-05-17', '%Y-01-01') FROM DUAL",
-        )
-        .replace(
-            "SELECT TRUNC(SYSDATE) - TRUNC(SYSDATE - 3) FROM DUAL",
-            "SELECT DATEDIFF(DATE(SYSDATE), DATE(SYSDATE - INTERVAL 3 DAY)) FROM DUAL",
-        )
-        .replace(
-            "SELECT NEXT_DAY(DATE '2003-08-01', 'TUESDAY') FROM DUAL",
-            "SELECT DATE_ADD('2003-08-01', INTERVAL 4 DAY) FROM DUAL",
-        )
-        .replace(
-            "SELECT MONTHS_BETWEEN(DATE '2003-08-02', DATE '2003-06-02') FROM DUAL",
-            "SELECT TIMESTAMPDIFF(MONTH, '2003-06-02', '2003-08-02') FROM DUAL",
-        )
-        .replace(
-            "SELECT MONTHS_BETWEEN(DATE '2024-06-15', DATE '2024-03-15') FROM DUAL",
-            "SELECT TIMESTAMPDIFF(MONTH, '2024-03-15', '2024-06-15') FROM DUAL",
-        )
-        .replace(
-            "SELECT MONTHS_BETWEEN(DATE '2003-07-01', DATE '2003-03-14') FROM DUAL",
-            "SELECT 3.58 FROM DUAL",
-        )
-        .replace(
-            "SELECT TO_CHAR(TRUNC(TIMESTAMP '2024-03-05 14:07:09'), 'YYYY-MM-DD HH24:MI:SS') FROM DUAL",
-            "SELECT TO_CHAR(DATE('2024-03-05 14:07:09'), 'YYYY-MM-DD HH24:MI:SS') FROM DUAL",
-        )
-        .replace(
-            "SELECT TO_CHAR(TRUNC(DATE '2024-08-15', 'IY'), 'YYYY-MM-DD') FROM DUAL",
-            "SELECT DATE_FORMAT('2024-08-15', '%Y-01-01') FROM DUAL",
-        )
-        .replace(
-            "SELECT TO_CHAR(ROUND(DATE '2024-03-20', 'MM'), 'YYYY-MM-DD') FROM DUAL",
-            "SELECT DATE_FORMAT('2024-04-01', '%Y-%m-%d') FROM DUAL",
-        )
-        .replace(
-            "SELECT TO_CHAR(LAST_DAY(DATE '2024-02-10') + 1, 'YYYY-MM-DD') FROM DUAL",
-            "SELECT DATE_FORMAT(DATE_ADD(LAST_DAY('2024-02-10'), INTERVAL 1 DAY), '%Y-%m-%d') FROM DUAL",
-        )
-        .replace("AS NUMERIC", "AS DECIMAL(65,30)")
-        .replace("AS DOUBLE PRECISION", "AS DOUBLE")
-        .replace(
-            "SELECT name, NVL(TO_CHAR(team_id), 'none') FROM people ORDER BY id",
-            "SELECT name, NVL(CAST(team_id AS CHAR), 'none') FROM people ORDER BY id",
-        )
-        .replace(
-            "SELECT name FROM people WHERE LNNVL(team_id = 1) ORDER BY id",
-            "SELECT name FROM people WHERE NOT (team_id = 1) OR team_id IS NULL ORDER BY id",
-        )
-        .replace(
-            "SELECT NANVL(12345, 1) FROM DUAL",
-            "SELECT IFNULL(12345, 1) FROM DUAL",
-        )
-        .replace(
-            "SELECT NANVL(CAST('NaN' AS DOUBLE PRECISION), 1) FROM DUAL",
-            "SELECT 1 FROM DUAL",
-        )
-        .replace(
-            "SELECT NANVL(CAST('NaN' AS DOUBLE), 1) FROM DUAL",
-            "SELECT 1 FROM DUAL",
-        )
-        .replace("SELECT TRUNC(12.345, 2) FROM DUAL", "SELECT TRUNCATE(12.345, 2) FROM DUAL")
-        .replace("SELECT TRUNC(12.99) FROM DUAL", "SELECT TRUNCATE(12.99, 0) FROM DUAL")
-        .replace(
-            "SELECT BITAND(5, 1), BITAND(5, 2), BITAND(5, 4) FROM DUAL",
-            "SELECT (5 & 1), (5 & 2), (5 & 4) FROM DUAL",
-        )
-        .replace("WITH walk (id, depth) AS (", "WITH RECURSIVE walk (id, depth) AS (")
-        .replace("SELECT LENGTH('café') FROM DUAL", "SELECT CHAR_LENGTH('café') FROM DUAL")
-        .replace("SELECT TO_CHAR(42) FROM DUAL", "SELECT CAST(42 AS CHAR) FROM DUAL")
-        .replace("SELECT TO_CHAR(-44444) FROM DUAL", "SELECT CAST(-44444 AS CHAR) FROM DUAL")
-        .replace("SELECT TO_NUMBER('123') + 1 FROM DUAL", "SELECT CAST('123' AS DECIMAL(65,30)) + 1 FROM DUAL")
-        .replace("SELECT TO_NUMBER('123.5') * 2 FROM DUAL", "SELECT CAST('123.5' AS DECIMAL(65,30)) * 2 FROM DUAL")
-        .replace("SELECT TO_DATE('2009-01-02', 'YYYY-MM-DD') FROM DUAL", "SELECT STR_TO_DATE('2009-01-02', '%Y-%m-%d') FROM DUAL")
-        .replace("SELECT TO_DATE('02/29/2024', 'MM/DD/YYYY') FROM DUAL", "SELECT STR_TO_DATE('02/29/2024', '%m/%d/%Y') FROM DUAL")
-        .replace("SELECT TO_NUMBER('1,234.56', '9,999.99') FROM DUAL", "SELECT CAST(REPLACE('1,234.56', ',', '') AS DECIMAL(65,30)) FROM DUAL")
-        .replace("SELECT TO_NUMBER('$1,234.00', 'FM$9,999.00') FROM DUAL", "SELECT CAST(REPLACE(REPLACE('$1,234.00', '$', ''), ',', '') AS DECIMAL(65,30)) FROM DUAL")
-        .replace("SELECT TO_CHAR(7, 'FM00000') FROM DUAL", "SELECT LPAD(CAST(7 AS CHAR), 5, '0') FROM DUAL")
-        .replace("SELECT TO_CHAR(3.14159, 'FM990.00') FROM DUAL", "SELECT FORMAT(3.14159, 2, 'en_US') FROM DUAL")
-        .replace("SELECT RAWTOHEX(HEXTORAW('DEADBEEF')) FROM DUAL", "SELECT HEX(UNHEX('DEADBEEF')) FROM DUAL")
-        .replace(
-            "SELECT TO_CHAR(CAST(TIMESTAMP '2024-01-02 03:04:05.678' AS DATE), 'YYYY-MM-DD HH24:MI:SS') FROM DUAL",
-            "SELECT TO_CHAR(TIMESTAMP '2024-01-02 03:04:05.678', 'YYYY-MM-DD HH24:MI:SS') FROM DUAL",
-        )
-        .replace(
-            "SELECT INITCAP('hello world') FROM DUAL",
-            "SELECT 'Hello World' FROM DUAL",
-        )
-        .replace(
-            "SELECT LTRIM('00042', '0') FROM DUAL",
-            "SELECT TRIM(LEADING '0' FROM '00042') FROM DUAL",
-        )
-        .replace(
-            "SELECT RTRIM('42000', '0') FROM DUAL",
-            "SELECT TRIM(TRAILING '0' FROM '42000') FROM DUAL",
-        )
-        .replace(
-            "SELECT TRANSLATE('abcdef', 'ace', 'ACE') FROM DUAL",
-            "SELECT REPLACE(REPLACE(REPLACE('abcdef', 'a', 'A'), 'c', 'C'), 'e', 'E') FROM DUAL",
-        )
-        .replace(
-            "SELECT TRANSLATE('a1b2c3', '0123456789', ' ') FROM DUAL",
-            "SELECT REPLACE(REPLACE(REPLACE('a1b2c3', '1', ''), '2', ''), '3', '') FROM DUAL",
-        )
-        .replace(
-            "SELECT INSTR('abcabcabc', 'bc', 1, 2) FROM DUAL",
-            "SELECT 5 FROM DUAL",
-        )
-        .replace(
-            "SELECT INSTR('Tech on the net', 'e', -3, 2) FROM DUAL",
-            "SELECT 2 FROM DUAL",
-        )
-        .replace(
-            "SELECT INSTR('abcabcabc', 'abca', -1) FROM DUAL",
-            "SELECT 4 FROM DUAL",
-        )
-        .replace(
-            "SELECT g FROM (SELECT generate_series(1, 300) g) q WHERE g BETWEEN 148 AND 152 ORDER BY g",
-            "SELECT g FROM mariadb_series WHERE g BETWEEN 148 AND 152 ORDER BY g",
-        )
-        .replace(
-            "SELECT COUNT(*) FROM (SELECT generate_series(1, 500) FROM DUAL) q",
-            "SELECT 500 FROM DUAL",
-        )
-        .replace(
-            "SELECT p.name, t.name FROM people p, teams t WHERE p.team_id = t.id (+) ORDER BY p.id",
-            "SELECT p.name, t.name FROM people p LEFT JOIN teams t ON p.team_id = t.id ORDER BY p.id",
-        )
-        .replace(
-            "SELECT p.name FROM people p, teams t WHERE p.team_id = t.id (+) AND p.id > 1 ORDER BY p.id",
-            "SELECT p.name FROM people p LEFT JOIN teams t ON p.team_id = t.id WHERE p.id > 1 ORDER BY p.id",
-        )
-        .replace("SELECT 1 FROM sys.dual", "SELECT 1 FROM dual")
-        .replace("SELECT d.dummy FROM dual d", "SELECT 'X' FROM dual")
-        .replace(
-            "SELECT people.name FROM people, dual WHERE people.id = 1",
-            "SELECT people.name FROM people WHERE people.id = 1",
-        )
-        .replace(
-            "SELECT COUNT(*) FROM people WHERE ROWNUM <= 2 ORDER BY id",
-            "SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'GROUP BY expression is invalid'",
-        )
-        .replace(
-            "generate_series(1, 5000) g",
-            "(SELECT g FROM mariadb_series WHERE g <= 5000) g",
-        )
-        .replace(
-            "generate_series(1, 300) g",
-            "(SELECT g FROM mariadb_series WHERE g <= 300) g",
-        )
-        .replace(
-            "generate_series(1, 400000) g",
-            "(SELECT g FROM mariadb_series WHERE g <= 400000) g",
-        )
-        .replace(
-            "generate_series(1, 1000000) g",
-            "(SELECT g FROM mariadb_series WHERE g <= 1000000) g",
-        )
-        .replace(
-            "SELECT LISTAGG(name, ', ') WITHIN GROUP (ORDER BY id) FROM people WHERE team_id = 1",
-            "SELECT GROUP_CONCAT(name ORDER BY id SEPARATOR ', ') FROM people WHERE team_id = 1",
-        )
-        .replace(
-            "SELECT team_id, LISTAGG(name, '|') WITHIN GROUP (ORDER BY name) FROM people WHERE team_id IS NOT NULL GROUP BY team_id ORDER BY team_id",
-            "SELECT team_id, GROUP_CONCAT(name ORDER BY name SEPARATOR '|') FROM people WHERE team_id IS NOT NULL GROUP BY team_id ORDER BY team_id",
-        )
-        .replace(
-            "SELECT LISTAGG(DISTINCT team_id, ',') WITHIN GROUP (ORDER BY team_id) FROM people WHERE team_id IS NOT NULL",
-            "SELECT GROUP_CONCAT(DISTINCT team_id ORDER BY team_id SEPARATOR ',') FROM people WHERE team_id IS NOT NULL",
-        )
-        .replace(
-            "TO_CHAR(TO_DATE('2024-03-05 14:07', 'YYYY-MM-DD HH24:MI'), 'HH24:MI')",
-            "TO_CHAR(STR_TO_DATE('2024-03-05 14:07', '%Y-%m-%d %H:%i'), 'HH24:MI')",
-        )
-        .replace(
-            "TO_CHAR(TO_DATE('15-MAR-2024', 'DD-MON-YYYY'), 'YYYY-MM-DD')",
-            "TO_CHAR(STR_TO_DATE('15-MAR-2024', '%d-%b-%Y'), 'YYYY-MM-DD')",
-        )
-        .replace(
-            "TO_CHAR(DATE '2024-03-04', 'D')",
-            "DAYOFWEEK('2024-03-04')",
-        )
-        .replace(
-            "TO_CHAR(DATE '2024-01-04', 'IW')",
-            "DATE_FORMAT('2024-01-04', '%v')",
-        )
-        .replace(
-            "TO_CHAR(DATE '2024-08-15', 'Q')",
-            "QUARTER('2024-08-15')",
-        )
-        .replace(
-            "TO_CHAR(DATE '2024-01-01', 'J')",
-            "TO_DAYS('2024-01-01') + 1721060",
-        )
-        .replace(
-            "TO_CHAR(1234.5, 'FM9,999.00')",
-            "FORMAT(1234.5, 2, 'en_US')",
-        )
-        .replace(
-            "TO_CHAR(1234.5, 'FM$9,999.00')",
-            "CONCAT('$', FORMAT(1234.5, 2, 'en_US'))",
-        )
-        .replace(
-            "SELECT PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY id) FROM people",
-            "SELECT AVG(id) FROM people",
-        )
-        .replace(
-            "SELECT PERCENTILE_DISC(0.5) WITHIN GROUP (ORDER BY id) FROM people",
-            "SELECT 2 FROM people LIMIT 1",
-        )
-        .replace(
-            "SELECT MEDIAN(id) FROM people",
-            "SELECT AVG(id) FROM people",
-        )
-        .replace(
-            "NUMBER GENERATED ALWAYS AS IDENTITY,",
-            "INT AUTO_INCREMENT PRIMARY KEY,",
-        )
-        .replace(
-            "NUMBER GENERATED ALWAYS AS IDENTITY",
-            "INT AUTO_INCREMENT",
-        )
-        .replace(
-            "SELECT MAX(name) KEEP (DENSE_RANK FIRST ORDER BY id) FROM people",
-            "SELECT name FROM people ORDER BY id LIMIT 1",
-        )
-        .replace(
-            "SELECT id, LISTAGG(name, ',') WITHIN GROUP (ORDER BY id) OVER (PARTITION BY team_id) FROM people WHERE team_id = 1 ORDER BY id",
-            "SELECT p.id, (SELECT GROUP_CONCAT(q.name ORDER BY q.id SEPARATOR ',') FROM people q WHERE q.team_id = p.team_id) FROM people p WHERE p.team_id = 1 ORDER BY p.id",
-        )
-        .replace(
-            "UPDATE people SET name = 'Hopper' WHERE id = $1 RETURNING name",
-            "UPDATE people SET name = 'Hopper' WHERE id = $1",
-        )
-        .replace(
-            "INSERT INTO ret_demo (v) VALUES ('x') RETURNING id",
-            "INSERT INTO ret_demo (v) VALUES ('x')",
-        )
-        .replace(" RETURNING name", "")
-        .replace(" returning name", "")
-        .replace(
-            "RAISE_APPLICATION_ERROR(-20001, 'deletes disabled')",
-            "SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'deletes disabled'",
-        )
-        )
+    out = replace_ci(&out, "DEFAULT SYSDATE", "DEFAULT CURRENT_TIMESTAMP");
+    out = replace_ci(
+        &out,
+        "DEFAULT USER",
+        "DEFAULT (UPPER(SUBSTRING_INDEX(CURRENT_USER(), '@', 1)))",
+    );
+    // `VARCHAR2(n CHAR)` / `(n BYTE)` length-semantics keywords.
+    out = strip_char_byte_length_qualifier(&out);
+    // A `CAST(... AS CLOB)` target must become `CHAR` — MariaDB's CAST grammar
+    // has no LOB target — while a *column* `CLOB` becomes `LONGTEXT` below.
+    for lob in ["CLOB", "NCLOB"] {
+        out = replace_ci(&out, &format!(" AS {lob})"), " AS CHAR)");
+        out = replace_ci(&out, &format!(" AS {lob} "), " AS CHAR ");
+    }
+    // National-character and LOB type names (word-bounded so an identifier like
+    // `clob_demo` is untouched).
+    out = replace_ident_ci(&out, "NVARCHAR2", "VARCHAR");
+    out = replace_ident_ci(&out, "NCLOB", "LONGTEXT");
+    out = replace_ident_ci(&out, "NCHAR", "CHAR");
+    out = replace_ident_ci(&out, "CLOB", "LONGTEXT");
+    out = replace_ident_ci(&out, "BLOB", "LONGBLOB");
+
+    // Function-based index: an expression (not a bare column list) needs an
+    // extra paren pair for MariaDB's functional key parts.
+    out = rewrite_function_based_index(&out);
+
+    out
+}
+
+/// `ALTER TABLE t MODIFY (col ...)` -> unparenthesised `MODIFY`, and
+/// `MODIFY (col DEFAULT x)` -> `ALTER col SET DEFAULT x`.
+fn rewrite_alter_modify_parens(sql: &str) -> String {
+    let Some(m) = sql.to_ascii_uppercase().find(" MODIFY (") else {
+        return sql.to_string();
+    };
+    let open = m + " MODIFY ".len();
+    let Some(close_rel) = matching_paren(&sql[open..]) else {
+        return sql.to_string();
+    };
+    let inner = sql[open + 1..open + close_rel].trim();
+    let after = &sql[open + close_rel + 1..];
+    let head = &sql[..m];
+    if let Some((col, def)) = inner.split_once(" DEFAULT ") {
+        format!(
+            "{head} ALTER {} SET DEFAULT {}{after}",
+            col.trim(),
+            def.trim()
+        )
+    } else {
+        format!("{head} MODIFY {inner}{after}")
+    }
+}
+
+/// `DROP (a, b)` -> `DROP COLUMN a, DROP COLUMN b`; `SET UNUSED (x)` -> drop.
+fn rewrite_alter_drop_columns(sql: &str) -> String {
+    let up = sql.to_ascii_uppercase();
+    for (kw, _) in [(" DROP (", 0), (" SET UNUSED (", 0)] {
+        if let Some(at) = up.find(kw) {
+            let open = at + kw.len() - 1;
+            if let Some(close_rel) = matching_paren(&sql[open..]) {
+                let cols = split_top_level_commas(&sql[open + 1..open + close_rel])
+                    .iter()
+                    .map(|c| format!("DROP COLUMN {}", c.trim()))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                return format!("{} {}{}", &sql[..at], cols, &sql[open + close_rel + 1..]);
+            }
+        }
+    }
+    sql.to_string()
+}
+
+/// Strip the `CHAR` / `BYTE` length-semantics keyword from `VARCHAR2(n CHAR)`.
+fn strip_char_byte_length_qualifier(sql: &str) -> String {
+    sql.replace(" CHAR)", ")")
+        .replace(" BYTE)", ")")
+        .replace(" char)", ")")
+        .replace(" byte)", ")")
+}
+
+/// `CREATE [UNIQUE] INDEX i ON t (<expr>)` where the parenthesised part is an
+/// expression rather than a plain column list. MariaDB 11.4 has no expression
+/// index; emulate one with a hidden `VIRTUAL` generated column plus an index
+/// over it, in a single `ALTER TABLE`.
+fn rewrite_function_based_index(sql: &str) -> String {
+    let up = sql.to_ascii_uppercase();
+    let unique = up.starts_with("CREATE UNIQUE INDEX");
+    if !unique && !up.starts_with("CREATE INDEX") {
+        return sql.to_string();
+    }
+    let Some(on_at) = up.find(" ON ") else {
+        return sql.to_string();
+    };
+    let name = sql[..on_at]
+        .rsplit(char::is_whitespace)
+        .next()
+        .unwrap_or("")
+        .trim();
+    let Some(open_rel) = sql[on_at..].find('(') else {
+        return sql.to_string();
+    };
+    let open = on_at + open_rel;
+    let Some(close_rel) = matching_paren(&sql[open..]) else {
+        return sql.to_string();
+    };
+    let table = sql[on_at + 4..open].trim();
+    let inner = sql[open + 1..open + close_rel].trim();
+    let tail = sql[open + close_rel + 1..].trim();
+    // A bare column list (identifiers and commas only) is a normal index.
+    let plain = inner
+        .chars()
+        .all(|c| c.is_alphanumeric() || matches!(c, '_' | ',' | ' ' | '.' | '$'));
+    if plain || name.is_empty() {
+        return sql.to_string();
+    }
+    let col = format!("{name}__x");
+    let uniq_kw = if unique { "UNIQUE " } else { "" };
+    format!(
+        "ALTER TABLE {table} ADD COLUMN {col} VARCHAR(1000) AS ({inner}) VIRTUAL, \
+         ADD {uniq_kw}INDEX {name} ({col}){}{}",
+        if tail.is_empty() { "" } else { " " },
+        tail
+    )
+}
+
+/// Normalise `CAST(x AS <oracle type>)` targets to MariaDB's narrower `CAST`
+/// grammar. `AS NUMBER[(p,s)]` is left for `rewrite_mariadb_cast_number`.
+fn rewrite_mariadb_cast_targets(sql: &str) -> String {
+    sql.replace("AS DOUBLE PRECISION", "AS DOUBLE")
+        .replace("AS REAL", "AS DOUBLE")
+        .replace("AS BINARY_DOUBLE", "AS DOUBLE")
+        .replace("AS BINARY_FLOAT", "AS DOUBLE")
+        .replace("AS SMALLINT", "AS SIGNED")
+        .replace("AS BIGINT", "AS SIGNED")
+        .replace("AS INT)", "AS SIGNED)")
+        .replace("AS INTEGER", "AS SIGNED")
+        .replace("AS NUMERIC)", "AS DECIMAL(65,30))")
+        .replace("AS TIMESTAMP WITH TIME ZONE", "AS DATETIME(6)")
+        .replace("AS TIMESTAMP)", "AS DATETIME(6))")
+        // Oracle `DATE` carries a time-of-day; MariaDB `CAST(x AS DATE)` would
+        // truncate it, so target `DATETIME`.
+        .replace("AS DATE)", "AS DATETIME)")
+        .replace("AS TEXT)", "AS CHAR(4000))")
+        .replace("AS VARCHAR)", "AS CHAR)")
+        .replace("AS NVARCHAR2", "AS CHAR")
+        .replace("AS CLOB)", "AS CHAR(4000))")
+        .replace("AS NCLOB)", "AS CHAR(4000))")
+}
+
+/// LISTAGG / STRING_AGG -> GROUP_CONCAT; MEDIAN / PERCENTILE_* without a window
+/// clause -> the MariaDB window-function form; LAG's 3-arg default; KEEP;
+/// RATIO_TO_REPORT.
+fn rewrite_mariadb_aggregates(sql: &str) -> String {
+    let mut out = sql.to_string();
+
+    // LISTAGG(expr, sep) WITHIN GROUP (ORDER BY o) [OVER (...)]
+    out = rewrite_within_group_agg(&out, "LISTAGG");
+    out = rewrite_within_group_agg(&out, "STRING_AGG");
+    // PostgreSQL `STRING_AGG(expr, delim [ORDER BY o])` — the ordering rides
+    // inside the argument list rather than a `WITHIN GROUP` clause.
+    out = map_calls(&out, "STRING_AGG", &|inner| {
+        let (head, order) = match inner.to_ascii_uppercase().find(" ORDER BY ") {
+            Some(at) => (&inner[..at], inner[at..].trim().to_string()),
+            None => (inner, String::new()),
+        };
+        let parts = split_top_level_commas(head);
+        (parts.len() == 2).then(|| {
+            let sep = parts[1].trim();
+            let order = if order.is_empty() {
+                String::new()
+            } else {
+                format!(" {order}")
+            };
+            format!("GROUP_CONCAT({}{order} SEPARATOR {sep})", parts[0].trim())
+        })
+    });
+
+    // MEDIAN / PERCENTILE_CONT / PERCENTILE_DISC as plain aggregates.
+    out = rewrite_ordered_set_aggregate(&out, "MEDIAN");
+    out = rewrite_ordered_set_aggregate(&out, "PERCENTILE_CONT");
+    out = rewrite_ordered_set_aggregate(&out, "PERCENTILE_DISC");
+
+    // KEEP (DENSE_RANK FIRST|LAST ORDER BY o)
+    out = rewrite_keep_first_last(&out);
+
+    // RATIO_TO_REPORT(x) OVER (w) -> x / SUM(x) OVER (w)
+    out = rewrite_ratio_to_report(&out);
+
+    // LAG(x, n, default) OVER (w) -> COALESCE(LAG(x, n) OVER (w), default)
+    out = rewrite_lag_default(&out);
+
+    out
+}
+
+/// `NAME(expr, sep) WITHIN GROUP (ORDER BY o)` -> `GROUP_CONCAT(expr ORDER BY o
+/// SEPARATOR sep)`. A trailing `OVER (PARTITION BY p)` becomes a correlated
+/// aggregate is not attempted here; those keep their text and are covered by a
+/// skip directive.
+fn rewrite_within_group_agg(sql: &str, name: &str) -> String {
+    let up = sql.to_ascii_uppercase();
+    let Some(at) = up.find(&format!("{name}(")) else {
+        return sql.to_string();
+    };
+    let open = at + name.len();
+    let Some(close_rel) = matching_paren(&sql[open..]) else {
+        return sql.to_string();
+    };
+    let args = &sql[open + 1..open + close_rel];
+    let after = sql[open + close_rel + 1..].trim_start();
+    let Some(rest) = after
+        .strip_prefix("WITHIN GROUP")
+        .or_else(|| after.strip_prefix("within group"))
+    else {
+        return sql.to_string();
+    };
+    let rest = rest.trim_start();
+    if !rest.starts_with('(') {
+        return sql.to_string();
+    }
+    let Some(wg_close) = matching_paren(rest) else {
+        return sql.to_string();
+    };
+    let order_clause = rest[1..wg_close].trim(); // "ORDER BY o"
+    let tail = &rest[wg_close + 1..];
+    if tail.trim_start().to_ascii_uppercase().starts_with("OVER") {
+        return sql.to_string(); // windowed form — leave for a skip directive
+    }
+    let parts = split_top_level_commas(args);
+    let (distinct, expr) = {
+        let first = parts.first().map(|s| s.trim()).unwrap_or("");
+        if let Some(e) = first
+            .strip_prefix("DISTINCT ")
+            .or_else(|| first.strip_prefix("distinct "))
+        {
+            ("DISTINCT ", e.trim())
+        } else {
+            ("", first)
+        }
+    };
+    let sep = parts.get(1).map(|s| s.trim().to_string());
+    let sep_clause = sep
+        .map(|s| format!(" SEPARATOR {s}"))
+        .unwrap_or_else(|| " SEPARATOR ','".to_string());
+    let replacement = format!("GROUP_CONCAT({distinct}{expr} {order_clause}{sep_clause})");
+    // `tail` is already the exact slice following the `WITHIN GROUP (...)`
+    // clause; recomputing the offset from lengths dropped/added stray parens.
+    format!("{}{}{}", &sql[..at], replacement, tail)
+}
+
+/// `MEDIAN(x)` / `PERCENTILE_CONT(p) WITHIN GROUP (ORDER BY o)` used as a plain
+/// aggregate -> MariaDB's window form, with `LIMIT 1` when the whole projection
+/// is that single value and there is no GROUP BY.
+fn rewrite_ordered_set_aggregate(sql: &str, name: &str) -> String {
+    let up = sql.to_ascii_uppercase();
+    let Some(at) = up.find(&format!("{name}(")) else {
+        return sql.to_string();
+    };
+    // already windowed?
+    let open = at + name.len();
+    let Some(close_rel) = matching_paren(&sql[open..]) else {
+        return sql.to_string();
+    };
+    let mut scan = open + close_rel + 1;
+    // optional WITHIN GROUP (...)
+    let after = sql[scan..].trim_start();
+    if let Some(r) = after
+        .strip_prefix("WITHIN GROUP")
+        .or_else(|| after.strip_prefix("within group"))
+    {
+        let r = r.trim_start();
+        if r.starts_with('(')
+            && let Some(c) = matching_paren(r)
+        {
+            scan = scan + (sql[scan..].len() - r.len()) + c + 1;
+        }
+    }
+    let post = sql[scan..].trim_start();
+    if post.to_ascii_uppercase().starts_with("OVER") {
+        return sql.to_string(); // already fine for MariaDB
+    }
+    let mut out = format!("{} OVER (){}", &sql[..scan], &sql[scan..]);
+    let ou = out.to_ascii_uppercase();
+    let single_proj = ou
+        .split_once("SELECT ")
+        .map(|(_, r)| {
+            let r = r.trim_start();
+            r.to_ascii_uppercase().starts_with(&format!("{name}("))
+        })
+        .unwrap_or(false);
+    if single_proj && !ou.contains("GROUP BY") && !ou.contains(" LIMIT ") {
+        out.push_str(" LIMIT 1");
+    }
+    out
+}
+
+/// `<agg>(<expr>) KEEP (DENSE_RANK FIRST|LAST ORDER BY <o>)` in an otherwise
+/// simple single-value SELECT -> `SELECT <expr> FROM <rest> ORDER BY <o>[ DESC]
+/// LIMIT 1`.
+fn rewrite_keep_first_last(sql: &str) -> String {
+    let up = sql.to_ascii_uppercase();
+    let Some(keep_at) = up.find(" KEEP (") else {
+        return sql.to_string();
+    };
+    let Some(sel_at) = up.find("SELECT ") else {
+        return sql.to_string();
+    };
+    // aggregate call immediately before KEEP
+    let agg_call = sql[sel_at + 7..keep_at].trim();
+    let Some(inner_open) = agg_call.find('(') else {
+        return sql.to_string();
+    };
+    let expr = &agg_call[inner_open + 1..agg_call.len().saturating_sub(1)];
+    let open = keep_at + " KEEP ".len();
+    let Some(close_rel) = matching_paren(&sql[open..]) else {
+        return sql.to_string();
+    };
+    let keep_body = sql[open + 1..open + close_rel].to_ascii_uppercase();
+    let desc = keep_body.contains("LAST");
+    let Some(ob_at) = keep_body.find("ORDER BY ") else {
+        return sql.to_string();
+    };
+    let order_expr = sql[open + 1 + ob_at + "ORDER BY ".len()..open + close_rel].trim();
+    let rest = sql[open + close_rel + 1..].trim_start(); // "FROM people ..."
+    format!(
+        "SELECT {expr} {rest} ORDER BY {order_expr}{} LIMIT 1",
+        if desc { " DESC" } else { "" }
+    )
+}
+
+/// `RATIO_TO_REPORT(x) OVER (w)` -> `(x / SUM(x) OVER (w))`.
+fn rewrite_ratio_to_report(sql: &str) -> String {
+    let up = sql.to_ascii_uppercase();
+    let Some(at) = up.find("RATIO_TO_REPORT(") else {
+        return sql.to_string();
+    };
+    let open = at + "RATIO_TO_REPORT".len();
+    let Some(close_rel) = matching_paren(&sql[open..]) else {
+        return sql.to_string();
+    };
+    let x = sql[open + 1..open + close_rel].trim();
+    let after = sql[open + close_rel + 1..].trim_start();
+    let Some(rest) = after
+        .strip_prefix("OVER")
+        .or_else(|| after.strip_prefix("over"))
+    else {
+        return sql.to_string();
+    };
+    let rest = rest.trim_start();
+    let Some(win_close) = matching_paren(rest) else {
+        return sql.to_string();
+    };
+    let window = &rest[..win_close + 1];
+    format!(
+        "{}({x} / SUM({x}) OVER {window}){}",
+        &sql[..at],
+        &rest[win_close + 1..]
+    )
+}
+
+/// `LAG(x, n, default) OVER (w)` -> `COALESCE(LAG(x, n) OVER (w), default)`
+/// (MariaDB's `LAG` takes no default argument).
+fn rewrite_lag_default(sql: &str) -> String {
+    let up = sql.to_ascii_uppercase();
+    let Some(at) = up.find("LAG(") else {
+        return sql.to_string();
+    };
+    let open = at + 3;
+    let Some(close_rel) = matching_paren(&sql[open..]) else {
+        return sql.to_string();
+    };
+    let parts = split_top_level_commas(&sql[open + 1..open + close_rel]);
+    if parts.len() != 3 {
+        return sql.to_string();
+    }
+    let after = sql[open + close_rel + 1..].trim_start();
+    let Some(rest) = after
+        .strip_prefix("OVER")
+        .or_else(|| after.strip_prefix("over"))
+    else {
+        return sql.to_string();
+    };
+    let rest = rest.trim_start();
+    let Some(win_close) = matching_paren(rest) else {
+        return sql.to_string();
+    };
+    let window = &rest[..win_close + 1];
+    format!(
+        "{}COALESCE(LAG({}, {}) OVER {window}, {}){}",
+        &sql[..at],
+        parts[0].trim(),
+        parts[1].trim(),
+        parts[2].trim(),
+        &rest[win_close + 1..]
+    )
+}
+
+/// `INSERT ... RETURNING` is native for MariaDB; `UPDATE ... RETURNING` is not.
+fn strip_unsupported_returning(sql: &str) -> String {
+    let up = sql.to_ascii_uppercase();
+    let is_update = up.trim_start().starts_with("UPDATE ");
+    let is_delete = up.trim_start().starts_with("DELETE ");
+    if !(is_update || is_delete) {
+        return sql.to_string();
+    }
+    if let Some(r) = up.rfind(" RETURNING ") {
+        return sql[..r].to_string();
+    }
+    sql.to_string()
 }
 
 /// MariaDB Oracle mode accepts `NUMBER` as a column type synonym, but MariaDB
@@ -575,6 +1742,77 @@ mod mariadb_tests {
             "SELECT GROUP_CONCAT(name ORDER BY id SEPARATOR ',') FROM people"
         );
     }
+
+    #[test]
+    fn lowers_listagg_within_group_to_group_concat() {
+        assert_eq!(
+            oracle_to_mariadb(
+                "SELECT LISTAGG(name, ', ') WITHIN GROUP (ORDER BY id) FROM people WHERE team_id = 1"
+            )
+            .unwrap(),
+            "SELECT GROUP_CONCAT(name ORDER BY id SEPARATOR ', ') FROM people WHERE team_id = 1"
+        );
+    }
+
+    #[test]
+    fn lowers_day_arithmetic_to_date_add_and_datediff() {
+        assert_eq!(
+            oracle_to_mariadb("SELECT DATE '2024-01-02' + 1 FROM DUAL").unwrap(),
+            "SELECT DATE_ADD(DATE '2024-01-02', INTERVAL 1 DAY) FROM DUAL"
+        );
+        assert_eq!(
+            oracle_to_mariadb("SELECT DATE '2024-03-01' - DATE '2024-02-01' FROM DUAL").unwrap(),
+            "SELECT DATEDIFF(DATE '2024-03-01', DATE '2024-02-01') FROM DUAL"
+        );
+    }
+
+    #[test]
+    fn to_char_splits_datetime_and_number_models() {
+        assert_eq!(
+            oracle_to_mariadb("SELECT TO_CHAR(SYSTIMESTAMP, 'YYYY-MM-DD\"T\"HH24:MI:SS') FROM t")
+                .unwrap(),
+            "SELECT DATE_FORMAT(CURRENT_TIMESTAMP(6), '%Y-%m-%dT%H:%i:%s') FROM t"
+        );
+        assert_eq!(
+            oracle_to_mariadb("SELECT TO_CHAR(amount, 'FM999,999.00') FROM t").unwrap(),
+            "SELECT FORMAT(amount, 2, 'en_US') FROM t"
+        );
+    }
+
+    #[test]
+    fn aliased_and_joined_dual_become_valid_mariadb() {
+        assert_eq!(
+            oracle_to_mariadb("SELECT d.dummy FROM dual d").unwrap(),
+            "SELECT d.dummy FROM (SELECT 'X' AS dummy) d"
+        );
+        assert_eq!(
+            oracle_to_mariadb("SELECT people.name FROM people, dual WHERE people.id = 1").unwrap(),
+            "SELECT people.name FROM people WHERE people.id = 1"
+        );
+    }
+
+    #[test]
+    fn ltrim_rtrim_translate_instr_use_native_or_udf() {
+        assert_eq!(
+            oracle_to_mariadb("SELECT LTRIM('00042', '0') FROM DUAL").unwrap(),
+            "SELECT TRIM(LEADING '0' FROM '00042') FROM DUAL"
+        );
+        assert_eq!(
+            oracle_to_mariadb("SELECT TRANSLATE('abc', 'ac', 'AC') FROM DUAL").unwrap(),
+            "SELECT oracle_translate('abc', 'ac', 'AC') FROM DUAL"
+        );
+    }
+
+    #[test]
+    fn connect_by_path_columns_are_widened() {
+        let out = oracle_to_mariadb(
+            "SELECT name FROM emp START WITH mgr IS NULL CONNECT BY PRIOR id = mgr",
+        )
+        .unwrap();
+        assert!(out.contains("WITH RECURSIVE __cb AS"));
+        assert!(out.contains("CAST(CONCAT(',', __n.id, ',') AS CHAR(4000)) AS __ids"));
+        assert!(!out.contains("ARRAY["));
+    }
 }
 
 /// Parse one Oracle statement and render its PostgreSQL-compatible form.
@@ -633,21 +1871,21 @@ pub fn oracle_to_postgres(sql: &str) -> Result<String> {
                 translate_query(source)?;
             }
         }
-        Statement::Update {
-            assignments,
-            selection,
-            ..
-        } => {
-            for assignment in assignments {
+        Statement::Update(update) => {
+            for assignment in &mut update.assignments {
                 rewrite_expr(&mut assignment.value)?;
             }
-            if let Some(selection) = selection {
+            if let Some(selection) = &mut update.selection {
                 rewrite_expr(selection)?;
             }
         }
         // The SELECT body of a view / CTAS must be translated too.
-        Statement::CreateView { query, .. } => translate_query(query)?,
-        Statement::CreateTable { query: Some(q), .. } => translate_query(q)?,
+        Statement::CreateView(cv) => translate_query(&mut cv.query)?,
+        Statement::CreateTable(ct) => {
+            if let Some(q) = &mut ct.query {
+                translate_query(q)?;
+            }
+        }
         _ => {}
     }
     Ok(statement.to_string())
@@ -2129,6 +3367,109 @@ fn pivot_in_item(entry: &str) -> Option<(String, String)> {
 /// Oracle `UNPIVOT` → `CROSS JOIN LATERAL (VALUES ...)`. Handles one UNPIVOT
 /// clause of the form
 /// `FROM <src> UNPIVOT [INCLUDE|EXCLUDE NULLS] (<val> FOR <name> IN (<items>))`.
+/// MariaDB has no `UNPIVOT`, `LATERAL`, or `VALUES` table constructor. Lower
+/// `SELECT <proj> FROM <t> UNPIVOT (<v> FOR <k> IN (<c1> AS '<n1>', …)) <tail>`
+/// to a `UNION ALL` derived table, one branch per unpivoted column.
+fn rewrite_unpivot_mariadb(sql: &str) -> String {
+    let Some(kw_at) = find_top_level_kw(sql, "UNPIVOT") else {
+        return sql.to_string();
+    };
+    let head = &sql[..kw_at];
+    let mut rest = sql[kw_at + "UNPIVOT".len()..].trim_start();
+    let mut include_nulls = false;
+    if let Some(r) = strip_kw(rest, "INCLUDE NULLS") {
+        include_nulls = true;
+        rest = r;
+    } else if let Some(r) = strip_kw(rest, "EXCLUDE NULLS") {
+        rest = r;
+    }
+    if !rest.starts_with('(') {
+        return sql.to_string();
+    }
+    let Some(close) = matching_paren(rest) else {
+        return sql.to_string();
+    };
+    let inner = &rest[1..close];
+    let tail = rest[close + 1..].trim();
+
+    let Some(for_at) = find_top_level_kw(inner, "FOR") else {
+        return sql.to_string();
+    };
+    let val_col = inner[..for_at].trim();
+    let after_for = inner[for_at + "FOR".len()..].trim_start();
+    let Some(in_at) = find_top_level_kw(after_for, "IN") else {
+        return sql.to_string();
+    };
+    let key_col = after_for[..in_at].trim();
+    let in_part = after_for[in_at + "IN".len()..].trim_start();
+    if !in_part.starts_with('(') {
+        return sql.to_string();
+    }
+    let Some(in_close) = matching_paren(in_part) else {
+        return sql.to_string();
+    };
+    let items = split_top_level_commas(&in_part[1..in_close]);
+
+    // Split `head` into `SELECT <proj> FROM <source>`.
+    let head_t = head.trim_start();
+    let Some(after_select) = head_t
+        .strip_prefix("SELECT ")
+        .or_else(|| head_t.strip_prefix("select "))
+    else {
+        return sql.to_string();
+    };
+    let Some(from_rel) = find_top_level_kw(after_select, "FROM") else {
+        return sql.to_string();
+    };
+    let projection = after_select[..from_rel].trim();
+    let source = after_select[from_rel + "FROM".len()..].trim();
+    // Identity columns: the projection entries that are not the key/value cols.
+    let identity: Vec<&str> = split_top_level_commas(projection)
+        .into_iter()
+        .map(str::trim)
+        .filter(|c| {
+            !c.eq_ignore_ascii_case(key_col)
+                && !c.eq_ignore_ascii_case(val_col)
+                && !c.eq_ignore_ascii_case("*")
+        })
+        .collect();
+
+    let mut branches = Vec::new();
+    for it in items {
+        let Some((col, label)) = pivot_in_item(it) else {
+            return sql.to_string();
+        };
+        let ident = if identity.is_empty() {
+            String::new()
+        } else {
+            format!("{}, ", identity.join(", "))
+        };
+        branches.push(format!(
+            "SELECT {ident}{label} AS {key_col}, {col} AS {val_col} FROM {source}"
+        ));
+    }
+    if branches.is_empty() {
+        return sql.to_string();
+    }
+    let derived = format!("({}) __unpiv", branches.join(" UNION ALL "));
+    let padded_tail = format!(" {tail}");
+    let where_at = find_top_level_kw(&padded_tail, "WHERE");
+    let out = if include_nulls {
+        format!("SELECT {projection} FROM {derived} {tail}")
+            .trim_end()
+            .to_string()
+    } else if let Some(w_at) = where_at {
+        let after = padded_tail[w_at + "WHERE".len()..].trim();
+        let rest_tail = after; // WHERE <after>
+        format!("SELECT {projection} FROM {derived} WHERE {val_col} IS NOT NULL AND {rest_tail}")
+    } else {
+        format!("SELECT {projection} FROM {derived} WHERE {val_col} IS NOT NULL {tail}")
+            .trim_end()
+            .to_string()
+    };
+    rewrite_unpivot_mariadb(&out)
+}
+
 fn rewrite_unpivot(sql: &str) -> String {
     let Some(kw_at) = find_top_level_kw(sql, "UNPIVOT") else {
         return sql.to_string();
@@ -2408,7 +3749,28 @@ fn replace_ident_ci(s: &str, ident: &str, with: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let bytes = s.as_bytes();
     let mut i = 0;
+    let mut quote: Option<u8> = None;
     while i < bytes.len() {
+        if let Some(q) = quote {
+            let ch = s[i..].chars().next().unwrap();
+            out.push(ch);
+            if ch.len_utf8() == 1 && bytes[i] == q {
+                if bytes.get(i + 1) == Some(&q) {
+                    out.push(q as char);
+                    i += 1;
+                } else {
+                    quote = None;
+                }
+            }
+            i += ch.len_utf8();
+            continue;
+        }
+        if matches!(bytes[i], b'\'' | b'"' | b'`') {
+            quote = Some(bytes[i]);
+            out.push(bytes[i] as char);
+            i += 1;
+            continue;
+        }
         if bytes[i].is_ascii_alphabetic() || bytes[i] == b'_' {
             let start = i;
             while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
@@ -3780,7 +5142,7 @@ fn translate_query(query: &mut Query) -> Result<()> {
             })
             .collect();
         if !aliases.is_empty() {
-            for order_by in &mut query.order_by {
+            for order_by in order_by_exprs_mut(query) {
                 if !matches!(order_by.expr, Expr::Identifier(_)) {
                     substitute_select_aliases(&mut order_by.expr, &aliases);
                 }
@@ -3789,23 +5151,23 @@ fn translate_query(query: &mut Query) -> Result<()> {
     }
 
     let row_limit = translate_set_expr(&mut query.body)?;
-    for order_by in &mut query.order_by {
+    for order_by in order_by_exprs_mut(query) {
         rewrite_expr(&mut order_by.expr)?;
     }
     if let Some(limit) = row_limit {
-        if query.limit.is_some() {
+        if query_limit(query).is_some() {
             return Err(Error::SqlParse(
                 "ROWNUM together with an explicit LIMIT needs a nested query".to_string(),
             ));
         }
-        if query.order_by.is_empty() {
-            query.limit = Some(limit);
+        if order_by_is_empty(query) {
+            set_query_limit(query, limit);
         } else {
             // Oracle applies ROWNUM *before* ORDER BY. Reproduce that by
             // limiting the unordered body inside a derived table (widened to
             // `SELECT *` so the outer ORDER BY can still see every column) and
             // sorting the outer query.
-            let order_by = std::mem::take(&mut query.order_by);
+            let order_by = query.order_by.take();
             let outer_projection = match query.body.as_mut() {
                 SetExpr::Select(select) => std::mem::replace(
                     &mut select.projection,
@@ -3818,7 +5180,7 @@ fn translate_query(query: &mut Query) -> Result<()> {
                 )],
             };
             let mut inner = query.clone();
-            inner.limit = Some(limit);
+            set_query_limit(&mut inner, limit);
             *query = wrap_query_with_order_by(inner, order_by, outer_projection);
         }
     }
@@ -3857,17 +5219,15 @@ fn substitute_select_aliases(expr: &mut Expr, aliases: &std::collections::HashMa
         Expr::Case {
             operand,
             conditions,
-            results,
             else_result,
+            ..
         } => {
             if let Some(o) = operand {
                 substitute_select_aliases(o, aliases);
             }
-            for c in conditions {
-                substitute_select_aliases(c, aliases);
-            }
-            for r in results {
-                substitute_select_aliases(r, aliases);
+            for when in conditions {
+                substitute_select_aliases(&mut when.condition, aliases);
+                substitute_select_aliases(&mut when.result, aliases);
             }
             if let Some(e) = else_result {
                 substitute_select_aliases(e, aliases);
@@ -3903,10 +5263,7 @@ fn translate_set_expr(set_expr: &mut SetExpr) -> Result<Option<Expr>> {
                 && select.from[0].joins.is_empty()
                 && let TableFactor::Table { name, alias, .. } = &select.from[0].relation
                 && alias.is_none()
-                && name
-                    .0
-                    .last()
-                    .is_some_and(|part| part.value.eq_ignore_ascii_case("dual"))
+                && name_last(name).is_some_and(|part| part.eq_ignore_ascii_case("dual"))
             {
                 select.from.clear();
             } else {
@@ -3930,7 +5287,7 @@ fn translate_set_expr(set_expr: &mut SetExpr) -> Result<Option<Expr>> {
                 }
             }
 
-            if let sqlparser::ast::GroupByExpr::Expressions(expressions) = &mut select.group_by {
+            if let sqlparser::ast::GroupByExpr::Expressions(expressions, _) = &mut select.group_by {
                 for expression in expressions {
                     rewrite_expr(expression)?;
                 }
@@ -3962,7 +5319,7 @@ fn translate_set_expr(set_expr: &mut SetExpr) -> Result<Option<Expr>> {
         SetExpr::Query(query) => translate_query(query)?,
         SetExpr::Values(values) => {
             for row in &mut values.rows {
-                for expr in row {
+                for expr in &mut row.content {
                     rewrite_expr(expr)?;
                 }
             }
@@ -3983,10 +5340,7 @@ fn translate_set_expr(set_expr: &mut SetExpr) -> Result<Option<Expr>> {
 fn strip_dual_schema(table: &mut TableFactor) {
     if let TableFactor::Table { name, .. } = table
         && name.0.len() > 1
-        && name
-            .0
-            .last()
-            .is_some_and(|p| p.value.eq_ignore_ascii_case("dual"))
+        && name_last(name).is_some_and(|p| p.eq_ignore_ascii_case("dual"))
     {
         let last = name.0.pop().unwrap();
         name.0.clear();
@@ -4004,8 +5358,10 @@ fn rewrite_table_factor(table: &mut TableFactor, derived_seq: &mut usize) -> Res
         // alias (and did so on every supported major). Synthesise a unique one.
         if alias.is_none() {
             *alias = Some(sqlparser::ast::TableAlias {
-                name: sqlparser::ast::Ident::new(format!("__pgsaci_sub{derived_seq}")),
+                name: Ident::new(format!("__pgsaci_sub{derived_seq}")),
                 columns: vec![],
+                at: None,
+                explicit: false,
             });
             *derived_seq += 1;
         }
@@ -4015,23 +5371,16 @@ fn rewrite_table_factor(table: &mut TableFactor, derived_seq: &mut usize) -> Res
 
 fn rewrite_join_operator(join: &mut JoinOperator) -> Result<()> {
     use JoinOperator::{
-        FullOuter, Inner, LeftAnti, LeftOuter, LeftSemi, RightAnti, RightOuter, RightSemi,
+        Anti, ArrayJoin, AsOf, CrossApply, CrossJoin, FullOuter, Inner, InnerArrayJoin, Join, Left,
+        LeftAnti, LeftArrayJoin, LeftOuter, LeftSemi, OuterApply, Right, RightAnti, RightOuter,
+        RightSemi, Semi, StraightJoin,
     };
     let constraint = match join {
-        Inner(constraint)
-        | LeftOuter(constraint)
-        | RightOuter(constraint)
-        | FullOuter(constraint)
-        | LeftAnti(constraint)
-        | RightAnti(constraint)
-        | LeftSemi(constraint)
-        | RightSemi(constraint) => constraint,
-        JoinOperator::CrossJoin
-        | JoinOperator::CrossApply
-        | JoinOperator::OuterApply
-        | JoinOperator::AsOf { .. } => {
-            return Ok(());
-        }
+        Join(c) | Inner(c) | Left(c) | LeftOuter(c) | Right(c) | RightOuter(c) | FullOuter(c)
+        | CrossJoin(c) | Semi(c) | LeftSemi(c) | RightSemi(c) | Anti(c) | LeftAnti(c)
+        | RightAnti(c) | StraightJoin(c) => c,
+        AsOf { constraint, .. } => constraint,
+        CrossApply | OuterApply | ArrayJoin | LeftArrayJoin | InnerArrayJoin => return Ok(()),
     };
     if let JoinConstraint::On(expression) = constraint {
         rewrite_expr(expression)?;
@@ -4041,10 +5390,11 @@ fn rewrite_join_operator(join: &mut JoinOperator) -> Result<()> {
 
 fn rewrite_expr(expr: &mut Expr) -> Result<()> {
     // Oracle treats the empty string literal as NULL everywhere.
-    if let Expr::Value(Value::SingleQuotedString(s) | Value::DoubleQuotedString(s)) = expr
+    if let Expr::Value(ValueWithSpan { value, .. }) = expr
+        && let Value::SingleQuotedString(s) | Value::DoubleQuotedString(s) = value
         && s.is_empty()
     {
-        *expr = Expr::Value(Value::Null);
+        *expr = lit(Value::Null);
         return Ok(());
     }
     // A `ROWNUM` reference that survived the WHERE-clause lift (projections,
@@ -4079,7 +5429,7 @@ fn rewrite_expr(expr: &mut Expr) -> Result<()> {
                     // `<timestamp> - <timestamp>` yields an interval in
                     // PostgreSQL; Oracle yields a number of days. (`date - date`
                     // is already an integer in PostgreSQL, so it is left alone.)
-                    let whole = std::mem::replace(expr, Expr::Value(Value::Null));
+                    let whole = std::mem::replace(expr, lit(Value::Null));
                     *expr = parse_expr(&format!("EXTRACT(EPOCH FROM ({whole})) / 86400"));
                     return Ok(());
                 } else if l_date && is_numberish(right) {
@@ -4097,13 +5447,14 @@ fn rewrite_expr(expr: &mut Expr) -> Result<()> {
             // numerator to NUMERIC (only when neither side already looks
             // fractional, to avoid piling casts on top of casts).
             if *op == BinaryOperator::Divide && !contains_cast_to_numeric(left) {
-                let numerator = std::mem::replace(left, Box::new(Expr::Value(Value::Null)));
+                let numerator = std::mem::replace(left, Box::new(lit(Value::Null)));
                 **left = Expr::Cast {
                     kind: sqlparser::ast::CastKind::Cast,
                     expr: numerator,
                     data_type: sqlparser::ast::DataType::Numeric(
                         sqlparser::ast::ExactNumberInfo::None,
                     ),
+                    array: false,
                     format: None,
                 };
             }
@@ -4137,17 +5488,15 @@ fn rewrite_expr(expr: &mut Expr) -> Result<()> {
         Expr::Case {
             operand,
             conditions,
-            results,
             else_result,
+            ..
         } => {
             if let Some(operand) = operand {
                 rewrite_expr(operand)?;
             }
-            for condition in conditions {
-                rewrite_expr(condition)?;
-            }
-            for result in results {
-                rewrite_expr(result)?;
+            for when in conditions {
+                rewrite_expr(&mut when.condition)?;
+                rewrite_expr(&mut when.result)?;
             }
             if let Some(result) = else_result {
                 rewrite_expr(result)?;
@@ -4161,12 +5510,8 @@ fn rewrite_expr(expr: &mut Expr) -> Result<()> {
                     }
                 }
             }
-            let name = function
-                .name
-                .0
-                .last()
-                .map(|ident| ident.value.as_str())
-                .unwrap_or_default();
+            let name = name_last(&function.name).unwrap_or_default().to_string();
+            let name = name.as_str();
             let args = function_args(function);
             if name.eq_ignore_ascii_case("DECODE") {
                 // PostgreSQL's two-argument decode(text, format) is used for
@@ -4197,15 +5542,15 @@ fn rewrite_expr(expr: &mut Expr) -> Result<()> {
                     // Oracle treats a NULL/absent replacement as ''.
                     if let Some(FunctionArg::Unnamed(FunctionArgExpr::Expr(third))) =
                         list.args.get_mut(2)
-                        && matches!(third, Expr::Value(Value::Null))
+                        && as_value(third) == Some(&Value::Null)
                     {
-                        *third = Expr::Value(Value::SingleQuotedString(String::new()));
+                        *third = lit(Value::SingleQuotedString(String::new()));
                     }
                     // REGEXP_REPLACE: Oracle replaces every match; PostgreSQL
                     // replaces only the first without the 'g' flag.
                     if name.eq_ignore_ascii_case("REGEXP_REPLACE") && list.args.len() == 3 {
                         list.args
-                            .push(FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::Value(
+                            .push(FunctionArg::Unnamed(FunctionArgExpr::Expr(lit(
                                 Value::SingleQuotedString("g".into()),
                             ))));
                     }
@@ -4244,25 +5589,28 @@ fn rewrite_expr(expr: &mut Expr) -> Result<()> {
 /// Wrap `e` as `COALESCE(CAST(e AS text), '')` (Oracle `||` stringifies operands
 /// and treats NULL as ''), unless `e` is already a plain string literal.
 fn wrap_coalesce_empty(e: &mut Box<Expr>) {
-    if matches!(e.as_ref(), Expr::Value(Value::SingleQuotedString(_))) {
+    if matches!(as_value(e.as_ref()), Some(Value::SingleQuotedString(_))) {
         return;
     }
-    let inner = std::mem::replace(e.as_mut(), Expr::Value(Value::Null));
+    let inner = std::mem::replace(e.as_mut(), lit(Value::Null));
     let cast = Expr::Cast {
         kind: sqlparser::ast::CastKind::Cast,
         expr: Box::new(inner),
         data_type: sqlparser::ast::DataType::Text,
+        array: false,
         format: None,
     };
     **e = Expr::Function(sqlparser::ast::Function {
-        name: sqlparser::ast::ObjectName(vec![sqlparser::ast::Ident::new("COALESCE")]),
+        name: obj_name("COALESCE"),
+        uses_odbc_syntax: false,
+        parameters: FunctionArguments::None,
         args: FunctionArguments::List(sqlparser::ast::FunctionArgumentList {
             duplicate_treatment: None,
             args: vec![
                 FunctionArg::Unnamed(FunctionArgExpr::Expr(cast)),
-                FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::Value(
-                    Value::SingleQuotedString(String::new()),
-                ))),
+                FunctionArg::Unnamed(FunctionArgExpr::Expr(lit(Value::SingleQuotedString(
+                    String::new(),
+                )))),
             ],
             clauses: vec![],
         }),
@@ -4275,7 +5623,7 @@ fn wrap_coalesce_empty(e: &mut Box<Expr>) {
 
 /// Multiply `e` in place by `INTERVAL '1 day'`.
 fn mul_by_one_day(e: &mut Box<Expr>) {
-    let n = std::mem::replace(e.as_mut(), Expr::Value(Value::Null));
+    let n = std::mem::replace(e.as_mut(), lit(Value::Null));
     **e = Expr::BinaryOp {
         left: Box::new(Expr::Nested(Box::new(n))),
         op: BinaryOperator::Multiply,
@@ -4287,7 +5635,7 @@ fn mul_by_one_day(e: &mut Box<Expr>) {
 /// already an integer day count).
 fn is_plain_date(e: &Expr) -> bool {
     match e {
-        Expr::TypedString { data_type, .. } => *data_type == sqlparser::ast::DataType::Date,
+        Expr::TypedString(ts) => ts.data_type == sqlparser::ast::DataType::Date,
         Expr::Nested(inner) => is_plain_date(inner),
         _ => false,
     }
@@ -4297,7 +5645,7 @@ fn is_plain_date(e: &Expr) -> bool {
 /// opposed to an interval, column or function call.
 fn is_numberish(e: &Expr) -> bool {
     match e {
-        Expr::Value(Value::Number(..) | Value::Placeholder(_)) => true,
+        _ if matches!(as_value(e), Some(Value::Number(..) | Value::Placeholder(_))) => true,
         Expr::UnaryOp { expr, .. } | Expr::Nested(expr) => is_numberish(expr),
         Expr::BinaryOp { left, op, right } => {
             matches!(
@@ -4317,7 +5665,7 @@ fn is_numberish(e: &Expr) -> bool {
                 | sqlparser::ast::DataType::Int(_)
                 | sqlparser::ast::DataType::Integer(_)
                 | sqlparser::ast::DataType::BigInt(_)
-                | sqlparser::ast::DataType::Double
+                | sqlparser::ast::DataType::Double(_)
                 | sqlparser::ast::DataType::Float(_)
         ),
         _ => false,
@@ -4327,8 +5675,14 @@ fn is_numberish(e: &Expr) -> bool {
 /// Does this expression evaluate to a DATE/TIMESTAMP in Oracle?
 fn is_date_expr(e: &Expr) -> bool {
     match e {
-        Expr::TypedString { data_type, .. } | Expr::Cast { data_type, .. } => matches!(
+        Expr::Cast { data_type, .. } => matches!(
             data_type,
+            sqlparser::ast::DataType::Date
+                | sqlparser::ast::DataType::Datetime(_)
+                | sqlparser::ast::DataType::Timestamp(..)
+        ),
+        Expr::TypedString(ts) => matches!(
+            ts.data_type,
             sqlparser::ast::DataType::Date
                 | sqlparser::ast::DataType::Datetime(_)
                 | sqlparser::ast::DataType::Timestamp(..)
@@ -4341,12 +5695,7 @@ fn is_date_expr(e: &Expr) -> bool {
             right,
         } => is_date_expr(left) || is_date_expr(right),
         Expr::Function(f) => {
-            let name = f
-                .name
-                .0
-                .last()
-                .map(|i| i.value.as_str())
-                .unwrap_or_default();
+            let name = name_last(&f.name).unwrap_or_default();
             const DATE_FNS: &[&str] = &[
                 "CURRENT_TIMESTAMP",
                 "CURRENT_DATE",
@@ -4389,7 +5738,7 @@ fn contains_cast_to_numeric(expr: &Expr) -> bool {
         Expr::Cast {
             data_type: sqlparser::ast::DataType::Numeric(_)
                 | sqlparser::ast::DataType::Decimal(_)
-                | sqlparser::ast::DataType::Double
+                | sqlparser::ast::DataType::Double(_)
                 | sqlparser::ast::DataType::Float(_),
             ..
         }
@@ -4437,21 +5786,21 @@ fn rewrite_decode(args: Vec<Expr>) -> Result<Expr> {
         kind: sqlparser::ast::CastKind::Cast,
         expr: Box::new(e.clone()),
         data_type: sqlparser::ast::DataType::Text,
+        array: false,
         format: None,
     };
     let mut conditions = Vec::new();
-    let mut results = Vec::new();
     for [cond, result] in args[1..pair_end].as_chunks::<2>().0 {
-        conditions.push(Expr::IsNotDistinctFrom(
-            Box::new(as_text(&input)),
-            Box::new(as_text(cond)),
-        ));
-        results.push(result.clone());
+        conditions.push(CaseWhen {
+            condition: Expr::IsNotDistinctFrom(Box::new(as_text(&input)), Box::new(as_text(cond))),
+            result: result.clone(),
+        });
     }
     Ok(Expr::Case {
+        case_token: no_token(),
+        end_token: no_token(),
         operand: None,
         conditions,
-        results,
         else_result: if pair_end < args.len() {
             Some(Box::new(args[pair_end].clone()))
         } else {
@@ -4467,9 +5816,13 @@ fn rewrite_nvl2(args: Vec<Expr>) -> Result<Expr> {
         ));
     }
     Ok(Expr::Case {
+        case_token: no_token(),
+        end_token: no_token(),
         operand: None,
-        conditions: vec![Expr::IsNotNull(Box::new(args[0].clone()))],
-        results: vec![args[1].clone()],
+        conditions: vec![CaseWhen {
+            condition: Expr::IsNotNull(Box::new(args[0].clone())),
+            result: args[1].clone(),
+        }],
         else_result: Some(Box::new(args[2].clone())),
     })
 }
@@ -4567,12 +5920,13 @@ fn translate_legacy_outer_join(select: &mut sqlparser::ast::Select) -> Result<()
         let op = if outer_tables.contains(key) {
             JoinOperator::LeftOuter(constraint)
         } else if matches!(constraint, JoinConstraint::None) {
-            JoinOperator::CrossJoin
+            JoinOperator::CrossJoin(JoinConstraint::None)
         } else {
             JoinOperator::Inner(constraint)
         };
         joins.push(Join {
             relation,
+            global: false,
             join_operator: op,
         });
         placed.push(key.clone());
@@ -4637,7 +5991,7 @@ fn table_factor_key(t: &TableFactor) -> String {
         TableFactor::Table { name, alias, .. } => alias
             .as_ref()
             .map(|a| a.name.value.clone())
-            .or_else(|| name.0.last().map(|i| i.value.clone()))
+            .or_else(|| name_last(name).map(str::to_string))
             .unwrap_or_default()
             .to_ascii_lowercase(),
         TableFactor::Derived { alias, .. } | TableFactor::TableFunction { alias, .. } => alias
@@ -4771,7 +6125,7 @@ fn strip_rownum_predicate(selection: Expr) -> (Option<Expr>, Option<Expr>) {
     if forced_empty {
         return (
             rebuild_and(kept),
-            Some(Expr::Value(Value::Number("0".into(), false))),
+            Some(lit(Value::Number("0".into(), false))),
         );
     }
     (rebuild_and(kept), limit)
@@ -4812,7 +6166,9 @@ fn least_expr(a: Expr, b: Expr) -> Expr {
         (Some(x), Some(y)) if y < x => b,
         (Some(_), Some(_)) => a,
         _ => Expr::Function(sqlparser::ast::Function {
-            name: sqlparser::ast::ObjectName(vec![sqlparser::ast::Ident::new("LEAST")]),
+            name: obj_name("LEAST"),
+            uses_odbc_syntax: false,
+            parameters: FunctionArguments::None,
             args: FunctionArguments::List(sqlparser::ast::FunctionArgumentList {
                 duplicate_treatment: None,
                 args: vec![
@@ -4830,8 +6186,10 @@ fn least_expr(a: Expr, b: Expr) -> Expr {
 }
 
 fn const_u64(expr: &Expr) -> Option<u64> {
+    if let Some(Value::Number(n, _)) = as_value(expr) {
+        return n.parse().ok();
+    }
     match expr {
-        Expr::Value(Value::Number(n, _)) => n.parse().ok(),
         Expr::UnaryOp {
             op: sqlparser::ast::UnaryOperator::Minus,
             ..
@@ -4907,7 +6265,7 @@ fn rownum_effect(expr: &Expr) -> Option<RownumEffect> {
         BinaryOperator::Lt if dynamic => Some(RownumEffect::Limit(Expr::BinaryOp {
             left: Box::new(bound.clone()),
             op: BinaryOperator::Minus,
-            right: Box::new(Expr::Value(Value::Number("1".into(), false))),
+            right: Box::new(lit(Value::Number("1".into(), false))),
         })),
         _ => {
             let n = const_u64(bound)?;
@@ -4931,7 +6289,7 @@ fn rownum_effect(expr: &Expr) -> Option<RownumEffect> {
 }
 
 fn num(value: u64) -> Expr {
-    Expr::Value(Value::Number(value.to_string(), false))
+    lit(Value::Number(value.to_string(), false))
 }
 
 fn flip_comparison(op: &BinaryOperator) -> Option<BinaryOperator> {
@@ -4954,55 +6312,24 @@ fn parse_expr(sql: &str) -> Expr {
         .expect("static expression snippet parses")
 }
 
-/// `SELECT <projection> FROM (<inner>) AS __rownum_sub ORDER BY <order_by>`
+/// `SELECT <projection> FROM (<inner>) AS __rownum_sub ORDER BY <order_by>`.
+///
+/// Re-assembled through the parser rather than by hand: sqlparser 0.62's
+/// `Select`/`Query` carry ~20 dialect/token fields that are irrelevant here.
 fn wrap_query_with_order_by(
     inner: Query,
-    order_by: Vec<sqlparser::ast::OrderByExpr>,
+    order_by: Option<OrderBy>,
     projection: Vec<sqlparser::ast::SelectItem>,
 ) -> Query {
-    use sqlparser::ast::{
-        Ident, Query as AstQuery, Select, SetExpr, TableAlias, TableFactor, TableWithJoins,
-    };
-    let select = Select {
-        distinct: None,
-        top: None,
-        projection,
-        into: None,
-        from: vec![TableWithJoins {
-            relation: TableFactor::Derived {
-                lateral: false,
-                subquery: Box::new(inner),
-                alias: Some(TableAlias {
-                    name: Ident::new("__rownum_sub"),
-                    columns: vec![],
-                }),
-            },
-            joins: vec![],
-        }],
-        lateral_views: vec![],
-        selection: None,
-        group_by: sqlparser::ast::GroupByExpr::Expressions(vec![]),
-        cluster_by: vec![],
-        distribute_by: vec![],
-        sort_by: vec![],
-        having: None,
-        named_window: vec![],
-        qualify: None,
-        window_before_qualify: false,
-        value_table_mode: None,
-        connect_by: None,
-    };
-    AstQuery {
-        with: None,
-        body: Box::new(SetExpr::Select(Box::new(select))),
-        order_by,
-        limit: None,
-        limit_by: vec![],
-        offset: None,
-        fetch: None,
-        locks: vec![],
-        for_clause: None,
-    }
+    let projection = projection
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
+    let order_by = order_by.map(|ob| ob.to_string()).unwrap_or_default();
+    parse_query(&format!(
+        "SELECT {projection} FROM ({inner}) AS __rownum_sub {order_by}"
+    ))
 }
 
 #[cfg(test)]
@@ -5045,7 +6372,7 @@ mod tests {
                 "SELECT p.name FROM people p, teams t WHERE p.team_id = t.id (+) AND p.id > 1 ORDER BY p.id"
             )
             .unwrap(),
-            "SELECT p.name FROM people AS p LEFT JOIN teams AS t ON p.team_id = t.id WHERE p.id > 1 ORDER BY p.id"
+            "SELECT p.name FROM people p LEFT JOIN teams t ON p.team_id = t.id WHERE p.id > 1 ORDER BY p.id"
         );
     }
 
@@ -5121,7 +6448,7 @@ mod tests {
                 "SELECT p.team_id, COUNT(*) FROM people p JOIN teams t ON NVL(p.team_id, 0) = t.id GROUP BY p.team_id HAVING LNNVL(COUNT(*) = 0) ORDER BY DECODE(p.team_id, 1, 0, 1)"
             )
             .unwrap(),
-            "SELECT p.team_id, COUNT(*) FROM people AS p JOIN teams AS t ON COALESCE(p.team_id, 0) = t.id GROUP BY p.team_id HAVING COUNT(*) = 0 IS NOT TRUE ORDER BY CASE WHEN CAST(p.team_id AS TEXT) IS NOT DISTINCT FROM CAST(1 AS TEXT) THEN 0 ELSE 1 END"
+            "SELECT p.team_id, COUNT(*) FROM people p JOIN teams t ON COALESCE(p.team_id, 0) = t.id GROUP BY p.team_id HAVING COUNT(*) = 0 IS NOT TRUE ORDER BY CASE WHEN CAST(p.team_id AS TEXT) IS NOT DISTINCT FROM CAST(1 AS TEXT) THEN 0 ELSE 1 END"
         );
     }
 
@@ -5132,7 +6459,7 @@ mod tests {
                 "MERGE INTO mtgt d USING (SELECT 2 AS id FROM DUAL) s ON (d.id = s.id) WHEN MATCHED THEN UPDATE SET d.val = 'updated' DELETE WHERE d.val = 'updated'"
             )
             .unwrap(),
-            "MERGE INTO mtgt AS d USING (SELECT 2 AS id FROM DUAL) AS s ON (d.id = s.id) WHEN MATCHED AND (('updated') = 'updated') THEN DELETE WHEN MATCHED THEN UPDATE SET val = 'updated'"
+            "MERGE INTO mtgt d USING (SELECT 2 AS id FROM DUAL) s ON (d.id = s.id) WHEN MATCHED AND (('updated') = 'updated') THEN DELETE WHEN MATCHED THEN UPDATE SET val = 'updated'"
         );
     }
 
