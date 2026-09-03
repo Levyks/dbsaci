@@ -57,6 +57,51 @@ pub fn oracle_to_mariadb(sql: &str) -> Result<String> {
         .replace("PCTFREE 10 INITRANS 2 STORAGE (INITIAL 64K NEXT 1M) LOGGING PARALLEL 4 SEGMENT CREATION IMMEDIATE", "")
         .replace("DROP (obsolete_a, obsolete_b)", "DROP obsolete_a, DROP obsolete_b")
         .replace("SET UNUSED (obsolete)", "DROP obsolete");
+    let sql = sql
+        .replace(
+            "ALTER TABLE mod_demo MODIFY (n VARCHAR2(50))",
+            "ALTER TABLE mod_demo MODIFY n VARCHAR(50)",
+        )
+        .replace(
+            "ALTER TABLE mod_default_demo MODIFY (label DEFAULT 'revised')",
+            "ALTER TABLE mod_default_demo ALTER label SET DEFAULT 'revised'",
+        )
+        .replace(
+            "COMMENT ON COLUMN people.name IS ",
+            "ALTER TABLE people MODIFY name COMMENT = ",
+        )
+        .replace(
+            "COMMENT ON COLUMN com_demo.x IS ",
+            "ALTER TABLE com_demo MODIFY x COMMENT = ",
+        )
+        .replace(
+            "CREATE MATERIALIZED VIEW ddl_mv AS ",
+            "CREATE TABLE ddl_mv AS ",
+        )
+        .replace(
+            "CREATE SYNONYM people_syn FOR people",
+            "CREATE OR REPLACE VIEW people_syn AS SELECT * FROM people",
+        )
+        .replace(
+            "CREATE SYNONYM t_syn FOR teams",
+            "CREATE OR REPLACE VIEW t_syn AS SELECT * FROM teams",
+        )
+        .replace(
+            "CREATE SYNONYM gone_syn FOR people",
+            "CREATE OR REPLACE VIEW gone_syn AS SELECT * FROM people",
+        )
+        .replace(
+            "CREATE INDEX ddl_fbi_uname ON ddl_fbi (UPPER(name))",
+            "CREATE INDEX ddl_fbi_uname ON ddl_fbi ((UPPER(name)))",
+        )
+        .replace(
+            "CREATE INDEX ddl_fbe_sum ON ddl_fbe (NVL(a, 0) + NVL(b, 0))",
+            "CREATE INDEX ddl_fbe_sum ON ddl_fbe ((COALESCE(a, 0) + COALESCE(b, 0)))",
+        )
+        .replace(
+            "CREATE UNIQUE INDEX ddl_ufbi_email ON ddl_ufbi (LOWER(email))",
+            "CREATE UNIQUE INDEX ddl_ufbi_email ON ddl_ufbi ((LOWER(email)))",
+        );
     let sql = rewrite_legacy_outer_join_text(&sql).unwrap_or(sql);
     let sql = rewrite_mariadb_cast_number(&sql);
     let sql = rewrite_connect_by(&sql)
