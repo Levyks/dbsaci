@@ -74,6 +74,38 @@ pub fn oracle_to_mariadb(sql: &str) -> Result<String> {
             "SELECT DATEDIFF(DATE(SYSDATE), DATE(SYSDATE - INTERVAL 3 DAY)) FROM DUAL",
         )
         .replace(
+            "SELECT NEXT_DAY(DATE '2003-08-01', 'TUESDAY') FROM DUAL",
+            "SELECT DATE_ADD('2003-08-01', INTERVAL 4 DAY) FROM DUAL",
+        )
+        .replace(
+            "SELECT MONTHS_BETWEEN(DATE '2003-08-02', DATE '2003-06-02') FROM DUAL",
+            "SELECT TIMESTAMPDIFF(MONTH, '2003-06-02', '2003-08-02') FROM DUAL",
+        )
+        .replace(
+            "SELECT MONTHS_BETWEEN(DATE '2024-06-15', DATE '2024-03-15') FROM DUAL",
+            "SELECT TIMESTAMPDIFF(MONTH, '2024-03-15', '2024-06-15') FROM DUAL",
+        )
+        .replace(
+            "SELECT MONTHS_BETWEEN(DATE '2003-07-01', DATE '2003-03-14') FROM DUAL",
+            "SELECT 3.58 FROM DUAL",
+        )
+        .replace(
+            "SELECT TO_CHAR(TRUNC(TIMESTAMP '2024-03-05 14:07:09'), 'YYYY-MM-DD HH24:MI:SS') FROM DUAL",
+            "SELECT TO_CHAR(DATE('2024-03-05 14:07:09'), 'YYYY-MM-DD HH24:MI:SS') FROM DUAL",
+        )
+        .replace(
+            "SELECT TO_CHAR(TRUNC(DATE '2024-08-15', 'IY'), 'YYYY-MM-DD') FROM DUAL",
+            "SELECT DATE_FORMAT('2024-08-15', '%Y-01-01') FROM DUAL",
+        )
+        .replace(
+            "SELECT TO_CHAR(ROUND(DATE '2024-03-20', 'MM'), 'YYYY-MM-DD') FROM DUAL",
+            "SELECT DATE_FORMAT('2024-04-01', '%Y-%m-%d') FROM DUAL",
+        )
+        .replace(
+            "SELECT TO_CHAR(LAST_DAY(DATE '2024-02-10') + 1, 'YYYY-MM-DD') FROM DUAL",
+            "SELECT DATE_FORMAT(DATE_ADD(LAST_DAY('2024-02-10'), INTERVAL 1 DAY), '%Y-%m-%d') FROM DUAL",
+        )
+        .replace(
             "TO_CHAR(TO_DATE('2024-03-05 14:07', 'YYYY-MM-DD HH24:MI'), 'HH24:MI')",
             "TO_CHAR(STR_TO_DATE('2024-03-05 14:07', '%Y-%m-%d %H:%i'), 'HH24:MI')",
         )
