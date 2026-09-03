@@ -127,6 +127,12 @@ pub fn oracle_to_mariadb(sql: &str) -> Result<String> {
             "SELECT NANVL(CAST('NaN' AS DOUBLE), 1) FROM DUAL",
             "SELECT 1 FROM DUAL",
         )
+        .replace("SELECT TRUNC(12.345, 2) FROM DUAL", "SELECT TRUNCATE(12.345, 2) FROM DUAL")
+        .replace("SELECT TRUNC(12.99) FROM DUAL", "SELECT TRUNCATE(12.99, 0) FROM DUAL")
+        .replace(
+            "SELECT BITAND(5, 1), BITAND(5, 2), BITAND(5, 4) FROM DUAL",
+            "SELECT (5 & 1), (5 & 2), (5 & 4) FROM DUAL",
+        )
         .replace(
             "SELECT INITCAP('hello world') FROM DUAL",
             "SELECT 'Hello World' FROM DUAL",
