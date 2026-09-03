@@ -91,6 +91,10 @@ pub fn oracle_to_mariadb(sql: &str) -> Result<String> {
         )
         .replace(" RETURNING name", "")
         .replace(" returning name", "")
+        .replace(
+            "RAISE_APPLICATION_ERROR(-20001, 'deletes disabled')",
+            "SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'deletes disabled'",
+        )
         )
 }
 
