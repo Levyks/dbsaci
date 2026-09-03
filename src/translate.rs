@@ -42,6 +42,19 @@ pub fn oracle_to_mariadb(sql: &str) -> Result<String> {
         .replace("decode(", "UNHEX(")
         .replace(", 'hex')", ")");
     let sql = rewrite_mariadb_cast_number(&sql);
+    let sql = rewrite_connect_by(&sql)
+        .replace("::text", "")
+        .replace("::numeric", "")
+        .replace("::integer", "")
+        .replace("ARRAY[]", "''")
+        .replace("[]", "''")
+        .replace("ARRAY[__n.id]", "CONCAT(',', __n.id, ',')")
+        .replace("__ids || __c.id", "CONCAT(__ids, ',', __c.id, ',')")
+        .replace("__cb.CONCAT(__ids", "CONCAT(__cb.__ids")
+        .replace(
+            "NOT __c.id = ANY(__cb.__ids)",
+            "INSTR(__cb.__ids, CONCAT(',', __c.id, ',')) = 0",
+        );
     Ok(sql
         .replace(
             "REGEXP_LIKE(name, '^A')",
