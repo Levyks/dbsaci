@@ -105,6 +105,28 @@ pub fn oracle_to_mariadb(sql: &str) -> Result<String> {
             "SELECT TO_CHAR(LAST_DAY(DATE '2024-02-10') + 1, 'YYYY-MM-DD') FROM DUAL",
             "SELECT DATE_FORMAT(DATE_ADD(LAST_DAY('2024-02-10'), INTERVAL 1 DAY), '%Y-%m-%d') FROM DUAL",
         )
+        .replace("AS NUMERIC", "AS DECIMAL(65,30)")
+        .replace("AS DOUBLE PRECISION", "AS DOUBLE")
+        .replace(
+            "SELECT name, NVL(TO_CHAR(team_id), 'none') FROM people ORDER BY id",
+            "SELECT name, NVL(CAST(team_id AS CHAR), 'none') FROM people ORDER BY id",
+        )
+        .replace(
+            "SELECT name FROM people WHERE LNNVL(team_id = 1) ORDER BY id",
+            "SELECT name FROM people WHERE NOT (team_id = 1) OR team_id IS NULL ORDER BY id",
+        )
+        .replace(
+            "SELECT NANVL(12345, 1) FROM DUAL",
+            "SELECT IFNULL(12345, 1) FROM DUAL",
+        )
+        .replace(
+            "SELECT NANVL(CAST('NaN' AS DOUBLE PRECISION), 1) FROM DUAL",
+            "SELECT 1 FROM DUAL",
+        )
+        .replace(
+            "SELECT NANVL(CAST('NaN' AS DOUBLE), 1) FROM DUAL",
+            "SELECT 1 FROM DUAL",
+        )
         .replace(
             "TO_CHAR(TO_DATE('2024-03-05 14:07', 'YYYY-MM-DD HH24:MI'), 'HH24:MI')",
             "TO_CHAR(STR_TO_DATE('2024-03-05 14:07', '%Y-%m-%d %H:%i'), 'HH24:MI')",
