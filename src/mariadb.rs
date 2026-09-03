@@ -72,6 +72,22 @@ impl MariaDbBackend {
         conn.query_drop("SET NAMES utf8mb4")
             .await
             .map_err(|e| Error::Postgres(format!("MariaDB charset setup failed: {e}")))?;
+        // SQL_MODE=ORACLE supplies syntax and built-ins, but it does not
+        // provide Oracle's catalog views. Install the small portable core
+        // used by the corpus and by common migration tools in this schema.
+        for ddl in [
+            "CREATE OR REPLACE VIEW user_tables AS SELECT UPPER(table_name) AS table_name FROM information_schema.tables WHERE table_schema = DATABASE() AND table_type = 'BASE TABLE'",
+            "CREATE OR REPLACE VIEW all_tables AS SELECT UPPER(table_schema) AS owner, UPPER(table_name) AS table_name FROM information_schema.tables WHERE table_type = 'BASE TABLE'",
+            "CREATE OR REPLACE VIEW user_tab_columns AS SELECT UPPER(table_name) AS table_name, UPPER(column_name) AS column_name, ordinal_position AS column_id FROM information_schema.columns WHERE table_schema = DATABASE()",
+            "CREATE OR REPLACE VIEW all_tab_columns AS SELECT UPPER(table_schema) AS owner, UPPER(table_name) AS table_name, UPPER(column_name) AS column_name, ordinal_position AS column_id FROM information_schema.columns",
+            "CREATE OR REPLACE VIEW user_objects AS SELECT UPPER(table_name) AS object_name, 'TABLE' AS object_type FROM information_schema.tables WHERE table_schema = DATABASE() AND table_type = 'BASE TABLE'",
+            "CREATE OR REPLACE VIEW user_sequences AS SELECT UPPER(table_name) AS sequence_name FROM information_schema.tables WHERE table_schema = DATABASE() AND table_type = 'SEQUENCE'",
+            "CREATE OR REPLACE VIEW all_sequences AS SELECT UPPER(table_schema) AS sequence_owner, UPPER(table_name) AS sequence_name FROM information_schema.tables WHERE table_type = 'SEQUENCE'",
+        ] {
+            conn.query_drop(ddl)
+                .await
+                .map_err(|e| Error::Postgres(format!("MariaDB catalog setup failed: {e}")))?;
+        }
         conn.query_drop("START TRANSACTION")
             .await
             .map_err(|e| Error::Postgres(format!("MariaDB transaction setup failed: {e}")))?;
