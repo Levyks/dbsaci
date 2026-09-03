@@ -371,6 +371,11 @@ fn rewrite_mariadb_cast_number(sql: &str) -> String {
                 } else {
                     body[..as_pos].to_string()
                 };
+                if suffix.starts_with('(') {
+                    out.push_str(&expression);
+                    cursor = close + 1;
+                    continue;
+                }
                 out.push_str("CAST(");
                 out.push_str(&expression);
                 out.push_str(" AS ");
