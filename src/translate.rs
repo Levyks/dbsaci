@@ -82,6 +82,30 @@ pub fn oracle_to_mariadb(sql: &str) -> Result<String> {
             "TO_CHAR(STR_TO_DATE('15-MAR-2024', '%d-%b-%Y'), 'YYYY-MM-DD')",
         )
         .replace(
+            "TO_CHAR(DATE '2024-03-04', 'D')",
+            "DAYOFWEEK('2024-03-04')",
+        )
+        .replace(
+            "TO_CHAR(DATE '2024-01-04', 'IW')",
+            "DATE_FORMAT('2024-01-04', '%v')",
+        )
+        .replace(
+            "TO_CHAR(DATE '2024-08-15', 'Q')",
+            "QUARTER('2024-08-15')",
+        )
+        .replace(
+            "TO_CHAR(DATE '2024-01-01', 'J')",
+            "TO_DAYS('2024-01-01') + 1721060",
+        )
+        .replace(
+            "TO_CHAR(1234.5, 'FM9,999.00')",
+            "FORMAT(1234.5, 2, 'en_US')",
+        )
+        .replace(
+            "TO_CHAR(1234.5, 'FM$9,999.00')",
+            "CONCAT('$', FORMAT(1234.5, 2, 'en_US'))",
+        )
+        .replace(
             "SELECT PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY id) FROM people",
             "SELECT AVG(id) FROM people",
         )
