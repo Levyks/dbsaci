@@ -12,6 +12,7 @@ use crate::auth::{AuthState, hex_upper};
 use crate::backend::{BackendKind, OracleBackend, OracleCursor, PostgresBackend};
 use crate::credentials::Credentials;
 use crate::error::{Error, Result};
+use crate::mariadb::MariaDbBackend;
 use crate::tns::{PacketType, SduMode, TnsStream, build_accept_response};
 use crate::wire::{
     self, build_dml_response, build_error_response, build_error_response_at, build_query_response,
@@ -817,43 +818,51 @@ async fn handle_connection(stream: TcpStream, session_id: u64, config: Config) -
     tns.write_packet(PacketType::Data, &auth2_response).await?;
 
     // 8. Connect to the selected backend using Oracle credentials.
-    if config.backend == BackendKind::MariaDb {
-        return Err(Error::Postgres(
-            "MariaDB backend is selected but not implemented yet".into(),
-        ));
-    }
-    let backend: Arc<dyn OracleBackend> = match PostgresBackend::connect(
-        &config.pg_host,
-        config.pg_port,
-        &username,
-        &pg_password,
-        &config.pg_db,
-        config.statement_timeout,
-    )
-    .await
-    {
-        Ok(backend) => Arc::new(Arc::new(backend)),
-        Err(e) => {
-            // Report the failure to the client with a sensible ORA- code (e.g.
-            // PostgreSQL's `max_connections` -> ORA-00018) instead of dropping
-            // the socket.
-            let (code, message, error_pos) = oracle_error_for_pos(&e);
-            tns.write_packet(
-                PacketType::Data,
-                &build_error_response_at(
+    let backend: Arc<dyn OracleBackend> = match config.backend {
+        BackendKind::Postgres => match PostgresBackend::connect(
+            &config.pg_host,
+            config.pg_port,
+            &username,
+            &pg_password,
+            &config.pg_db,
+            config.statement_timeout,
+        )
+        .await
+        {
+            Ok(backend) => Arc::new(Arc::new(backend)),
+            Err(e) => {
+                return backend_connect_error(
+                    &mut tns,
+                    &e,
                     response_completion,
                     newer_describe_framing,
                     oci_dialect,
-                    code,
-                    &message,
-                    error_pos,
-                ),
-            )
-            .await?;
-            return Err(e);
-        }
+                )
+                .await;
+            }
+        },
+        BackendKind::MariaDb => match MariaDbBackend::connect(
+            &config.pg_host,
+            config.pg_port,
+            &username,
+            &pg_password,
+            &config.pg_db,
+        )
+        .await
+        {
+            Ok(backend) => Arc::new(Arc::new(backend)),
+            Err(e) => {
+                return backend_connect_error(
+                    &mut tns,
+                    &e,
+                    response_completion,
+                    newer_describe_framing,
+                    oci_dialect,
+                )
+                .await;
+            }
+        },
     };
-
     // 9. Main command loop. At most one streamed cursor is active at a time,
     // matching the way OCI/thin clients drive a single statement through
     // Execute + repeated Fetch.
@@ -1718,6 +1727,29 @@ fn is_query_statement(sql: &str) -> bool {
             || upper.contains("MERGE "));
     }
     false
+}
+
+async fn backend_connect_error(
+    tns: &mut TnsStream,
+    error: &Error,
+    response_completion: bool,
+    newer_describe_framing: bool,
+    oci_dialect: bool,
+) -> Result<()> {
+    let (code, message, error_pos) = oracle_error_for_pos(error);
+    tns.write_packet(
+        PacketType::Data,
+        &build_error_response_at(
+            response_completion,
+            newer_describe_framing,
+            oci_dialect,
+            code,
+            &message,
+            error_pos,
+        ),
+    )
+    .await?;
+    Err(Error::Postgres(error.to_string()))
 }
 
 /// Await `fut`, but if the client sends a TNS Marker (OCIBreak / Ctrl-C) while
