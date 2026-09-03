@@ -69,6 +69,9 @@ impl MariaDbBackend {
         conn.query_drop("SET sql_mode = 'ORACLE'")
             .await
             .map_err(|e| Error::Postgres(format!("MariaDB Oracle mode failed: {e}")))?;
+        conn.query_drop("START TRANSACTION")
+            .await
+            .map_err(|e| Error::Postgres(format!("MariaDB transaction setup failed: {e}")))?;
         Ok(Self {
             conn: tokio::sync::Mutex::new(conn),
         })
@@ -153,18 +156,80 @@ impl OracleBackend for Arc<MariaDbBackend> {
 
     async fn execute_simple(&self, sql: &str, binds: &[BindValue]) -> Result<u64> {
         let mut conn = self.conn.lock().await;
+        let command = sql.trim().trim_end_matches(';');
+        if command.eq_ignore_ascii_case("COMMIT") {
+            conn.query_drop("COMMIT").await.map_err(mariadb_error)?;
+            conn.query_drop("START TRANSACTION")
+                .await
+                .map_err(mariadb_error)?;
+            return Ok(0);
+        }
+        if command.eq_ignore_ascii_case("ROLLBACK") {
+            conn.query_drop("ROLLBACK").await.map_err(mariadb_error)?;
+            conn.query_drop("START TRANSACTION")
+                .await
+                .map_err(mariadb_error)?;
+            return Ok(0);
+        }
+        if command.eq_ignore_ascii_case("BEGIN")
+            || command.eq_ignore_ascii_case("START TRANSACTION")
+        {
+            return Ok(0);
+        }
+        let upper = command.to_ascii_uppercase();
+        if upper.starts_with("SAVEPOINT ")
+            || upper.starts_with("RELEASE SAVEPOINT ")
+            || upper.starts_with("ROLLBACK TO ")
+            || upper.starts_with("SET TRANSACTION ")
+        {
+            conn.query_drop(mariadb_sql(command))
+                .await
+                .map_err(mariadb_error)?;
+            return Ok(0);
+        }
         conn.query_drop("SET sql_mode = 'ORACLE'")
             .await
             .map_err(mariadb_error)?;
+        conn.query_drop("SAVEPOINT pgsaci_statement")
+            .await
+            .map_err(mariadb_error)?;
+        let result = conn
+            .exec_iter(
+                mariadb_sql(command),
+                Params::Positional(bind_values(binds)?),
+            )
+            .await;
+        match result {
+            Ok(result) => {
+                let affected = result.affected_rows();
+                conn.query_drop("RELEASE SAVEPOINT pgsaci_statement")
+                    .await
+                    .map_err(mariadb_error)?;
+                Ok(affected)
+            }
+            Err(error) => {
+                let _ = conn
+                    .query_drop("ROLLBACK TO SAVEPOINT pgsaci_statement")
+                    .await;
+                let _ = conn.query_drop("RELEASE SAVEPOINT pgsaci_statement").await;
+                Err(mariadb_error(error))
+            }
+        }
+    }
+
+    async fn execute_ddl(&self, sql: &str, binds: &[BindValue]) -> Result<u64> {
+        let mut conn = self.conn.lock().await;
+        conn.query_drop("COMMIT").await.map_err(mariadb_error)?;
         let result = conn
             .exec_iter(mariadb_sql(sql), Params::Positional(bind_values(binds)?))
             .await
             .map_err(mariadb_error)?;
-        Ok(result.affected_rows())
-    }
-
-    async fn execute_ddl(&self, sql: &str, binds: &[BindValue]) -> Result<u64> {
-        self.execute_simple(sql, binds).await
+        let affected = result.affected_rows();
+        conn.query_drop("COMMIT").await.map_err(mariadb_error)?;
+        conn.query_drop("START TRANSACTION")
+            .await
+            .map_err(mariadb_error)?;
+        Ok(affected)
     }
 
     async fn execute_returning(
