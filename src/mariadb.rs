@@ -246,7 +246,12 @@ impl OracleBackend for Arc<MariaDbBackend> {
 }
 
 fn mariadb_error(e: mysql_async::Error) -> Error {
-    Error::Postgres(format!("MariaDB error: {e}"))
+    match e {
+        mysql_async::Error::Server(server) => {
+            Error::Postgres(format!("{}: {}", server.state, server.message))
+        }
+        other => Error::Postgres(format!("MariaDB error: {other}")),
+    }
 }
 
 fn bind_values(binds: &[BindValue]) -> Result<Vec<Value>> {
