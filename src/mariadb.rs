@@ -281,3 +281,16 @@ fn urlencoding(value: &str) -> String {
     }
     out
 }
+
+#[cfg(test)]
+mod tests {
+    use super::mariadb_sql;
+
+    #[test]
+    fn converts_backend_parameters_but_not_literals_or_identifiers() {
+        assert_eq!(
+            mariadb_sql("SELECT $1, '$2', \"$3\", `$4` WHERE x = $12"),
+            "SELECT ?, '$2', \"$3\", `$4` WHERE x = ?"
+        );
+    }
+}
