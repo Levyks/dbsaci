@@ -56,7 +56,9 @@ impl MariaDbBackend {
     ) -> Result<Self> {
         let url = format!(
             "mysql://{}:{}@{}:{}/{}",
-            urlencoding(user),
+            // Oracle usernames are case-insensitive and the server passes the
+            // authenticated name in uppercase; MariaDB account names are not.
+            urlencoding(&user.to_lowercase()),
             urlencoding(password),
             host,
             port,
@@ -235,6 +237,20 @@ fn mariadb_sql(sql: &str) -> String {
             out.push(b as char);
             i += 1;
         }
+    }
+    // The shared bind rewriter annotates PostgreSQL parameters with casts.
+    // MariaDB infers these from the bound value and treats `::name` as a
+    // named-parameter marker, so remove only casts attached to `?`.
+    for ty in [
+        "text",
+        "numeric",
+        "bytea",
+        "timestamp",
+        "timestamptz",
+        "boolean",
+        "double precision",
+    ] {
+        out = out.replace(&format!("?::{ty}"), "?");
     }
     out
 }

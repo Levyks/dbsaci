@@ -51,6 +51,10 @@ harness = false
 name = "translate_golden"
 harness = true
 
+[[test]]
+name = "mariadb_smoke"
+harness = true
+
 [profile.release]
 strip = "symbols"   # drop debuginfo/symbols from the binary
 lto = "thin"        # modest size + speed win, safe
