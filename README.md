@@ -1,17 +1,17 @@
-# PgSaci
+# DbSaci
 
-**Docs: <https://levyks.github.io/pgsaci/>**
+**Docs: <https://levyks.github.io/dbsaci/>**
 
-PgSaci is a proxy that speaks Oracle's **TNS/TTC wire protocol** on the front and
-**stock PostgreSQL** on the back. An unmodified Oracle client — `python-oracledb`
-(thin), the Oracle JDBC thin driver, ODP.NET, OCI-based tools — points at PgSaci
-instead of at an Oracle database, and PgSaci:
+DbSaci is a proxy that speaks Oracle's **TNS/TTC wire protocol** on the front and
+connects to **PostgreSQL or MariaDB** on the back. An unmodified Oracle client — `python-oracledb`
+(thin), the Oracle JDBC thin driver, ODP.NET, OCI-based tools — points at DbSaci
+instead of at an Oracle database, and DbSaci:
 
 1. terminates the Oracle client handshake and authentication,
-2. translates the Oracle SQL dialect it understands into PostgreSQL SQL,
-3. runs the query against a normal PostgreSQL server that has the
-   [`orafce`](https://github.com/orafce/orafce) extension installed,
-4. re-encodes the PostgreSQL result back into Oracle's binary framing.
+2. translates the Oracle SQL dialect it understands into backend SQL,
+3. runs the query against PostgreSQL + [`orafce`](https://github.com/orafce/orafce)
+   or MariaDB 11.4 in `SQL_MODE=ORACLE`,
+4. re-encodes the backend result back into Oracle's binary framing.
 
 The application keeps its Oracle driver, its connection string shape, and most of
 its SQL. Nothing about the database it actually talks to is Oracle.
@@ -26,85 +26,106 @@ its SQL. Nothing about the database it actually talks to is Oracle.
 [IvorySQL](https://github.com/IvorySQL/IvorySQL) is a *fork of the PostgreSQL
 server* that builds Oracle SQL/PL-SQL compatibility — an Oracle parse mode,
 PL/iSQL, packages, `NUMBER`/`DATE` semantics, `DUAL`, etc. — **into the database
-engine**. It is far deeper than PgSaci on the *dialect*. But IvorySQL speaks the
+engine**. It is far deeper than DbSaci on the *dialect*. But IvorySQL speaks the
 **PostgreSQL wire protocol**: your application connects to it with a PostgreSQL
 driver. An unmodified Oracle client (ojdbc, ODP.NET, `python-oracledb`, an
 OCI-linked tool) cannot connect to IvorySQL at all.
 
-PgSaci is the inverse trade. It speaks Oracle's **TNS/TTC wire protocol**, so the
+DbSaci is the inverse trade. It speaks Oracle's **TNS/TTC wire protocol**, so the
 Oracle client connects exactly as it would to Oracle — no driver swap, no
 connection-string rewrite — while the database behind it is an ordinary,
-unmodified PostgreSQL. The cost is coverage: PgSaci only supports the slice of
-Oracle SQL/PL-SQL its translation layer plus `orafce` can express. Use IvorySQL
+unmodified PostgreSQL or MariaDB. The cost is coverage: DbSaci only supports
+the slice of Oracle SQL/PL-SQL its translation layer plus backend compatibility
+facilities can express. Use IvorySQL
 if you can repoint the application at a new database and want broad Oracle SQL
-semantics; use PgSaci if the application **and its Oracle driver** have to stay
+semantics; use DbSaci if the application **and its Oracle driver** have to stay
 exactly as they are.
 
 ## Requirements
 
 - **PostgreSQL** (recent release) with the **`orafce`** extension available
-  (`CREATE EXTENSION orafce`). A ready-to-use image is built from
-  [`testcontainers/Dockerfile`](testcontainers/Dockerfile).
-- **Rust** (stable, 2024 edition) to build PgSaci.
-- A login role on PostgreSQL for the proxy to connect as; one Oracle session maps
-  to one dedicated PostgreSQL connection, so size `max_connections` (or put a
-  session pooler behind PgSaci) accordingly.
-- Transport is **plaintext** on both sides today. Run PgSaci behind a
+  (`CREATE EXTENSION orafce`), or **MariaDB 11.4+**. MariaDB should run with
+  `SQL_MODE=ORACLE`; DbSaci adds the remaining structural rewrites and facade
+  objects. A PostgreSQL test image is built from `testcontainers/Dockerfile`.
+- **Rust** (stable, 2024 edition) to build DbSaci.
+- A login role on the selected backend for the proxy to connect as; one Oracle
+  session maps to one dedicated backend connection, so size the backend's
+  connection capacity accordingly.
+- Transport is **plaintext** on both sides today. Run DbSaci behind a
   TLS-terminating boundary if you need encryption in transit.
 
 ## Running it
 
 ```bash
 # build the Postgres+orafce test image once
-docker build -t pgsaci-test-pg:18 testcontainers
+docker build -t dbsaci-test-pg:18 testcontainers
 
 # start it and note the mapped 5432 port
-docker run -d -e POSTGRES_PASSWORD=postgres -P pgsaci-test-pg:18
+docker run -d -e POSTGRES_PASSWORD=postgres -P dbsaci-test-pg:18
 
-# run the proxy (see src/bin/pgsaci.rs for every PGSACI_* variable)
-PGSACI_LISTEN=0.0.0.0:1521 \
-PGSACI_PG_HOST=127.0.0.1 PGSACI_PG_PORT=<mapped-port> \
-PGSACI_PG_DB=postgres PGSACI_PG_PASSWORD=<role-password> \
-cargo run --bin pgsaci
+# run the proxy (see src/bin/dbsaci.rs for every DBSACI_* variable)
+DBSACI_LISTEN=0.0.0.0:1521 \
+DBSACI_PG_HOST=127.0.0.1 DBSACI_PG_PORT=<mapped-port> \
+DBSACI_PG_DB=postgres DBSACI_PG_PASSWORD=<role-password> \
+cargo run --bin dbsaci
 ```
+
+For MariaDB, start MariaDB with Oracle mode enabled and select the backend:
+
+```bash
+docker run -d --name dbsaci-mariadb \
+  -e MARIADB_ROOT_PASSWORD=root \
+  -e MARIADB_DATABASE=appdb -e MARIADB_USER=appuser -e MARIADB_PASSWORD=apppw \
+  -p 3306:3306 mariadb:11.4 --sql-mode=ORACLE
+
+DBSACI_BACKEND=mariadb \
+DBSACI_PG_HOST=127.0.0.1 DBSACI_PG_PORT=3306 \
+DBSACI_PG_DB=appdb DBSACI_PG_PASSWORD=apppw \
+cargo run --bin dbsaci
+```
+
+The `PG` option names are retained for CLI/environment compatibility with the
+original PostgreSQL backend; they point to the selected backend in MariaDB
+mode as well. See the [compatibility matrix](https://levyks.github.io/dbsaci/compatibility/)
+for the backend-by-backend feature status.
 
 Then connect any Oracle client to `//host:1521/FREEPDB1`.
 
-Or run it from a container (`levyks/pgsaci:0.0.9`, ~12 MB) —
-`docker run -p 1521:1521 -e PGSACI_PG_HOST=… levyks/pgsaci:0.0.9`. See the
-[docs](https://levyks.github.io/pgsaci/getting-started/) for a full
+Or run it from a container (`levyks/dbsaci:0.1.0`, ~12 MB) —
+`docker run -p 1521:1521 -e DBSACI_PG_HOST=… levyks/dbsaci:0.1.0`. See the
+[docs](https://levyks.github.io/dbsaci/getting-started/) for a full
 docker-compose.
 
-Every option also has a CLI flag (`pgsaci --help`); the flag wins over the env var.
+Every option also has a CLI flag (`dbsaci --help`); the flag wins over the env var.
 
-`PGSACI_ORACLE_VERSION` picks which release PgSaci claims to be — `19` (default) or
+`DBSACI_ORACLE_VERSION` picks which release DbSaci claims to be — `19` (default) or
 `11`. This changes the banner, `AUTH_VERSION_*`, and the auth verifier family so
 that both modern and 11g-era clients negotiate successfully.
 
 ### Credentials (multi-user)
 
 An Oracle login is a challenge/response — the password never crosses the wire —
-so PgSaci must already hold each user's PostgreSQL password. Declare them up
+so DbSaci must already hold each user's PostgreSQL password. Declare them up
 front and an Oracle client then authenticates with the *same* user/password it
 would use against PostgreSQL directly:
 
 ```bash
-pgsaci \
+dbsaci \
   --pg-user alice:s3cret --pg-user bob:hunter2 \   # repeatable, CLI only
-  --pg-users-file /etc/pgsaci/users              \ # or a file of user:password lines
+  --pg-users-file /etc/dbsaci/users              \ # or a file of user:password lines
   --pg-password postgres                           # fallback for anyone not listed
-# env equivalents: PGSACI_PG_USERS="alice:s3cret,bob:hunter2",
-#                  PGSACI_PG_USERS_FILE=..., PGSACI_PG_PASSWORD=...
+# env equivalents: DBSACI_PG_USERS="alice:s3cret,bob:hunter2",
+#                  DBSACI_PG_USERS_FILE=..., DBSACI_PG_PASSWORD=...
 ```
 
-Sources layer file &lt; `PGSACI_PG_USERS` &lt; `--pg-user`. The username is matched
+Sources layer file &lt; `DBSACI_PG_USERS` &lt; `--pg-user`. The username is matched
 case-insensitively; a user with no match and no fallback is rejected with
 ORA-01017. The matched password drives both the login challenge and the backend
 PostgreSQL connection.
 
 ### Schemas
 
-Oracle's *schema == user*: on connect PgSaci ensures a PostgreSQL schema named
+Oracle's *schema == user*: on connect DbSaci ensures a PostgreSQL schema named
 after the user and sets `search_path` to `"<user>", oracle, public`. Unqualified
 names resolve in the user's own schema first, then in `public` (the shared
 fallback, also reachable as `public.<name>` — so an existing PostgreSQL database
@@ -193,23 +214,23 @@ Roughly most-likely-to-bite first.
 
 ## How slow is this?
 
-pgSaci sits in the path as an extra hop: it decodes the Oracle TNS/TTC frame,
+dbSaci sits in the path as an extra hop: it decodes the Oracle TNS/TTC frame,
 translates the SQL, does **one** backend round trip to PostgreSQL, and re-frames
 the answer. So per query it is slower than talking to Oracle directly — but both
 are in the low-millisecond range on a laptop.
 
 `bench/run.sh` runs an identical single-connection, single-thread micro-workload
 (`python-oracledb` thin) against a real **Oracle XE 21c** container and against
-**PostgreSQL 18 via pgSaci**, and prints this table. It measures *per-operation
-latency*, i.e. the overhead pgSaci adds — not database throughput. See
+**PostgreSQL 18 via dbSaci**, and prints this table. It measures *per-operation
+latency*, i.e. the overhead dbSaci adds — not database throughput. See
 `bench/README.md` for methodology and caveats.
 
 <!-- BENCH:START -->
 One sample run — 2 000 iterations/op (30 for the heavy ops), single connection.
 Everything runs in Docker on one bridge network — the client, Oracle XE,
-PostgreSQL and pgSaci — so every hop is a container veth with no host
-port-proxy in the path. pgSaci runs from its published image
-(`levyks/pgsaci:0.0.9`, a static musl build). Both database containers get
+PostgreSQL and dbSaci — so every hop is a container veth with no host
+port-proxy in the path. dbSaci runs from its published image
+(`levyks/dbsaci:0.1.0`, a static musl build). Both database containers get
 **2 CPU / 2.5 GiB**: Oracle XE spends its full 2 GiB licence (`INIT_SGA_SIZE`
 1536M + `INIT_PGA_SIZE` 512M), PostgreSQL is **tuned to that envelope**
 (`shared_buffers` 768 MB, 64 MB `work_mem`, parallel workers, `jit=off`). A
@@ -217,7 +238,7 @@ Windows laptop — re-run it on your own hardware, absolute numbers move a lot.
 
 **Per-statement latency** — small ops; the wall-clock is the proxy overhead.
 
-| operation | Oracle XE p50 | pgSaci p50 | pgSaci / Oracle |
+| operation | Oracle XE p50 | dbSaci p50 | dbSaci / Oracle |
 | --- | ---: | ---: | ---: |
 | `select_1_from_dual` | 0.11 ms | 0.58 ms | 5.2x |
 | `point_select_by_pk` (1 bind) | 0.11 ms | 0.55 ms | 4.8x |
@@ -227,17 +248,17 @@ Windows laptop — re-run it on your own hardware, absolute numbers move a lot.
 | `update_commit` | 1.52 ms | 1.92 ms | 1.3x |
 | `insert_then_rollback` | 1.56 ms | 0.67 ms | 0.4x |
 
-pgSaci adds **~0.45 ms of fixed overhead per round trip** — a second hop
-(client → pgSaci → PostgreSQL and back), plus SQL translation and re-encoding
+dbSaci adds **~0.45 ms of fixed overhead per round trip** — a second hop
+(client → dbSaci → PostgreSQL and back), plus SQL translation and re-encoding
 the result into Oracle's wire format. It is a large *ratio* on the sub-0.2 ms
 reads but still sub-millisecond in absolute terms. On the commit ops the WAL
 fsync dominates and the ratio falls to ~1.3x. `insert + rollback` is *quicker*
-via pgSaci — Oracle XE's redo/undo path for that pattern is heavier.
+via dbSaci — Oracle XE's redo/undo path for that pattern is heavier.
 
 **Throughput** — scan / sort / aggregate / transfer over `bench_big` (100 000
 rows); the wall-clock is dominated by the database engine, not the hop.
 
-| operation | Oracle XE p50 | pgSaci p50 | pgSaci / Oracle |
+| operation | Oracle XE p50 | dbSaci p50 | dbSaci / Oracle |
 | --- | ---: | ---: | ---: |
 | `big_full_aggregate` (COUNT/SUM/AVG/MIN/MAX, `NUMBER` cols) | 2.8 ms | 9.2 ms | 3.3x |
 | `big_scan_expr_count` (per-row `MOD` expr) | 15.3 ms | 21.1 ms | 1.4x |
@@ -255,7 +276,7 @@ slower than `bigint` / `double precision`); even with the tuned config and
 parallel query enabled, `big_full_aggregate` stays ~3x because the query is too
 short to parallelise. Integer columns or more cores narrow it. The bulk write is
 ~2x slower on p50 but far **steadier**: Oracle XE's p95 is ~2.9 s
-(redo-log-switch stalls) versus pgSaci's ~200 ms.
+(redo-log-switch stalls) versus dbSaci's ~200 ms.
 
 **This is a single-connection latency benchmark** and says nothing about
 concurrency, mixed OLTP, or a tuned deployment — the areas where PostgreSQL
@@ -266,12 +287,12 @@ costs a slice of the tiny-op latency.
 ## Tests
 
 The executable compatibility claim is the golden corpus — one real
-PostgreSQL/`orafce` container and one real PgSaci proxy, every case driven over
+PostgreSQL/`orafce` container and one real DbSaci proxy, every case driven over
 TNS, asserting Oracle-correct values, row counts and error text (not merely "did
 not error"):
 
 ```bash
-docker build -t pgsaci-test-pg:18 testcontainers     # first time only
+docker build -t dbsaci-test-pg:18 testcontainers     # first time only
 cargo test --test corpus -- --test-threads=1
 ```
 
@@ -282,7 +303,7 @@ expectation.
 
 CI runs the corpus against **PostgreSQL 18, 16 and 13** — build the image for a
 different major with `docker build --build-arg PG_VERSION=16 …` and point the
-tests at it with `PGSACI_TEST_PG_IMAGE=pgsaci-test-pg:16`.
+tests at it with `DBSACI_TEST_PG_IMAGE=dbsaci-test-pg:16`.
 
 Other suites:
 
@@ -303,11 +324,11 @@ below — that covers Oracle's marks and drivers, not this code.)
 
 ## Legal / trademarks
 
-PgSaci is an independent, clean-room implementation of a wire-compatible proxy.
+DbSaci is an independent, clean-room implementation of a wire-compatible proxy.
 It is **not affiliated with, endorsed by, or sponsored by Oracle Corporation.**
 "Oracle", "TNS", "OCI", "JDBC", and related marks are trademarks of Oracle
 Corporation and/or its affiliates, used here only descriptively to state what
-PgSaci is compatible with.
+DbSaci is compatible with.
 
 - No Oracle software is redistributed with this repository. The JDBC thin
   driver, ODP.NET, and Instant Client used by the compatibility probes are

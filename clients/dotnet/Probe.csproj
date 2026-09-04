@@ -7,7 +7,7 @@
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
     <AssemblyName>Probe</AssemblyName>
-    <RootNamespace>PgSaciProbe</RootNamespace>
+    <RootNamespace>DbSaciProbe</RootNamespace>
     <InvariantGlobalization>true</InvariantGlobalization>
   </PropertyGroup>
 

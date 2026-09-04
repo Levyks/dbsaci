@@ -1,4 +1,4 @@
-# Schema == user. Every pgSaci user owns a PostgreSQL schema of its own name;
+# Schema == user. Every dbSaci user owns a PostgreSQL schema of its own name;
 # unqualified DDL/DML lands there, other schemas are reached by qualifying
 # (`hr.emp`) or `ALTER SESSION SET CURRENT_SCHEMA`, and `public` is the shared
 # fallback on the search_path. The corpus connects as user `corpus`, so its
@@ -68,6 +68,7 @@ prod
 -- end
 
 -- case: public_reachable_when_explicitly_qualified
+-- skip: mariadb (MariaDB has no shared PUBLIC schema for cross-schema refs)
 SELECT v FROM public.corpus_shared_ref WHERE k = 'region'
 -- expect:
 eu
@@ -81,6 +82,7 @@ SELECT COUNT(*) FROM regions
 -- end
 
 -- case: get_ddl_resolves_in_the_user_schema
+-- skip: mariadb (no dbms_metadata.get_ddl on MariaDB)
 -- setup: CREATE TABLE ddl_probe (id NUMBER PRIMARY KEY, label VARCHAR2(20))
 SELECT CASE WHEN dbms_metadata.get_ddl('TABLE', 'DDL_PROBE', 'CORPUS') LIKE '%corpus.ddl_probe%'
             THEN 'ok' ELSE 'miss' END FROM dual

@@ -8,11 +8,11 @@ public class JdbcCompat {
         if (ok) pass++; else fail++;
     }
     public static void main(String[] a) throws Exception {
-        String host = System.getenv().getOrDefault("PGSACI_HOST", "127.0.0.1");
-        String port = System.getenv().getOrDefault("PGSACI_PORT", "1521");
-        String user = System.getenv().getOrDefault("PGSACI_USER", "corpus");
-        String pw   = System.getenv().getOrDefault("PGSACI_PASSWORD", "corpus");
-        String svc  = System.getenv().getOrDefault("PGSACI_SERVICE", "FREEPDB1");
+        String host = System.getenv().getOrDefault("DBSACI_HOST", "127.0.0.1");
+        String port = System.getenv().getOrDefault("DBSACI_PORT", "1521");
+        String user = System.getenv().getOrDefault("DBSACI_USER", "corpus");
+        String pw   = System.getenv().getOrDefault("DBSACI_PASSWORD", "corpus");
+        String svc  = System.getenv().getOrDefault("DBSACI_SERVICE", "FREEPDB1");
         String url = "jdbc:oracle:thin:@//" + host + ":" + port + "/" + svc;
         System.out.println("connecting: " + url + " as " + user);
         try (Connection c = DriverManager.getConnection(url, user, pw)) {

@@ -1,10 +1,10 @@
 [package]
-name = "pgsaci"
-version = "0.0.9"
+name = "dbsaci"
+version = "0.1.0"
 edition = "2024"
 license = "WTFPL"
-description = "A proxy that speaks Oracle's TNS/TTC wire protocol on the front and PostgreSQL on the back"
-repository = "https://github.com/Levyks/pgsaci"
+description = "An Oracle TNS/TTC wire-protocol proxy for PostgreSQL and MariaDB"
+repository = "https://github.com/Levyks/dbsaci"
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
@@ -15,7 +15,7 @@ bytes = "1"
 thiserror = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-sqlparser = "0.47"
+sqlparser = { version = "0.62", features = ["visitor"] }
 sha1 = "0.10"
 sha2 = "0.10"
 md-5 = "0.10"
@@ -38,7 +38,7 @@ oracle-rs = "0.1"
 libtest-mimic = "0.8"
 
 # End-to-end compatibility corpus. Custom harness: one PostgreSQL/orafce
-# container and one PgSaci proxy are started once, then every golden-file case
+# container and one DbSaci proxy are started once, then every golden-file case
 # is streamed across TNS through a single worker connection. See
 # `tests/corpus/README.md` for the file format.
 [[test]]

@@ -1,4 +1,4 @@
-# NVL / NVL2 / DECODE / LNNVL / NANVL. PgSaci lowers NVL2, DECODE and LNNVL to
+# NVL / NVL2 / DECODE / LNNVL / NANVL. DbSaci lowers NVL2, DECODE and LNNVL to
 # CASE against the AST; NVL becomes COALESCE; NANVL is orafce.
 
 -- case: nvl_returns_fallback_on_null
@@ -93,6 +93,7 @@ SELECT NANVL(12345, 1) FROM DUAL
 -- end
 
 -- case: nanvl_replaces_nan
+-- skip: mariadb (MariaDB has no NaN value in DOUBLE arithmetic)
 SELECT NANVL(CAST('NaN' AS DOUBLE PRECISION), 1) FROM DUAL
 -- expect:
 1

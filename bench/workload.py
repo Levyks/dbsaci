@@ -2,7 +2,7 @@
 """Fixed workload, run against one Oracle-wire endpoint.
 
 The *same* script and SQL run against (a) a real Oracle XE instance and (b)
-PostgreSQL fronted by pgSaci, both via python-oracledb thin, on one connection.
+PostgreSQL fronted by dbSaci, both via python-oracledb thin, on one connection.
 
 Two families of operations:
 
@@ -74,7 +74,7 @@ GEN = max(1000, int(BIG_ROWS**0.5) + 2)  # bench_seed rows; GEN*GEN must exceed 
 def seed():
     # 1 000 single-row inserts into a generator table, then everything else via
     # set-based `INSERT … SELECT` off its self cross join. Avoids array binds
-    # (pgSaci implements them only partially) and `CONNECT BY` inside an INSERT.
+    # (dbSaci implements them only partially) and `CONNECT BY` inside an INSERT.
     cur = DB["cur"]
     for t in ("bench", "bench_big", "bench_scratch", "bench_seed"):
         drop_if_exists(cur, t)

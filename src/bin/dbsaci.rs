@@ -1,31 +1,31 @@
-//! PgSaci proxy entry point.
+//! DbSaci proxy entry point.
 //!
 //! Every option can be set with a CLI flag or an environment variable (the flag
 //! wins when both are given):
 //!
 //! | flag | env | default | meaning |
 //! | --- | --- | --- | --- |
-//! | `--listen`            | `PGSACI_LISTEN`        | `0.0.0.0:1521` | Oracle TNS listen address |
-//! | `--pg-host`           | `PGSACI_PG_HOST`       | `localhost`   | PostgreSQL host |
-//! | `--pg-port`           | `PGSACI_PG_PORT`       | `5432`        | PostgreSQL port |
-//! | `--pg-db`             | `PGSACI_PG_DB`         | `postgres`    | PostgreSQL database |
-//! | `--pg-password`       | `PGSACI_PG_PASSWORD`   | `postgres`    | fallback password for users not in the list |
+//! | `--listen`            | `DBSACI_LISTEN`        | `0.0.0.0:1521` | Oracle TNS listen address |
+//! | `--pg-host`           | `DBSACI_PG_HOST`       | `localhost`   | PostgreSQL host |
+//! | `--pg-port`           | `DBSACI_PG_PORT`       | `5432`        | PostgreSQL port |
+//! | `--pg-db`             | `DBSACI_PG_DB`         | `postgres`    | PostgreSQL database |
+//! | `--pg-password`       | `DBSACI_PG_PASSWORD`   | `postgres`    | fallback password for users not in the list |
 //! | `--pg-user u:p`       | —                     | —             | one `user:password` pair; repeatable |
-//! | `--pg-users`          | `PGSACI_PG_USERS`     | —             | comma-separated `user:password,user:password` |
-//! | `--pg-users-file`     | `PGSACI_PG_USERS_FILE`| —             | file of `user:password` lines (`#` comments ok) |
-//! | `--statement-timeout-ms` | `PGSACI_STATEMENT_TIMEOUT_MS` | unset | per-statement timeout; ORA-01013 on expiry |
-//! | `--idle-timeout-ms`   | `PGSACI_IDLE_TIMEOUT_MS`      | `900000` | idle client reaping; `0` disables |
-//! | `--health-addr`       | `PGSACI_HEALTH_ADDR`  | unset          | `host:port` for `/healthz` + `/readyz` |
-//! | `--shutdown-grace-ms` | `PGSACI_SHUTDOWN_GRACE_MS`    | `30000` | drain window after SIGINT/SIGTERM |
-//! | `--oracle-version`    | `PGSACI_ORACLE_VERSION`      | `19c`   | impersonated Oracle release (`11` or `19`) |
+//! | `--pg-users`          | `DBSACI_PG_USERS`     | —             | comma-separated `user:password,user:password` |
+//! | `--pg-users-file`     | `DBSACI_PG_USERS_FILE`| —             | file of `user:password` lines (`#` comments ok) |
+//! | `--statement-timeout-ms` | `DBSACI_STATEMENT_TIMEOUT_MS` | unset | per-statement timeout; ORA-01013 on expiry |
+//! | `--idle-timeout-ms`   | `DBSACI_IDLE_TIMEOUT_MS`      | `900000` | idle client reaping; `0` disables |
+//! | `--health-addr`       | `DBSACI_HEALTH_ADDR`  | unset          | `host:port` for `/healthz` + `/readyz` |
+//! | `--shutdown-grace-ms` | `DBSACI_SHUTDOWN_GRACE_MS`    | `30000` | drain window after SIGINT/SIGTERM |
+//! | `--oracle-version`    | `DBSACI_ORACLE_VERSION`      | `19c`   | impersonated Oracle release (`11` or `19`) |
 //!
 //! ## Credential model
 //!
-//! An Oracle client authenticates with a challenge/response, so PgSaci must
+//! An Oracle client authenticates with a challenge/response, so DbSaci must
 //! already hold each user's PostgreSQL password. Declare them ahead of time and
 //! an Oracle client then logs in with the *same* user/password it would use
 //! against PostgreSQL directly. Sources are layered (later overrides earlier):
-//! `--pg-users-file` / `PGSACI_PG_USERS_FILE`, then `PGSACI_PG_USERS`, then each
+//! `--pg-users-file` / `DBSACI_PG_USERS_FILE`, then `DBSACI_PG_USERS`, then each
 //! `--pg-user` flag. A user not in the list falls back to `--pg-password` if set,
 //! and is rejected with ORA-01017 otherwise.
 
@@ -33,33 +33,33 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use clap::{Parser, ValueEnum};
-use pgsaci::{Config, Credentials, OracleVersion, Server};
+use dbsaci::{Config, Credentials, OracleVersion, Server};
 
-/// Oracle TNS/TTC proxy in front of PostgreSQL + orafce.
+/// Oracle TNS/TTC proxy in front of PostgreSQL + orafce or MariaDB.
 #[derive(Parser, Debug)]
-#[command(name = "pgsaci", version, about)]
+#[command(name = "dbsaci", version, about)]
 struct Cli {
     /// Database engine behind the Oracle wire protocol.
-    #[arg(long, env = "PGSACI_BACKEND", value_enum, default_value = "postgres")]
+    #[arg(long, env = "DBSACI_BACKEND", value_enum, default_value = "postgres")]
     backend: CliBackend,
     /// Oracle TNS listen address.
-    #[arg(long, env = "PGSACI_LISTEN")]
+    #[arg(long, env = "DBSACI_LISTEN")]
     listen: Option<String>,
 
     /// PostgreSQL host.
-    #[arg(long, env = "PGSACI_PG_HOST")]
+    #[arg(long, env = "DBSACI_PG_HOST")]
     pg_host: Option<String>,
 
     /// PostgreSQL port.
-    #[arg(long, env = "PGSACI_PG_PORT")]
+    #[arg(long, env = "DBSACI_PG_PORT")]
     pg_port: Option<u16>,
 
     /// PostgreSQL database.
-    #[arg(long, env = "PGSACI_PG_DB")]
+    #[arg(long, env = "DBSACI_PG_DB")]
     pg_db: Option<String>,
 
     /// Fallback password for any user not named in the credential list.
-    #[arg(long, env = "PGSACI_PG_PASSWORD")]
+    #[arg(long, env = "DBSACI_PG_PASSWORD")]
     pg_password: Option<String>,
 
     /// One `user:password` pair. Repeatable. Overrides the file and env list.
@@ -67,31 +67,31 @@ struct Cli {
     pg_users: Vec<String>,
 
     /// Comma-separated `user:password,user:password` list.
-    #[arg(long = "pg-users", env = "PGSACI_PG_USERS", value_name = "LIST")]
+    #[arg(long = "pg-users", env = "DBSACI_PG_USERS", value_name = "LIST")]
     pg_users_list: Option<String>,
 
     /// File of `user:password` lines (`#` comments and blank lines ignored).
-    #[arg(long, env = "PGSACI_PG_USERS_FILE", value_name = "PATH")]
+    #[arg(long, env = "DBSACI_PG_USERS_FILE", value_name = "PATH")]
     pg_users_file: Option<PathBuf>,
 
     /// Per-statement timeout in milliseconds; ORA-01013 on expiry.
-    #[arg(long, env = "PGSACI_STATEMENT_TIMEOUT_MS")]
+    #[arg(long, env = "DBSACI_STATEMENT_TIMEOUT_MS")]
     statement_timeout_ms: Option<u64>,
 
     /// Idle client reaping in milliseconds; `0` disables.
-    #[arg(long, env = "PGSACI_IDLE_TIMEOUT_MS")]
+    #[arg(long, env = "DBSACI_IDLE_TIMEOUT_MS")]
     idle_timeout_ms: Option<u64>,
 
     /// `host:port` for the dependency-free `/healthz` + `/readyz` endpoints.
-    #[arg(long, env = "PGSACI_HEALTH_ADDR")]
+    #[arg(long, env = "DBSACI_HEALTH_ADDR")]
     health_addr: Option<String>,
 
     /// Drain window in milliseconds after SIGINT/SIGTERM.
-    #[arg(long, env = "PGSACI_SHUTDOWN_GRACE_MS")]
+    #[arg(long, env = "DBSACI_SHUTDOWN_GRACE_MS")]
     shutdown_grace_ms: Option<u64>,
 
     /// Impersonated Oracle release: `11`/`11g`/`11.2` or `19`/`19c`.
-    #[arg(long, env = "PGSACI_ORACLE_VERSION")]
+    #[arg(long, env = "DBSACI_ORACLE_VERSION")]
     oracle_version: Option<String>,
 }
 
@@ -130,7 +130,7 @@ async fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "pgsaci=info".into()),
+                .unwrap_or_else(|_| "dbsaci=info".into()),
         )
         .init();
 
@@ -147,8 +147,8 @@ async fn main() {
 
     let config = Config {
         backend: match cli.backend {
-            CliBackend::Postgres => pgsaci::BackendKind::Postgres,
-            CliBackend::Mariadb => pgsaci::BackendKind::MariaDb,
+            CliBackend::Postgres => dbsaci::BackendKind::Postgres,
+            CliBackend::Mariadb => dbsaci::BackendKind::MariaDb,
         },
         listen_addr: cli.listen.unwrap_or(default.listen_addr),
         pg_host: cli.pg_host.unwrap_or(default.pg_host),
@@ -170,7 +170,7 @@ async fn main() {
     };
 
     if let Err(e) = Server::new(config).run().await {
-        eprintln!("pgsaci exited with error: {e}");
+        eprintln!("dbsaci exited with error: {e}");
         std::process::exit(1);
     }
 }

@@ -1,6 +1,6 @@
 //! End-to-end Oracle-compatibility corpus.
 //!
-//! One PostgreSQL/orafce container and one PgSaci proxy are started once for the
+//! One PostgreSQL/orafce container and one DbSaci proxy are started once for the
 //! whole binary. Every golden-file case under `tests/corpus/*.sql` is then
 //! streamed across the real TNS wire through a single worker connection and its
 //! result compared to the expected block declared beside it.
@@ -25,7 +25,7 @@ use testcontainers::runners::AsyncRunner;
 use testcontainers::{GenericImage, ImageExt};
 use tokio_postgres::{Client, NoTls};
 
-use pgsaci::{Config as PgSaciConfig, Server};
+use dbsaci::{Config as DbSaciConfig, Server};
 
 const CORPUS_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/corpus");
 
@@ -66,11 +66,16 @@ fn main() {
         // features with a hard version floor (e.g. `MERGE` needs PG 15). Below
         // that, its cases run as ignored rather than red.
         let below_floor = group.min_pg.is_some_and(|m| pg_major != 0 && pg_major < m);
+        let backend = current_backend();
+        let group_skipped = group.skip_backends.iter().any(|b| b == backend);
         for case in &group.cases {
             let name = format!("{}::{}", group.name, case.name);
             let job_tx = job_tx.clone();
             let case = case.clone();
-            let skip = case.skip || below_floor;
+            let skip = case.skip
+                || below_floor
+                || group_skipped
+                || case.skip_backends.iter().any(|b| b == backend);
             trials
                 .push(Trial::test(name, move || run_trial(&job_tx, case)).with_ignored_flag(skip));
         }
@@ -232,14 +237,14 @@ impl CorpusAdmin {
 
 impl TestBackend {
     async fn start(fixtures: Vec<String>) -> Result<Self, String> {
-        if std::env::var("PGSACI_CORPUS_BACKEND").as_deref() == Ok("mariadb") {
+        if std::env::var("DBSACI_CORPUS_BACKEND").as_deref() == Ok("mariadb") {
             return Self::start_mariadb(fixtures).await;
         }
-        // `PGSACI_TEST_PG_IMAGE` (e.g. `pgsaci-test-pg:16`) lets CI run the
+        // `DBSACI_TEST_PG_IMAGE` (e.g. `dbsaci-test-pg:16`) lets CI run the
         // corpus against several PostgreSQL majors; the default matches the
         // image `clients/run.sh` and the docs build.
-        let image = std::env::var("PGSACI_TEST_PG_IMAGE")
-            .unwrap_or_else(|_| "pgsaci-test-pg:18".to_string());
+        let image = std::env::var("DBSACI_TEST_PG_IMAGE")
+            .unwrap_or_else(|_| "dbsaci-test-pg:18".to_string());
         let (image_name, image_tag) = image.rsplit_once(':').unwrap_or((image.as_str(), "latest"));
         let container = GenericImage::new(image_name.to_string(), image_tag.to_string())
             .with_wait_for(WaitFor::message_on_stdout(
@@ -281,19 +286,19 @@ impl TestBackend {
                 .map_err(|e| format!("apply fixture `{fixture}`: {e}"))?;
         }
 
-        // Start PgSaci on a random port, pointed at the container.
+        // Start DbSaci on a random port, pointed at the container.
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .map_err(|e| e.to_string())?;
         let proxy_port = listener.local_addr().map_err(|e| e.to_string())?.port();
         tokio::spawn(async move {
-            let _ = Server::new(PgSaciConfig {
-                backend: pgsaci::BackendKind::Postgres,
+            let _ = Server::new(DbSaciConfig {
+                backend: dbsaci::BackendKind::Postgres,
                 listen_addr: format!("127.0.0.1:{proxy_port}"),
                 pg_host: host,
                 pg_port: port,
                 pg_db: "postgres".into(),
-                credentials: pgsaci::Credentials::with_fallback(CORPUS_USER),
+                credentials: dbsaci::Credentials::with_fallback(CORPUS_USER),
                 // Exercise the proxy's per-statement timeout while leaving
                 // ordinary corpus queries ample time to run.
                 statement_timeout: Some(Duration::from_secs(2)),
@@ -318,7 +323,10 @@ impl TestBackend {
             .with_wait_for(WaitFor::seconds(8))
             .with_exposed_port(ContainerPort::Tcp(3306))
             .with_env_var("MARIADB_ALLOW_EMPTY_ROOT_PASSWORD", "yes")
-            .with_env_var("MARIADB_DATABASE", "postgres")
+            .with_env_var("MARIADB_DATABASE", "corpus")
+            // Oracle folds unquoted identifiers to a single case; make MariaDB
+            // table-name lookups case-insensitive to match.
+            .with_cmd(["--lower-case-table-names=1"])
             .start()
             .await
             .map_err(|e| format!("start MariaDB container: {e}"))?;
@@ -338,7 +346,7 @@ impl TestBackend {
             .await
             .map_err(|e| format!("create MariaDB corpus user: {e}"))?;
         admin
-            .query_drop("GRANT ALL PRIVILEGES ON postgres.* TO 'corpus'@'%'")
+            .query_drop("GRANT ALL PRIVILEGES ON corpus.* TO 'corpus'@'%'")
             .await
             .map_err(|e| format!("grant MariaDB corpus user: {e}"))?;
         admin
@@ -392,6 +400,18 @@ impl TestBackend {
                         "corpus_shared_ref (k varchar(255) PRIMARY KEY",
                     )
                     .replace("public.corpus_shared_ref", "corpus_shared_ref");
+                // MariaDB has no dedicated `timestamptz`; fixtures that declare
+                // one still need a table so the cases that read it are visible
+                // (their time-zone *semantics* remain a MariaDB limitation). The
+                // seed literal is UTC, so the trailing `+00` offset is dropped.
+                let statement = statement
+                    .replace("timestamptz", "datetime")
+                    .replace("TIMESTAMPTZ '", "TIMESTAMP '")
+                    .replace("+00'", "'")
+                    // MariaDB `TIMESTAMP` columns are themselves session-tz
+                    // converted on read; a "plain" wall-clock column must be
+                    // `DATETIME`.
+                    .replace("plain timestamp", "plain datetime");
                 let statement = if let Some(rest) = statement.strip_prefix("COMMENT ON TABLE ") {
                     if let Some((table, comment)) = rest.split_once(" IS ") {
                         format!("ALTER TABLE {table} COMMENT = {comment}")
@@ -417,13 +437,13 @@ impl TestBackend {
         let proxy_port = listener.local_addr().map_err(|e| e.to_string())?.port();
         let backend_host = host.clone();
         tokio::spawn(async move {
-            let _ = Server::new(PgSaciConfig {
-                backend: pgsaci::BackendKind::MariaDb,
+            let _ = Server::new(DbSaciConfig {
+                backend: dbsaci::BackendKind::MariaDb,
                 listen_addr: format!("127.0.0.1:{proxy_port}"),
                 pg_host: backend_host,
                 pg_port: port,
-                pg_db: "postgres".into(),
-                credentials: pgsaci::Credentials::with_fallback(CORPUS_USER),
+                pg_db: "corpus".into(),
+                credentials: dbsaci::Credentials::with_fallback(CORPUS_USER),
                 statement_timeout: Some(Duration::from_secs(2)),
                 idle_timeout: Some(Duration::from_secs(30)),
                 ..Default::default()
@@ -460,10 +480,10 @@ impl TestBackend {
             }
         };
 
-        // Isolation. Client-side SAVEPOINTs are not usable here: PgSaci wraps every
-        // statement in `SAVEPOINT pgsaci_statement ... RELEASE`, and `RELEASE`
+        // Isolation. Client-side SAVEPOINTs are not usable here: DbSaci wraps every
+        // statement in `SAVEPOINT dbsaci_statement ... RELEASE`, and `RELEASE`
         // also destroys any savepoint the client established afterwards. So a
-        // case that touched state gets a full `ROLLBACK` (PgSaci turns that into
+        // case that touched state gets a full `ROLLBACK` (DbSaci turns that into
         // `ROLLBACK; BEGIN`) followed by a reconnect, because `ROLLBACK` also
         // drops the per-session temp views backing the Oracle catalog facade.
         // Pure read-only cases need neither.
@@ -479,7 +499,7 @@ impl TestBackend {
         // *before* the admin-side teardown runs. A lock-strong teardown
         // statement — e.g. `DROP TRIGGER IF EXISTS ... ON trg_people`, which
         // needs AccessExclusive — otherwise blocks on this session's row locks
-        // until PgSaci's idle reaper closes the session `idle_timeout` (~30s)
+        // until DbSaci's idle reaper closes the session `idle_timeout` (~30s)
         // later. That was the entire cost of the `triggers::` group.
         if crashed || case_mutates(case) {
             let _ = conn.execute("ROLLBACK", &[]).await;
@@ -540,7 +560,7 @@ fn case_mutates(case: &Case) -> bool {
 
 /// Run a query and return all rows.
 ///
-/// Exercises PgSaci's Execute + client-driven Fetch streaming. The first Execute
+/// Exercises DbSaci's Execute + client-driven Fetch streaming. The first Execute
 /// returns up to the client's prefetch count and a cursor id when more rows
 /// remain; subsequent `fetch_more` calls pull batches until the server signals
 /// exhaustion.
@@ -731,7 +751,7 @@ async fn connect_admin(host: &str, port: u16) -> Result<Client, String> {
 }
 
 async fn connect_maria_admin(host: &str, port: u16) -> Result<MariaConn, String> {
-    let url = format!("mysql://root@{host}:{port}/postgres");
+    let url = format!("mysql://root@{host}:{port}/corpus");
     let opts = mysql_async::Opts::from_url(&url).map_err(|e| e.to_string())?;
     let mut last = String::new();
     for _ in 0..50 {
@@ -764,7 +784,7 @@ async fn connect_oracle(proxy_port: u16) -> Result<OracleConnection, String> {
             }
         }
     }
-    Err(format!("oracle-rs connect through PgSaci: {last}"))
+    Err(format!("oracle-rs connect through DbSaci: {last}"))
 }
 
 // ---------------------------------------------------------------------------
@@ -778,6 +798,8 @@ struct Group {
     /// Minimum PostgreSQL major required for this group's feature (from a
     /// `# requires-pg: N` line). Cases run as ignored on older backends.
     min_pg: Option<u32>,
+    /// Backends this whole group cannot run on (`# skip: mariadb`).
+    skip_backends: Vec<String>,
 }
 
 #[derive(Clone)]
@@ -790,6 +812,29 @@ struct Case {
     expect: Expect,
     verify: Option<Verify>,
     skip: bool,
+    /// Backends this case cannot run on (`-- skip: mariadb (reason)`); it runs
+    /// as ignored there instead of red.
+    skip_backends: Vec<String>,
+}
+
+/// The engine the corpus is exercising, from `DBSACI_CORPUS_BACKEND`.
+fn current_backend() -> &'static str {
+    match std::env::var("DBSACI_CORPUS_BACKEND").as_deref() {
+        Ok("mariadb") => "mariadb",
+        _ => "postgres",
+    }
+}
+
+/// Parse the backend list in a `-- skip:` / `# skip:` directive — a
+/// whitespace-separated set of backend names, an optional `(reason)` ignored.
+fn parse_skip_backends(value: &str) -> Vec<String> {
+    value
+        .split('(')
+        .next()
+        .unwrap_or("")
+        .split_whitespace()
+        .map(str::to_string)
+        .collect()
 }
 
 #[derive(Clone)]
@@ -838,6 +883,7 @@ fn parse_group(name: &str, text: &str) -> Result<Group, String> {
     let mut fixtures = Vec::new();
     let mut cases: Vec<Case> = Vec::new();
     let mut min_pg: Option<u32> = None;
+    let mut group_skip_backends: Vec<String> = Vec::new();
     let mut lines = text.lines().peekable();
 
     while let Some(raw) = lines.next() {
@@ -845,6 +891,10 @@ fn parse_group(name: &str, text: &str) -> Result<Group, String> {
         let trimmed = line.trim();
         if let Some(rest) = trimmed.strip_prefix("# requires-pg:") {
             min_pg = rest.trim().parse().ok();
+            continue;
+        }
+        if let Some(rest) = trimmed.strip_prefix("# skip:") {
+            group_skip_backends.extend(parse_skip_backends(rest));
             continue;
         }
         if trimmed.is_empty()
@@ -865,6 +915,7 @@ fn parse_group(name: &str, text: &str) -> Result<Group, String> {
         let mut teardown = Vec::new();
         let mut binds = Vec::new();
         let mut skip = false;
+        let mut skip_backends: Vec<String> = Vec::new();
         let mut sql_lines: Vec<String> = Vec::new();
         let mut expect: Option<Expect> = None;
         let mut verify: Option<Verify> = None;
@@ -893,6 +944,8 @@ fn parse_group(name: &str, text: &str) -> Result<Group, String> {
                     "skip" => skip = true,
                     other => return Err(format!("case `{case_name}`: unknown tag `{other}`")),
                 }
+            } else if let Some(v) = directive(l, "skip") {
+                skip_backends.extend(parse_skip_backends(v));
             } else if let Some(v) = directive(l, "verify") {
                 let (sql, exp) = v.split_once("=>").ok_or_else(|| {
                     format!("case `{case_name}`: `-- verify:` needs `SQL => EXPECTED`")
@@ -960,6 +1013,7 @@ fn parse_group(name: &str, text: &str) -> Result<Group, String> {
             expect,
             verify,
             skip,
+            skip_backends,
         });
     }
 
@@ -968,6 +1022,7 @@ fn parse_group(name: &str, text: &str) -> Result<Group, String> {
         fixtures,
         cases,
         min_pg,
+        skip_backends: group_skip_backends,
     })
 }
 
@@ -980,6 +1035,7 @@ fn is_directive(line: &str) -> bool {
         "-- teardown:",
         "-- bind:",
         "-- tag:",
+        "-- skip:",
         "-- verify:",
         "-- expect:",
         "-- expect-regex:",

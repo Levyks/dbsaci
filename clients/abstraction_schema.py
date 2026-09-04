@@ -1,12 +1,12 @@
 """Load the abstraction.mdc test schema (its `src/test/resources/data.sql`,
-plain Oracle DDL) into pgSaci, so the Java integration suite has its tables.
+plain Oracle DDL) into dbSaci, so the Java integration suite has its tables.
 
-Runs each statement over python-oracledb **thin** against pgSaci — same path the
-app's ojdbc driver uses — so pgSaci's DDL translation is what actually creates
+Runs each statement over python-oracledb **thin** against dbSaci — same path the
+app's ojdbc driver uses — so dbSaci's DDL translation is what actually creates
 the Postgres tables. Idempotent: every table is dropped first.
 
 Env:
-  PGSACI_HOST / PGSACI_PORT / PGSACI_SERVICE / PGSACI_USER / PGSACI_PASS
+  DBSACI_HOST / DBSACI_PORT / DBSACI_SERVICE / DBSACI_USER / DBSACI_PASS
   ABS_MDC_DIR   path to the abstraction.mdc project (default: the sibling
                 checkout under ~/dev/eletra/is/abstraction/abstraction.mdc)
 """
@@ -17,11 +17,11 @@ from pathlib import Path
 
 import oracledb  # thin mode; no Instant Client
 
-HOST = os.environ.get("PGSACI_HOST", "127.0.0.1")
-PORT = int(os.environ.get("PGSACI_PORT", "15301"))
-SVC = os.environ.get("PGSACI_SERVICE", "XE")
-USER = os.environ.get("PGSACI_USER", "hexing")
-PASS = os.environ.get("PGSACI_PASS", "hexing")
+HOST = os.environ.get("DBSACI_HOST", "127.0.0.1")
+PORT = int(os.environ.get("DBSACI_PORT", "15301"))
+SVC = os.environ.get("DBSACI_SERVICE", "XE")
+USER = os.environ.get("DBSACI_USER", "hexing")
+PASS = os.environ.get("DBSACI_PASS", "hexing")
 
 ABS_DIR = Path(os.environ.get(
     "ABS_MDC_DIR",

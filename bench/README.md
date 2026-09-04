@@ -1,10 +1,10 @@
-# pgSaci benchmark
+# dbSaci benchmark
 
 Two questions, one harness:
 
 1. **How much latency does the proxy add per statement?** (the *latency* ops)
 2. **When the database engine is the bottleneck, not the hop, how does
-   PostgreSQL-via-pgSaci compare to Oracle XE?** (the *throughput* ops)
+   PostgreSQL-via-dbSaci compare to Oracle XE?** (the *throughput* ops)
 
 `workload.py` runs a fixed set of operations on a **single connection, single
 thread**, over the Oracle TNS/TTC wire, using `python-oracledb` in thin mode.
@@ -13,14 +13,14 @@ The same script and SQL run against two endpoints:
 | target | path under test |
 | --- | --- |
 | **Oracle XE 21c** (`gvenzl/oracle-xe:21-slim`) | client → real Oracle |
-| **pgSaci** | client → pgSaci (TNS decode + translate + re-frame) → PostgreSQL + orafce |
+| **dbSaci** | client → dbSaci (TNS decode + translate + re-frame) → PostgreSQL + orafce |
 
-Everything — the workload client, Oracle XE, PostgreSQL, and pgSaci — runs in
+Everything — the workload client, Oracle XE, PostgreSQL, and dbSaci — runs in
 Docker on one user-defined bridge network. Every hop is a container-to-container
 veth inside the Docker VM, so there is no host port-proxy in the path and both
-targets are reached identically. pgSaci runs from its **published image**
-(`levyks/pgsaci:0.0.9`, a static musl build), so the number reflects what you
-ship. `PGSACI_IMAGE=…` overrides it.
+targets are reached identically. dbSaci runs from its **published image**
+(`levyks/dbsaci:0.1.0`, a static musl build), so the number reflects what you
+ship. `DBSACI_IMAGE=…` overrides it.
 
 ## Fairness: 2 CPU / 2.5 GiB
 
@@ -39,7 +39,7 @@ ship. `PGSACI_IMAGE=…` overrides it.
   `jit=off`, …) instead of the stock 128 MB / 4 MB defaults. `synchronous_commit`
   stays `on` — the commit ops have to be as durable as Oracle's.
 
-The pgSaci proxy container runs unconstrained — it is the overhead being
+The dbSaci proxy container runs unconstrained — it is the overhead being
 measured, not a third contestant.
 
 ## Operations
@@ -73,7 +73,7 @@ Run against `bench_big` (default **100 000** rows; `BENCH_BIG_ROWS` to change).
 Each op reports p50 / p95 / mean of the per-call latency. The workload seeds with
 set-based `INSERT … SELECT` (off a 1 000-row generator table); it is a
 single-statement-throughput benchmark, so it does not use array binds even though
-pgSaci now supports them.
+dbSaci now supports them.
 
 ## Running it
 
@@ -91,7 +91,7 @@ per-run JSON is left in a temp dir (path printed at the end).
 
 ## Reading the results
 
-* **latency** table — pgSaci adds a fixed per-round-trip cost (TNS decode →
+* **latency** table — dbSaci adds a fixed per-round-trip cost (TNS decode →
   translate → re-frame → a hop to PostgreSQL → and back). On this box that is
   ~0.45 ms, so a 0.1 ms Oracle point-read becomes ~0.55 ms (~5x) but is still
   sub-millisecond. On the commit ops the durable `fsync` dominates and the ratio

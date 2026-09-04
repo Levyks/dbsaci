@@ -3,7 +3,7 @@ title: Benchmarks
 description: How much latency the proxy hop adds, measured against a real Oracle XE.
 ---
 
-pgSaci sits in the path as an extra hop: it decodes the Oracle TNS/TTC frame,
+dbSaci sits in the path as an extra hop: it decodes the Oracle TNS/TTC frame,
 translates the SQL, does **one** backend round trip to PostgreSQL, and re-frames
 the answer. So per query it is slower than talking to Oracle directly — but both
 are in the low-millisecond range on a laptop.
@@ -14,12 +14,12 @@ are in the low-millisecond range on a laptop.
 micro-workload (`python-oracledb` thin) against:
 
 - a real **Oracle XE 21c** container, and
-- **PostgreSQL 18 via pgSaci**.
+- **PostgreSQL 18 via dbSaci**.
 
-Everything — the workload client, Oracle XE, PostgreSQL and pgSaci — runs in
+Everything — the workload client, Oracle XE, PostgreSQL and dbSaci — runs in
 Docker on one user-defined bridge network, so every hop is a container-to-
 container veth with no host port-proxy in the path and both targets are reached
-identically. pgSaci runs from its **published image** (`levyks/pgsaci:0.0.9`, a
+identically. dbSaci runs from its **published image** (`levyks/dbsaci:0.1.0`, a
 static musl build), so the number reflects what you ship.
 
 Both database containers get **2 CPU / 2.5 GiB**:
@@ -31,7 +31,7 @@ Both database containers get **2 CPU / 2.5 GiB**:
   `work_mem` 64 MB, `max_parallel_workers_per_gather` 2, `jit=off` — instead of
   the stock 128 MB / 4 MB defaults. `synchronous_commit` stays on.
 
-The pgSaci proxy container runs unconstrained.
+The dbSaci proxy container runs unconstrained.
 
 :::note
 These are one sample run on a Windows laptop. Absolute numbers move a lot with
@@ -42,7 +42,7 @@ hardware — re-run `bench/run.sh` on yours.
 
 Small ops — the wall-clock here **is** the proxy overhead.
 
-| operation | Oracle XE p50 | pgSaci p50 | pgSaci / Oracle |
+| operation | Oracle XE p50 | dbSaci p50 | dbSaci / Oracle |
 | --- | ---: | ---: | ---: |
 | `select_1_from_dual` | 0.11 ms | 0.58 ms | 5.2× |
 | `point_select_by_pk` (1 bind) | 0.11 ms | 0.55 ms | 4.8× |
@@ -52,19 +52,19 @@ Small ops — the wall-clock here **is** the proxy overhead.
 | `update_commit` | 1.52 ms | 1.92 ms | 1.3× |
 | `insert_then_rollback` | 1.56 ms | 0.67 ms | 0.4× |
 
-pgSaci adds **~0.45 ms of fixed overhead per round trip** — a second hop
-(client → pgSaci → PostgreSQL and back), plus SQL translation and re-encoding
+dbSaci adds **~0.45 ms of fixed overhead per round trip** — a second hop
+(client → dbSaci → PostgreSQL and back), plus SQL translation and re-encoding
 the result into Oracle's wire format. That is a large *ratio* on the sub-0.2 ms
 reads but still sub-millisecond in absolute terms. On the commit ops the WAL
 fsync dominates and the ratio falls to ~1.3×. `insert + rollback` is *quicker*
-via pgSaci — Oracle XE's redo/undo path for that pattern is heavier.
+via dbSaci — Oracle XE's redo/undo path for that pattern is heavier.
 
 ## Throughput
 
 Scan / sort / aggregate / transfer over `bench_big` (100 000 rows) — the
 wall-clock here is dominated by the database engine, not the hop.
 
-| operation | Oracle XE p50 | pgSaci p50 | pgSaci / Oracle |
+| operation | Oracle XE p50 | dbSaci p50 | dbSaci / Oracle |
 | --- | ---: | ---: | ---: |
 | `big_full_aggregate` (COUNT/SUM/AVG/MIN/MAX, `NUMBER` cols) | 2.8 ms | 9.2 ms | 3.3× |
 | `big_scan_expr_count` (per-row `MOD` expr) | 15.3 ms | 21.1 ms | 1.4× |
@@ -83,7 +83,7 @@ parallel query enabled, `big_full_aggregate` stays ~3× because the query is too
 short to parallelise. Integer columns or more cores narrow it.
 
 The bulk write is ~2× slower on p50 but far **steadier**: Oracle XE's p95 is
-~2.9 s (redo-log-switch stalls) versus pgSaci's ~200 ms.
+~2.9 s (redo-log-switch stalls) versus dbSaci's ~200 ms.
 
 :::caution
 This is a **single-connection latency benchmark**. It says nothing about

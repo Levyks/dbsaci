@@ -7,7 +7,7 @@
 # the query path still resolves either case.)
 
 # Fixtures run on a direct PostgreSQL connection (no translation), so they use
-# PostgreSQL DDL; the cases below still query through PgSaci with Oracle names.
+# PostgreSQL DDL; the cases below still query through DbSaci with Oracle names.
 -- fixture: CREATE TABLE IF NOT EXISTS dd_demo (id integer PRIMARY KEY, label varchar(40) NOT NULL, amount numeric(10,2))
 -- fixture: COMMENT ON TABLE dd_demo IS 'demo table'
 -- fixture: CREATE INDEX IF NOT EXISTS dd_demo_label_ix ON dd_demo (label)
@@ -26,6 +26,7 @@ DD_DEMO
 -- end
 
 -- case: all_tables_has_owner
+-- skip: mariadb (facade reports the connected Oracle schema, not the fixture's PostgreSQL PUBLIC alias)
 SELECT owner FROM all_tables WHERE table_name = 'DD_DEMO'
 -- expect:
 PUBLIC
@@ -121,7 +122,7 @@ SELECT table_name FROM user_tables WHERE table_name = 'CATALOG_PROBE'
 CATALOG_PROBE
 -- end
 
-# A table created through PgSaci lands in the shared `oracle` schema, but the
+# A table created through DbSaci lands in the shared `oracle` schema, but the
 # catalog facade must present it as owned by the connected user (Oracle's
 # "schema == user" model) so an IDE shows it under the user's node — not under
 # a literal ORACLE schema. `all_users` must likewise list the connected user.
@@ -181,6 +182,7 @@ SELECT COUNT(*) FROM sys.all_ind_expressions
 -- end
 
 -- case: all_triggers_reports_timing_event_action_type
+-- skip: mariadb (a BEFORE INSERT OR UPDATE trigger is split into two single-event MariaDB triggers; the all_triggers facade does not reassemble the combined event)
 -- setup: CREATE TABLE trg_probe (id NUMBER, n NUMBER)
 -- setup: CREATE OR REPLACE TRIGGER trg_probe_biu BEFORE INSERT OR UPDATE ON trg_probe FOR EACH ROW BEGIN :NEW.n := NVL(:NEW.n, 0) + 1; END;
 SELECT trigger_type, triggering_event, action_type, before_row, status

@@ -2,13 +2,13 @@
 import { defineConfig } from 'astro/config';
 import starlight from '@astrojs/starlight';
 
-// Deployed as a GitHub Pages project site: https://levyks.github.io/pgsaci/
+// Deployed as a GitHub Pages project site: https://levyks.github.io/dbsaci/
 export default defineConfig({
 	site: 'https://levyks.github.io',
-	base: '/pgsaci/',
+	base: '/dbsaci/',
 	integrations: [
 		starlight({
-			title: 'pgSaci',
+			title: 'dbSaci',
 			favicon: '/favicon.svg',
 			description:
 				'An Oracle TNS/TTC wire-protocol proxy in front of stock PostgreSQL. ' +
@@ -17,11 +17,11 @@ export default defineConfig({
 				{
 					icon: 'github',
 					label: 'GitHub',
-					href: 'https://github.com/Levyks/pgsaci',
+					href: 'https://github.com/Levyks/dbsaci',
 				},
 			],
 			editLink: {
-				baseUrl: 'https://github.com/Levyks/pgsaci/edit/main/website/',
+				baseUrl: 'https://github.com/Levyks/dbsaci/edit/main/website/',
 			},
 			lastUpdated: true,
 			tableOfContents: { minHeadingLevel: 2, maxHeadingLevel: 3 },
@@ -29,7 +29,7 @@ export default defineConfig({
 				{
 					label: 'Start here',
 					items: [
-						{ label: 'What pgSaci is', slug: 'overview' },
+						{ label: 'What dbSaci is', slug: 'overview' },
 						{ label: 'Getting started', slug: 'getting-started' },
 					],
 				},

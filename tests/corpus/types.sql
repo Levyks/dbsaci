@@ -67,7 +67,7 @@ SELECT 'plain ascii text 123' FROM DUAL
 plain ascii text 123
 -- end
 
-# PgSaci sends a zero-length VARCHAR field, which oracle-rs surfaces as NULL.
+# DbSaci sends a zero-length VARCHAR field, which oracle-rs surfaces as NULL.
 # This happens to match Oracle's own '' IS NULL rule.
 -- case: empty_string_reads_back_as_null
 SELECT CAST('' AS TEXT) FROM DUAL
@@ -195,7 +195,7 @@ SELECT CAST(TIMESTAMP '2024-06-01 07:00:00.25' AS TIMESTAMP WITH TIME ZONE) FROM
 
 # A column *declared* BINARY_FLOAT / BINARY_DOUBLE is delivered in the native
 # IEEE wire form (types 100 / 101), recovered via a describe-time catalog lookup
-# on the `pgsaci.binary_*` domains — verified end-to-end by the python-oracledb
+# on the `dbsaci.binary_*` domains — verified end-to-end by the python-oracledb
 # probe (`clients/python/probe.py`: `DB_TYPE_BINARY_DOUBLE` + exact value).
 # oracle-rs 0.1.7 mis-decodes a BINARY_DOUBLE result column (its own tests only
 # cover the raw encode/decode functions, never a describe+row from a server), so
@@ -209,15 +209,17 @@ SELECT POWER(2, 10) FROM DUAL
 -- end
 
 # KNOWN GAP: a TIMESTAMP literal carrying an offset is TIMESTAMP WITH TIME ZONE
-# in Oracle but plain TIMESTAMP (offset ignored) in PostgreSQL; PgSaci has no
+# in Oracle but plain TIMESTAMP (offset ignored) in PostgreSQL; DbSaci has no
 # TSTZ wire encoding to carry the original offset back.
 -- case: timestamptz_keeps_offset
+-- skip: mariadb (MariaDB has no zone-aware datetime type)
 SELECT TO_CHAR(TIMESTAMP '2024-06-01 12:00:00 +05:00', 'HH24:MI TZH:TZM') FROM DUAL
 -- expect:
 12:00 +05:00
 -- end
 
 -- case: timestamptz_value_not_shifted_to_utc
+-- skip: mariadb (MariaDB has no zone-aware datetime type)
 SELECT TO_CHAR(CAST(TIMESTAMP '2024-06-01 12:00:00 +05:00' AS TIMESTAMP), 'HH24:MI') FROM DUAL
 -- expect:
 12:00
@@ -244,12 +246,14 @@ SELECT TO_CHAR(DATE '0042-01-01', 'YYYY-MM-DD') FROM DUAL
 -- end
 
 -- case: rowid_pseudocolumn_is_stable_within_query
+-- skip: mariadb (MariaDB has no ROWID pseudo-column)
 SELECT COUNT(DISTINCT ROWID) FROM people WHERE id <= 4
 -- expect:
 4
 -- end
 
 -- case: rowid_round_trips_for_refetch
+-- skip: mariadb (MariaDB has no ROWID pseudo-column)
 SELECT name FROM people WHERE ROWID = (SELECT ROWID FROM people WHERE id = 3)
 -- expect:
 Linus

@@ -1,18 +1,18 @@
 ---
-title: pgSaci
-description: An Oracle TNS/TTC wire-protocol proxy in front of stock PostgreSQL.
+title: dbSaci
+description: An Oracle TNS/TTC wire-protocol proxy in front of PostgreSQL or MariaDB.
 template: splash
 hero:
   tagline: >-
-    Point an unmodified Oracle driver at pgSaci and it connects, authenticates,
-    and runs a session — while the database behind it is plain PostgreSQL.
+    Point an unmodified Oracle driver at dbSaci and it connects, authenticates,
+    and runs a session — while the database behind it is PostgreSQL or MariaDB.
   actions:
     - text: Getting started
-      link: /pgsaci/getting-started/
+      link: /dbsaci/getting-started/
       icon: right-arrow
       variant: primary
     - text: View on GitHub
-      link: https://github.com/Levyks/pgsaci
+      link: https://github.com/Levyks/dbsaci
       icon: external
       variant: minimal
 ---
@@ -20,17 +20,17 @@ hero:
 import { Card, CardGrid, LinkCard, Aside } from '@astrojs/starlight/components';
 
 <Aside type="caution" title="Very early development — mostly written by AI">
-Hundreds of end-to-end tests pass, but pgSaci has never run a real workload.
+Hundreds of end-to-end tests pass, but dbSaci has never run a real workload.
 **Do not point it at data you care about.** Bug reports, failing-case
 contributions, and design feedback are very welcome.
 </Aside>
 
 ## What it is
 
-pgSaci speaks Oracle's **TNS / TTC wire protocol** on the front and **stock
-PostgreSQL** on the back. An unmodified Oracle client — `python-oracledb` (thin),
-the Oracle JDBC thin driver, ODP.NET managed — points at pgSaci instead of at an
-Oracle database, and pgSaci:
+dbSaci speaks Oracle's **TNS / TTC wire protocol** on the front and
+**PostgreSQL or MariaDB** on the back. An unmodified Oracle client — `python-oracledb` (thin),
+the Oracle JDBC thin driver, ODP.NET managed — points at dbSaci instead of at an
+Oracle database, and dbSaci:
 
 <CardGrid>
 	<Card title="1 · Terminates the handshake" icon="seti:default">
@@ -38,15 +38,15 @@ Oracle database, and pgSaci:
 		(12c PBKDF2 with mutual server proof, or the 11g MD5 verifier).
 	</Card>
 	<Card title="2 · Translates the SQL" icon="seti:sql">
-		The Oracle SQL/PL-SQL dialect it understands is rewritten to PostgreSQL
-		SQL; binds are sent as PostgreSQL parameters.
+		The Oracle SQL/PL-SQL dialect it understands is rewritten to the selected
+		backend; binds are sent as backend parameters.
 	</Card>
-	<Card title="3 · Runs it on PostgreSQL" icon="seti:db">
-		One backend round trip to an ordinary current PostgreSQL release with the
-		<a href="https://github.com/orafce/orafce">orafce</a> extension.
+	<Card title="3 · Runs it on the backend" icon="seti:db">
+		One backend round trip to PostgreSQL + <a href="https://github.com/orafce/orafce">orafce</a>,
+		or MariaDB 11.4+ in <code>SQL_MODE=ORACLE</code>.
 	</Card>
 	<Card title="4 · Re-frames the result" icon="seti:binary">
-		The PostgreSQL result is re-encoded into Oracle's binary framing and
+		The backend result is re-encoded into Oracle's binary framing and
 		streamed back batch by batch.
 	</Card>
 </CardGrid>
@@ -62,19 +62,19 @@ PL/iSQL, packages, `NUMBER`/`DATE` semantics — into the engine. It goes deep o
 the *dialect*, but it still speaks the **PostgreSQL wire protocol**: the
 application connects with a PostgreSQL driver, not its Oracle one.
 
-pgSaci is the other way round. It speaks Oracle's **TNS/TTC wire protocol**, so
+dbSaci is the other way round. It speaks Oracle's **TNS/TTC wire protocol**, so
 the unmodified Oracle driver — ojdbc, ODP.NET, `python-oracledb` — connects to it
-exactly as it would to Oracle, and the database behind it is stock PostgreSQL.
-The trade is the SQL/PL-SQL surface: pgSaci only covers what its translation
-layer plus `orafce` can express.
+exactly as it would to Oracle, and the database behind it is stock PostgreSQL or
+MariaDB. The trade is the SQL/PL-SQL surface: dbSaci only covers what its
+translation layer plus the selected backend compatibility facilities can express.
 
 They solve different problems. Reach for IvorySQL if you can repoint the app at a
-new database and want broad Oracle SQL semantics; reach for pgSaci if the app and
+new database and want broad Oracle SQL semantics; reach for dbSaci if the app and
 its Oracle client have to stay exactly as they are.
 
 <CardGrid>
-	<LinkCard title="What works" href="/pgsaci/what-works/" description="Drivers, SQL, DDL, triggers, transactions, operations." />
-	<LinkCard title="What doesn't" href="/pgsaci/limitations/" description="Not yet vs structurally impossible on stock PostgreSQL." />
-	<LinkCard title="Compatibility matrix" href="/pgsaci/compatibility/" description="The detailed per-area breakdown." />
-	<LinkCard title="How it works" href="/pgsaci/how-it-works/" description="The query path, wire negotiation, and testing." />
+	<LinkCard title="What works" href="/dbsaci/what-works/" description="Drivers, SQL, DDL, triggers, transactions, operations." />
+	<LinkCard title="What doesn't" href="/dbsaci/limitations/" description="Not yet vs structurally impossible on stock PostgreSQL." />
+	<LinkCard title="Compatibility matrix" href="/dbsaci/compatibility/" description="The detailed per-area breakdown." />
+	<LinkCard title="How it works" href="/dbsaci/how-it-works/" description="The query path, wire negotiation, and testing." />
 </CardGrid>

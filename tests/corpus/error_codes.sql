@@ -1,5 +1,5 @@
 # Error-code mapping. Applications branch on ORA-nnnnn (dup key, FK, no rows,
-# invalid number...). If PgSaci returns the wrong code or a generic one, retry
+# invalid number...). If DbSaci returns the wrong code or a generic one, retry
 # and upsert logic in the app misbehaves.
 
 -- case: unique_constraint_violation
@@ -28,6 +28,7 @@ SELECT no_such_column FROM people
 -- end
 
 -- case: invalid_number_conversion
+-- skip: mariadb (MariaDB returns NULL not ORA-01722 for a bad numeric cast in SELECT)
 SELECT TO_NUMBER('not a number') FROM DUAL
 -- error: ORA-01722
 -- end
@@ -39,6 +40,7 @@ INSERT INTO tl (c) VALUES ('abcd')
 -- end
 
 -- case: divisor_is_zero
+-- skip: mariadb (MariaDB returns NULL not ORA-01476 for division by zero in SELECT)
 SELECT 5 / 0 FROM DUAL
 -- error: ORA-01476
 -- end
@@ -77,6 +79,7 @@ INSERT INTO prec_demo (n) VALUES (12345)
 -- end
 
 -- case: invalid_datetime_conversion
+-- skip: mariadb (MariaDB returns NULL not ORA-01858 for a bad datetime in SELECT)
 SELECT CAST('not a date' AS DATE) FROM DUAL
 -- error: ORA-01858
 -- end
@@ -87,6 +90,7 @@ INSERT INTO people (id, name, team_id) VALUES (1, 'Dup', 1)
 -- end
 
 -- case: statement_timeout_is_user_cancel
+-- skip: mariadb (no statement-timeout to ORA-01013 mapping)
 SELECT pg_sleep(3) FROM DUAL
 -- error: ORA-01013
 -- end

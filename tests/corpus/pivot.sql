@@ -1,5 +1,5 @@
 # PIVOT / UNPIVOT. Oracle reporting queries lean on these heavily; PostgreSQL
-# has no native syntax, so PgSaci lowers them to conditional aggregation and a
+# has no native syntax, so DbSaci lowers them to conditional aggregation and a
 # LATERAL VALUES unnest respectively.
 
 -- fixture: CREATE TABLE IF NOT EXISTS sales_q (region VARCHAR(10), quarter VARCHAR(2), amt INT)

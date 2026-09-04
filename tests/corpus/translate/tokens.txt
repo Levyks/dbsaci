@@ -11,7 +11,7 @@ SELECT 'O''Reilly SYSDATE', "NUMBER", NVL(NULL, 'x') /* MINUS SYSDATE */ FROM DU
 # Oracle type names in DDL. Oracle DATE carries a time component, so it maps to
 # TIMESTAMP(0), not PostgreSQL DATE.
 CREATE TABLE oracle_ddl_people (id NUMBER(10) PRIMARY KEY, label VARCHAR2(30), note CLOB, created_at DATE DEFAULT SYSDATE) => CREATE TABLE oracle_ddl_people (id NUMERIC(10) PRIMARY KEY, label VARCHAR(30), note TEXT, created_at TIMESTAMP(0) DEFAULT CURRENT_TIMESTAMP)
-CREATE TABLE t (a NVARCHAR2(10), b BINARY_FLOAT, c BINARY_DOUBLE, d BLOB, e RAW, f LONG) => CREATE TABLE t (a VARCHAR(10), b pgsaci.binary_float, c pgsaci.binary_double, d BYTEA, e BYTEA, f TEXT)
+CREATE TABLE t (a NVARCHAR2(10), b BINARY_FLOAT, c BINARY_DOUBLE, d BLOB, e RAW, f LONG) => CREATE TABLE t (a VARCHAR(10), b dbsaci.binary_float, c dbsaci.binary_double, d BYTEA, e BYTEA, f TEXT)
 # RAW(n) -> BYTEA (length dropped); VARCHAR2(n CHAR|BYTE) -> VARCHAR(n).
 CREATE TABLE t (e RAW(16)) => CREATE TABLE t (e BYTEA)
 CREATE TABLE t (a VARCHAR2(5 CHAR), b VARCHAR2(10 BYTE)) => CREATE TABLE t (a VARCHAR(5), b VARCHAR(10))
@@ -30,6 +30,6 @@ CREATE MATERIALIZED VIEW mv BUILD IMMEDIATE REFRESH FAST ON DEMAND AS SELECT id 
 # Oracle session settings map to PostgreSQL session state.
 ALTER SESSION SET CURRENT_SCHEMA = app_owner => SET search_path TO app_owner, oracle, public
 ALTER SESSION SET TIME_ZONE = '-03:00' => SET TIME ZONE '+03:00'
-ALTER SESSION SET NLS_DATE_FORMAT = 'YYYY-MM-DD' => SET pgsaci.nls_date_format TO 'YYYY-MM-DD'
-ALTER SESSION SET NLS_COMP = LINGUISTIC => SET pgsaci.nls_comp TO LINGUISTIC
+ALTER SESSION SET NLS_DATE_FORMAT = 'YYYY-MM-DD' => SET dbsaci.nls_date_format TO 'YYYY-MM-DD'
+ALTER SESSION SET NLS_COMP = LINGUISTIC => SET dbsaci.nls_comp TO LINGUISTIC
 ALTER SESSION SET SQL_TRACE = TRUE => RESET application_name

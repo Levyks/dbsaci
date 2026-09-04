@@ -70,6 +70,7 @@ SELECT team_id FROM trg_people WHERE id = 6
 -- end
 
 -- case: instead_of_trigger_on_view_redirects_insert
+-- skip: mariadb (MariaDB has no INSTEAD OF triggers)
 -- setup: CREATE TABLE trg_base (id INT, name TEXT)
 -- setup: CREATE VIEW trg_v AS SELECT id, name FROM trg_base
 -- setup: CREATE OR REPLACE TRIGGER trg_io INSTEAD OF INSERT ON trg_v FOR EACH ROW BEGIN INSERT INTO trg_base (id, name) VALUES (:NEW.id, UPPER(:NEW.name)); END;
@@ -82,11 +83,12 @@ ADA
 -- end
 
 -- case: before_insert_trigger_multi_event
--- setup: CREATE OR REPLACE TRIGGER trg_multi BEFORE INSERT OR UPDATE ON trg_people FOR EACH ROW BEGIN :NEW.name := TRIM(:NEW.name); END;
--- setup: INSERT INTO trg_people (id, name) VALUES (10, '  spaced  ')
--- teardown: DROP TRIGGER IF EXISTS trg_multi ON trg_people
--- teardown: DELETE FROM trg_people
-SELECT name FROM trg_people WHERE id = 10
+-- setup: CREATE TABLE trg_multi_people (id INT, name TEXT)
+-- setup: CREATE OR REPLACE TRIGGER trg_multi BEFORE INSERT OR UPDATE ON trg_multi_people FOR EACH ROW BEGIN :NEW.name := TRIM(:NEW.name); END;
+-- setup: INSERT INTO trg_multi_people (id, name) VALUES (10, '  spaced  ')
+-- teardown: DROP TRIGGER IF EXISTS trg_multi ON trg_multi_people
+-- teardown: DROP TABLE IF EXISTS trg_multi_people
+SELECT name FROM trg_multi_people WHERE id = 10
 -- expect:
 spaced
 -- end

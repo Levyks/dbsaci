@@ -1,14 +1,14 @@
-"""OCI (thick-mode) smoke test against a running PgSaci.
+"""OCI (thick-mode) smoke test against a running DbSaci.
 
 Uses python-oracledb in **thick mode** — it loads the Oracle Instant Client
-(`oci.dll` / `libclntsh`) and talks to PgSaci over the real OCI code path
+(`oci.dll` / `libclntsh`) and talks to DbSaci over the real OCI code path
 instead of python-oracledb's own thin protocol implementation. This is the
 "one OCI-based client" smoke from the alpha checklist.
 
 Env:
   ORACLE_INSTANT_CLIENT  dir holding oci.dll / libclntsh (default: the Windows
                          install path; override on Linux/macOS)
-  PGSACI_HOST/PORT/USER/PASSWORD/SERVICE  as the other probes
+  DBSACI_HOST/PORT/USER/PASSWORD/SERVICE  as the other probes
 
 Exits non-zero on the first failed assertion or if the client library or a
 connection cannot be established.
@@ -33,11 +33,11 @@ else:
     print("still in thin mode — Instant Client not loaded")
     sys.exit(3)
 
-host = os.environ.get("PGSACI_HOST", "127.0.0.1")
-port = int(os.environ.get("PGSACI_PORT", "1521"))
-user = os.environ.get("PGSACI_USER", "corpus")
-password = os.environ.get("PGSACI_PASSWORD", "corpus")
-service = os.environ.get("PGSACI_SERVICE", "FREEPDB1")
+host = os.environ.get("DBSACI_HOST", "127.0.0.1")
+port = int(os.environ.get("DBSACI_PORT", "1521"))
+user = os.environ.get("DBSACI_USER", "corpus")
+password = os.environ.get("DBSACI_PASSWORD", "corpus")
+service = os.environ.get("DBSACI_SERVICE", "FREEPDB1")
 dsn = f"{host}:{port}/{service}"
 
 checks = []

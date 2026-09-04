@@ -1,5 +1,5 @@
 # PostgreSQL + orafce, used by `tests/corpus.rs` and `clients/run.sh`.
-# `PG_VERSION` selects the major (CI builds 18, 16 and 13 to prove pgSaci works
+# `PG_VERSION` selects the major (CI builds 18, 16 and 13 to prove dbSaci works
 # across the supported PostgreSQL range).
 #
 # orafce is built from `master` (its lexer needs flex/bison). That is a moving

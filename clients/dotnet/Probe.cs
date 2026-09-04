@@ -1,8 +1,8 @@
-// ADO.NET client-compatibility probe against a running PgSaci proxy, mirroring
+// ADO.NET client-compatibility probe against a running DbSaci proxy, mirroring
 // the python-oracledb and JDBC probes. Uses Oracle.ManagedDataAccess.Core
 // (Oracle's pure-managed thin provider).
 //
-// Env: PGSACI_HOST, PGSACI_PORT, PGSACI_USER, PGSACI_PASSWORD, PGSACI_SERVICE.
+// Env: DBSACI_HOST, DBSACI_PORT, DBSACI_USER, DBSACI_PASSWORD, DBSACI_SERVICE.
 // Exits non-zero if any check fails.
 
 using System.Data;
@@ -11,11 +11,11 @@ using Oracle.ManagedDataAccess.Client;
 static string Env(string k, string dflt) =>
     Environment.GetEnvironmentVariable(k) is { Length: > 0 } v ? v : dflt;
 
-string host = Env("PGSACI_HOST", "127.0.0.1");
-string port = Env("PGSACI_PORT", "1521");
-string user = Env("PGSACI_USER", "corpus");
-string pw = Env("PGSACI_PASSWORD", "corpus");
-string svc = Env("PGSACI_SERVICE", "FREEPDB1");
+string host = Env("DBSACI_HOST", "127.0.0.1");
+string port = Env("DBSACI_PORT", "1521");
+string user = Env("DBSACI_USER", "corpus");
+string pw = Env("DBSACI_PASSWORD", "corpus");
+string svc = Env("DBSACI_SERVICE", "FREEPDB1");
 
 string dataSource =
     $"(DESCRIPTION=(ADDRESS=(PROTOCOL=TCP)(HOST={host})(PORT={port}))" +

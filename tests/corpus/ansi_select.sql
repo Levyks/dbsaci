@@ -1,4 +1,4 @@
-# Core ANSI SELECT surface. PgSaci strips FROM DUAL and otherwise passes these
+# Core ANSI SELECT surface. DbSaci strips FROM DUAL and otherwise passes these
 # straight to PostgreSQL, so they double as a wire-format smoke test for the
 # scalar result path.
 
@@ -153,7 +153,7 @@ SELECT name AS who FROM people WHERE id = 1
 Ada
 -- end
 
-# Oracle (pre-23c) has no boolean in the projection list; PgSaci follows its
+# Oracle (pre-23c) has no boolean in the projection list; DbSaci follows its
 # PostgreSQL backend and renders bool as NUMBER 1/0.
 -- case: boolean_comparison_scalar
 SELECT 1 = 1 FROM DUAL

@@ -1,14 +1,14 @@
-"""Run the PgSaci compatibility corpus (`tests/corpus/*.sql`) through the OCI
+"""Run the DbSaci compatibility corpus (`tests/corpus/*.sql`) through the OCI
 thick client (python-oracledb thick mode).
 
 This mirrors `tests/corpus.rs` — same golden grammar, same value rendering — but
 drives the queries over the real Oracle Call Interface instead of oracle-rs, so
-it exercises PgSaci's OCI wire path end to end.
+it exercises DbSaci's OCI wire path end to end.
 
 Environment:
-  PGSACI_HOST / PGSACI_PORT / PGSACI_USER / PGSACI_PASSWORD / PGSACI_SERVICE
-  PGSACI_PG_HOST / PGSACI_PG_PORT / PGSACI_PG_DB / PGSACI_PG_USER /
-  PGSACI_PG_PASSWORD   direct TCP connection to the backing Postgres (for
+  DBSACI_HOST / DBSACI_PORT / DBSACI_USER / DBSACI_PASSWORD / DBSACI_SERVICE
+  DBSACI_PG_HOST / DBSACI_PG_PORT / DBSACI_PG_DB / DBSACI_PG_USER /
+  DBSACI_PG_PASSWORD   direct TCP connection to the backing Postgres (for
                     fixtures, teardown, and `-- verify` on a second connection)
   ORACLE_INSTANT_CLIENT   Instant Client dir (default: Windows install path)
   CORPUS_FILTER     optional substring; only run groups/cases containing it
@@ -52,19 +52,19 @@ if oracledb.is_thin_mode():
     print("still thin mode — Instant Client not loaded")
     sys.exit(3)
 
-HOST = os.environ.get("PGSACI_HOST", "127.0.0.1")
-PORT = int(os.environ.get("PGSACI_PORT", "1521"))
-USER = os.environ.get("PGSACI_USER", "corpus")
-PW = os.environ.get("PGSACI_PASSWORD", "corpus")
-SVC = os.environ.get("PGSACI_SERVICE", "FREEPDB1")
+HOST = os.environ.get("DBSACI_HOST", "127.0.0.1")
+PORT = int(os.environ.get("DBSACI_PORT", "1521"))
+USER = os.environ.get("DBSACI_USER", "corpus")
+PW = os.environ.get("DBSACI_PASSWORD", "corpus")
+SVC = os.environ.get("DBSACI_SERVICE", "FREEPDB1")
 DSN = f"{HOST}:{PORT}/{SVC}"
 FILTER = os.environ.get("CORPUS_FILTER", "")
 
-PG_HOST = os.environ.get("PGSACI_PG_HOST", "127.0.0.1")
-PG_PORT = int(os.environ.get("PGSACI_PG_PORT", "5432"))
-PG_DB = os.environ.get("PGSACI_PG_DB", "postgres")
-PG_USER = os.environ.get("PGSACI_PG_USER", "corpus")
-PG_PW = os.environ.get("PGSACI_PG_PASSWORD", "corpus")
+PG_HOST = os.environ.get("DBSACI_PG_HOST", "127.0.0.1")
+PG_PORT = int(os.environ.get("DBSACI_PG_PORT", "5432"))
+PG_DB = os.environ.get("DBSACI_PG_DB", "postgres")
+PG_USER = os.environ.get("DBSACI_PG_USER", "corpus")
+PG_PW = os.environ.get("DBSACI_PG_PASSWORD", "corpus")
 
 
 def _pg_cell(v) -> str:
@@ -356,7 +356,7 @@ def case_mutates(c: Case):
 
 
 # Cases whose *expected* behaviour is a thin-driver / oracle-rs trait that the
-# OCI client library itself contradicts before any bytes reach PgSaci. Each was
+# OCI client library itself contradicts before any bytes reach DbSaci. Each was
 # re-verified (clients/oci/verify_oracle_incompatible.py, 2026-08-31) to raise the IDENTICAL error
 # straight against a live Oracle XE 21c over python-oracledb **thick** — i.e.
 # they do NOT pass "against a real oracle db" on this transport, so per the
@@ -368,7 +368,7 @@ OCI_CLIENT_INCOMPATIBLE = {
     "binds::placeholder_inside_string_literal_is_not_a_bind",
     "binds::surplus_bind_values_are_ignored",
     # `RETURNING <col>` with no `INTO` is a hard Oracle syntax error.
-    # Live XE thick: ORA-00925 "missing INTO keyword" (confirmed). PgSaci is
+    # Live XE thick: ORA-00925 "missing INTO keyword" (confirmed). DbSaci is
     # deliberately lenient (bare PG RETURNING); only thin/oracle-rs exercise it.
     "dml::update_with_returning_clause",
 }
@@ -378,8 +378,8 @@ OCI_CLIENT_INCOMPATIBLE = {
 # reading the socket and ignores `call_timeout`, so the run cannot recover.
 # The identical wire (captured via a TCP tee) is byte-valid and every other
 # probe (thin / ojdbc / ODP.NET) runs these; adding any inter-frame delay
-# clears it intermittently. A client-library race, not a PgSaci wire bug.
-OCI_CLIENT_HANGS = set()  # (was: triggers + bytes_bind — those were a PgSaci
+# clears it intermittently. A client-library race, not a DbSaci wire bug.
+OCI_CLIENT_HANGS = set()  # (was: triggers + bytes_bind — those were a DbSaci
 # cursor-resolution bug, not a client hang; the `0x4e` re-execute of the
 # runner's `SELECT 1` probe resolved to the previous query. Fixed in
 # server.rs — the frame's named cursor id is now authoritative.)
@@ -465,8 +465,8 @@ def main():
             # The OCI thick client's response parser races when frames from
             # consecutive statements arrive with no gap (wedges hard on trigger
             # DDL — ignores `call_timeout`). A brief main-thread pause per case
-            # lets its background I/O thread drain. `PGSACI_OCI_PACE_MS` tunes it.
-            _pace = float(os.environ.get("PGSACI_OCI_PACE_MS", "30")) / 1000.0
+            # lets its background I/O thread drain. `DBSACI_OCI_PACE_MS` tunes it.
+            _pace = float(os.environ.get("DBSACI_OCI_PACE_MS", "30")) / 1000.0
             if _pace > 0:
                 import time as _t
                 _t.sleep(_pace)
@@ -540,7 +540,7 @@ def main():
                             conn.close()
                         except Exception:  # noqa: BLE001
                             pass
-                    # A reconnect can transiently fail (PgSaci mid-restart, a
+                    # A reconnect can transiently fail (DbSaci mid-restart, a
                     # socket in TIME_WAIT). Retry before giving up on the run.
                     conn = None
                     for _ in range(20):
@@ -591,7 +591,7 @@ def run_case(conn, c: Case):
             except Exception:  # noqa: BLE001
                 pass
     import time as _t
-    _pace = float(os.environ.get("PGSACI_OCI_PACE_MS", "30")) / 1000.0
+    _pace = float(os.environ.get("DBSACI_OCI_PACE_MS", "30")) / 1000.0
     for setup in c.setup:
         if _pace > 0:
             _t.sleep(_pace)

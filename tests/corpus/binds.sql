@@ -1,4 +1,4 @@
-# Bind-variable handling. oracle-rs sends typed bind values over TTC; PgSaci
+# Bind-variable handling. oracle-rs sends typed bind values over TTC; DbSaci
 # currently substitutes them as SQL literals before executing. These cases pin
 # the observable behaviour for each scalar type and for placeholder edge cases.
 
@@ -109,7 +109,7 @@ fallback
 -- end
 
 # oracle-rs 0.1.7 mis-frames the Execute descriptor area for this repeated
-# bind before PgSaci can recover it.
+# bind before DbSaci can recover it.
 -- case: single_placeholder_referenced_twice
 -- bind: int 2
 SELECT name FROM people WHERE id = :1 OR team_id = :1 ORDER BY id
@@ -143,7 +143,7 @@ Linus
 
 # --- Probes of substitute_bind_values: the inserted literal must not be
 # re-scanned for further placeholders, and Oracle rejects a bind-count
-# mismatch that PgSaci silently tolerates.
+# mismatch that DbSaci silently tolerates.
 
 -- case: bind_value_that_looks_like_a_placeholder
 -- bind: str :2 and :name

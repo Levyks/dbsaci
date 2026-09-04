@@ -1,6 +1,6 @@
 //! Negotiated-capability profile for a connected client.
 //!
-//! Every wire divergence PgSaci makes is decided the way a real Oracle server
+//! Every wire divergence DbSaci makes is decided the way a real Oracle server
 //! decides it: from what the client negotiated in the TTC handshake — the
 //! `TNS_CCAP_*` / `TNS_RCAP_*` capability vectors in the DataTypes request and
 //! the Protocol-message version list. The client's driver-name banner is never

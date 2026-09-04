@@ -1,4 +1,4 @@
-# Set operations. Oracle spells EXCEPT as MINUS; PgSaci rewrites it.
+# Set operations. Oracle spells EXCEPT as MINUS; DbSaci rewrites it.
 
 -- case: union_deduplicates
 SELECT team_id FROM people WHERE team_id IS NOT NULL UNION SELECT id FROM teams ORDER BY 1

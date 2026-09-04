@@ -1,17 +1,17 @@
-"""python-oracledb (thin mode) compatibility probe against a running PgSaci.
+"""python-oracledb (thin mode) compatibility probe against a running DbSaci.
 
-Env: PGSACI_HOST, PGSACI_PORT, PGSACI_USER, PGSACI_PASSWORD, PGSACI_SERVICE.
+Env: DBSACI_HOST, DBSACI_PORT, DBSACI_USER, DBSACI_PASSWORD, DBSACI_SERVICE.
 Exits non-zero on the first failed assertion.
 """
 import os
 import sys
 import oracledb
 
-host = os.environ.get("PGSACI_HOST", "127.0.0.1")
-port = int(os.environ.get("PGSACI_PORT", "1521"))
-user = os.environ.get("PGSACI_USER", "corpus")
-password = os.environ.get("PGSACI_PASSWORD", "corpus")
-service = os.environ.get("PGSACI_SERVICE", "FREEPDB1")
+host = os.environ.get("DBSACI_HOST", "127.0.0.1")
+port = int(os.environ.get("DBSACI_PORT", "1521"))
+user = os.environ.get("DBSACI_USER", "corpus")
+password = os.environ.get("DBSACI_PASSWORD", "corpus")
+service = os.environ.get("DBSACI_SERVICE", "FREEPDB1")
 
 dsn = oracledb.makedsn(host, port, service_name=service)
 print(f"connecting thin mode to {dsn} as {user}")
@@ -142,10 +142,10 @@ check("executemany_rolled_back", cur.fetchone(), (0,))
 
 # 10. re-execute of a no-bind, multi-batch query after bind traffic on the same
 # cursor. python-oracledb thin re-runs a hot statement with a bare REEXECUTE
-# (no SQL, no bind row). PgSaci must resolve that to the statement currently on
+# (no SQL, no bind row). DbSaci must resolve that to the statement currently on
 # the cursor. A regression resolved it via the wrapping TTC sequence byte, so
 # after a big fetch (many round trips advance the seq) a later REEXECUTE's seq
-# aliased a slot left by the earlier bind INSERT; PgSaci then expected a bind
+# aliased a slot left by the earlier bind INSERT; DbSaci then expected a bind
 # RowData marker the query re-execute never sends -> ORA-01008
 # "reexecute: no bind RowData marker". Seen first by bench `big_fetch_25k_rows`.
 cur.execute("BEGIN EXECUTE IMMEDIATE 'DROP TABLE reexec_demo'; EXCEPTION WHEN OTHERS THEN NULL; END;")

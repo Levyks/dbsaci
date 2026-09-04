@@ -324,7 +324,7 @@ impl PostgresBackend {
         // Oracle's model is "schema == user": every user owns a schema of its
         // own name, unqualified DDL/DML lands there, and other schemas are
         // reached by qualifying (`hr.emp`) or `ALTER SESSION SET CURRENT_SCHEMA`.
-        // Give each pgSaci user a PostgreSQL schema of its own name so the
+        // Give each dbSaci user a PostgreSQL schema of its own name so the
         // catalog facade can report honest owners and an IDE shows the user's
         // objects under the user's node. Created by the connecting role, so it
         // owns it. Best-effort: if the role lacks CREATE on the database the
@@ -369,7 +369,7 @@ impl PostgresBackend {
         // One-shot environment diagnostics on the first backend connection.
         preflight(&client, &pg_user).await;
 
-        // The cross-session objects — the `pgsaci` schema, the `sys.*` catalog
+        // The cross-session objects — the `dbsaci` schema, the `sys.*` catalog
         // views, the `public.*` / `dbms_*` helper functions — are installed
         // once. If they are already present at this version, an unprivileged
         // login role (e.g. a read-only integration user) skips all of the DDL
@@ -380,7 +380,7 @@ impl PostgresBackend {
         tracing::debug!("compatibility facade installed: {}", installed);
 
         if !installed {
-            // Permanent, cross-session objects (a `pgsaci` schema + the
+            // Permanent, cross-session objects (a `dbsaci` schema + the
             // `binary_float`/`binary_double` domains) must be committed on their
             // own — if they sat in the session's opening transaction, the first
             // client statement that errors and triggers a `ROLLBACK` would drop
@@ -405,7 +405,7 @@ impl PostgresBackend {
         // so a concurrent connect wave doesn't all apply it at once.
         async fn facade_stale(c: &tokio_postgres::Client) -> bool {
             !c.query_opt(
-                "SELECT ver = $1 FROM pgsaci.facade_ver",
+                "SELECT ver = $1 FROM dbsaci.facade_ver",
                 &[&SYS_CATALOG_FACADE_VERSION],
             )
             .await
@@ -417,7 +417,7 @@ impl PostgresBackend {
         if facade_stale(&client).await {
             let _ = client
                 .batch_execute(
-                    "SELECT pg_advisory_lock(hashtext('pgsaci:sys_catalog_facade')::bigint)",
+                    "SELECT pg_advisory_lock(hashtext('dbsaci:sys_catalog_facade')::bigint)",
                 )
                 .await;
             if facade_stale(&client).await {
@@ -430,7 +430,7 @@ impl PostgresBackend {
                 } else {
                     let _ = client
                         .batch_execute(&format!(
-                            "INSERT INTO pgsaci.facade_ver(only_one, ver) VALUES (true, '{v}')
+                            "INSERT INTO dbsaci.facade_ver(only_one, ver) VALUES (true, '{v}')
                                ON CONFLICT (only_one) DO UPDATE SET ver = '{v}'",
                             v = SYS_CATALOG_FACADE_VERSION
                         ))
@@ -445,7 +445,7 @@ impl PostgresBackend {
             }
             let _ = client
                 .batch_execute(
-                    "SELECT pg_advisory_unlock(hashtext('pgsaci:sys_catalog_facade')::bigint)",
+                    "SELECT pg_advisory_unlock(hashtext('dbsaci:sys_catalog_facade')::bigint)",
                 )
                 .await;
         }
@@ -594,7 +594,7 @@ impl PostgresBackend {
                 }
             };
             // Describe metadata is finalised while the connection is idle: the
-            // `pgsaci.binary_*` domain lookup needs a catalog query, which is not
+            // `dbsaci.binary_*` domain lookup needs a catalog query, which is not
             // possible once `query_raw` has an open `RowStream` on the socket.
             let mut columns: Vec<ColumnMeta> = statement
                 .columns()
@@ -647,7 +647,7 @@ impl PostgresBackend {
     /// PostgreSQL `real`/`float8` back both a declared Oracle
     /// `BINARY_FLOAT`/`BINARY_DOUBLE` column and computed doubles (`POWER`,
     /// `AVG`, `DOUBLE PRECISION`), which Oracle reports as NUMBER. The DDL
-    /// translator routes the declarations through transparent `pgsaci.binary_*`
+    /// translator routes the declarations through transparent `dbsaci.binary_*`
     /// domains; here a catalog lookup on a result column's `table_oid` /
     /// `column_id` recovers the declared column and re-describes it with the
     /// native Oracle type (100 / 101). Expressions carry no `table_oid` and
@@ -679,7 +679,7 @@ impl PostgresBackend {
             let Ok(Some(row)) = row else { continue };
             let typname: String = row.get("typname");
             let nsp: String = row.get("nsp");
-            if nsp != "pgsaci" {
+            if nsp != "dbsaci" {
                 continue;
             }
             match typname.as_str() {
@@ -749,7 +749,7 @@ impl PostgresBackend {
             return Ok(0);
         }
         // Client-managed savepoints must run *outside* the per-statement
-        // `SAVEPOINT pgsaci_statement ... RELEASE` wrapper: `RELEASE SAVEPOINT`
+        // `SAVEPOINT dbsaci_statement ... RELEASE` wrapper: `RELEASE SAVEPOINT`
         // also destroys every savepoint established after it, so the wrapper
         // would silently discard a client `SAVEPOINT` the moment it was made.
         let upper = command.to_ascii_uppercase();
@@ -897,7 +897,7 @@ impl PostgresBackend {
     /// the single-shot DML path.
     pub(crate) async fn begin_statement_ex(&self, apply_timeout: bool) -> Result<()> {
         self.client
-            .batch_execute("SAVEPOINT pgsaci_statement")
+            .batch_execute("SAVEPOINT dbsaci_statement")
             .await
             .map_err(|e| Error::Postgres(pg_error_detail(&e)))?;
         if apply_timeout && let Some(timeout) = self.statement_timeout {
@@ -912,7 +912,7 @@ impl PostgresBackend {
 
     pub(crate) async fn finish_statement(&self) -> Result<()> {
         self.client
-            .batch_execute("RELEASE SAVEPOINT pgsaci_statement")
+            .batch_execute("RELEASE SAVEPOINT dbsaci_statement")
             .await
             .map_err(|e| Error::Postgres(pg_error_detail(&e)))
     }
@@ -923,7 +923,7 @@ impl PostgresBackend {
         match self
             .client
             .batch_execute(
-                "ROLLBACK TO SAVEPOINT pgsaci_statement; RELEASE SAVEPOINT pgsaci_statement",
+                "ROLLBACK TO SAVEPOINT dbsaci_statement; RELEASE SAVEPOINT dbsaci_statement",
             )
             .await
         {
@@ -944,7 +944,7 @@ fn quote_identifier(identifier: &str) -> String {
 }
 
 /// One-time environment diagnostics, logged on the first backend connection.
-/// PgSaci's compatibility rests on a few implicit assumptions about the target
+/// DbSaci's compatibility rests on a few implicit assumptions about the target
 /// database (orafce installed, PostgreSQL-native lower-case identifiers); when
 /// one is missing the failure otherwise surfaces later as an opaque PostgreSQL
 /// error. Surface it once, up front, as a single line. Best-effort: every probe
@@ -958,7 +958,7 @@ async fn preflight(client: &Client, pg_user: &str) {
     // Pre-0.0.5 builds created `sys_context` unqualified, so it could land in
     // the `oracle` schema and now shadows `public.sys_context` (which resolves
     // later on the search_path). Drop that stale copy; orafce has no
-    // `sys_context` of its own, so this only removes PgSaci's. Best-effort.
+    // `sys_context` of its own, so this only removes DbSaci's. Best-effort.
     let _ = client
         .batch_execute("DROP FUNCTION IF EXISTS oracle.sys_context(text, text)")
         .await;
@@ -1139,24 +1139,24 @@ const ORACLE_COMPAT_FACADE: &[&str] = &[
       WHERE c.relkind IN ('r', 'p', 'v', 'm')
         AND pg_catalog.pg_table_is_visible(c.oid)",
     "CREATE OR REPLACE TEMP VIEW \"v$version\" AS
-       SELECT ('PgSaci Oracle-compatibility proxy on ' || version())::varchar AS banner",
+       SELECT ('DbSaci Oracle-compatibility proxy on ' || version())::varchar AS banner",
     "
     CREATE OR REPLACE TEMP VIEW nls_session_parameters AS
       SELECT * FROM (VALUES
-        ('NLS_DATE_FORMAT', coalesce(current_setting('pgsaci.nls_date_format', true), 'DD-MON-RR')),
-        ('NLS_TIMESTAMP_FORMAT', coalesce(current_setting('pgsaci.nls_timestamp_format', true), 'DD-MON-RR HH24.MI.SSXFF')),
-        ('NLS_TIMESTAMP_TZ_FORMAT', coalesce(current_setting('pgsaci.nls_timestamp_tz_format', true), 'DD-MON-RR HH24.MI.SSXFF TZR')),
-        ('NLS_NUMERIC_CHARACTERS', coalesce(current_setting('pgsaci.nls_numeric_characters', true), '.,')),
-        ('NLS_LANGUAGE', coalesce(current_setting('pgsaci.nls_language', true), 'AMERICAN')),
-        ('NLS_DATE_LANGUAGE', coalesce(current_setting('pgsaci.nls_date_language', true), 'AMERICAN')),
-        ('NLS_TERRITORY', coalesce(current_setting('pgsaci.nls_territory', true), 'AMERICA')),
-        ('NLS_SORT', upper(coalesce(current_setting('pgsaci.nls_sort', true), 'BINARY'))),
-        ('NLS_COMP', upper(coalesce(current_setting('pgsaci.nls_comp', true), 'BINARY')))
+        ('NLS_DATE_FORMAT', coalesce(current_setting('dbsaci.nls_date_format', true), 'DD-MON-RR')),
+        ('NLS_TIMESTAMP_FORMAT', coalesce(current_setting('dbsaci.nls_timestamp_format', true), 'DD-MON-RR HH24.MI.SSXFF')),
+        ('NLS_TIMESTAMP_TZ_FORMAT', coalesce(current_setting('dbsaci.nls_timestamp_tz_format', true), 'DD-MON-RR HH24.MI.SSXFF TZR')),
+        ('NLS_NUMERIC_CHARACTERS', coalesce(current_setting('dbsaci.nls_numeric_characters', true), '.,')),
+        ('NLS_LANGUAGE', coalesce(current_setting('dbsaci.nls_language', true), 'AMERICAN')),
+        ('NLS_DATE_LANGUAGE', coalesce(current_setting('dbsaci.nls_date_language', true), 'AMERICAN')),
+        ('NLS_TERRITORY', coalesce(current_setting('dbsaci.nls_territory', true), 'AMERICA')),
+        ('NLS_SORT', upper(coalesce(current_setting('dbsaci.nls_sort', true), 'BINARY'))),
+        ('NLS_COMP', upper(coalesce(current_setting('dbsaci.nls_comp', true), 'BINARY')))
       ) AS t(parameter, value)",
     // Version / DB-identity views Oracle tooling also reads *unqualified*
     // (SYS.* copies live in IDE_INTROSPECTION_STUBS for the qualified path).
     "CREATE OR REPLACE TEMP VIEW product_component_version AS
-       SELECT 'PgSaci Oracle-compatibility proxy'::varchar AS product,
+       SELECT 'DbSaci Oracle-compatibility proxy'::varchar AS product,
               '19.0.0.0.0'::varchar AS version,
               '19.0.0.0.0'::varchar AS version_full,
               'Production'::varchar AS status",
@@ -1171,7 +1171,7 @@ const ORACLE_COMPAT_FACADE: &[&str] = &[
        SELECT (upper(current_database()) || '')::varchar AS global_name",
 ];
 
-/// Cross-session helper functions PgSaci installs once (in `public` and the
+/// Cross-session helper functions DbSaci installs once (in `public` and the
 /// `dbms_*` schemas). Unlike [`ORACLE_COMPAT_FACADE`], creating these needs DDL
 /// rights the mapped login role may not have; they are applied only when the
 /// facade is not already installed (see `facade_installed`), so an unprivileged
@@ -1183,7 +1183,7 @@ const ORACLE_COMPAT_FACADE: &[&str] = &[
 /// schema (drops off the search_path when CURRENT_SCHEMA is switched).
 const GLOBAL_COMPAT_FACADE: &[&str] = &[
     // SESSIONTIMEZONE follows `ALTER SESSION SET TIME_ZONE`; DBTIMEZONE is fixed
-    // at DB creation (PgSaci has none configurable, so `+00:00`). Defined before
+    // at DB creation (DbSaci has none configurable, so `+00:00`). Defined before
     // sys_context, which calls them.
     "CREATE OR REPLACE FUNCTION public.sessiontimezone() RETURNS varchar
        LANGUAGE sql STABLE AS $fn$
@@ -1251,19 +1251,19 @@ const GLOBAL_COMPAT_FACADE: &[&str] = &[
 /// PRECISION` — would not get. Idempotent so a table created in one session is
 /// describable in the next.
 const PERSISTENT_SETUP: &str = "
-    CREATE SCHEMA IF NOT EXISTS pgsaci;
-    DO $b$ BEGIN CREATE DOMAIN pgsaci.binary_double AS double precision;
+    CREATE SCHEMA IF NOT EXISTS dbsaci;
+    DO $b$ BEGIN CREATE DOMAIN dbsaci.binary_double AS double precision;
       EXCEPTION WHEN duplicate_object THEN NULL; END $b$;
-    DO $b$ BEGIN CREATE DOMAIN pgsaci.binary_float AS real;
+    DO $b$ BEGIN CREATE DOMAIN dbsaci.binary_float AS real;
       EXCEPTION WHEN duplicate_object THEN NULL; END $b$;
-    CREATE TABLE IF NOT EXISTS pgsaci.facade_ver (
+    CREATE TABLE IF NOT EXISTS dbsaci.facade_ver (
       only_one boolean PRIMARY KEY DEFAULT true CHECK (only_one),
       ver      text NOT NULL);
 ";
 
 /// Bump on any change to [`SYS_CATALOG_FACADE`]. Connects re-apply the facade
 /// (an ACCESS EXCLUSIVE `CREATE OR REPLACE VIEW` storm) only when the value
-/// stored in `pgsaci.facade_ver` differs from this.
+/// stored in `dbsaci.facade_ver` differs from this.
 const SYS_CATALOG_FACADE_VERSION: &str = "2026-09-03.1";
 
 /// Applied once, by the role that installs the facade, so unprivileged login
@@ -1276,7 +1276,7 @@ DECLARE s text;
 BEGIN
   FOR s IN
     SELECT nspname FROM pg_catalog.pg_namespace
-    WHERE nspname IN ('sys','pgsaci','dbms_metadata','dbms_utility','dbms_lob')
+    WHERE nspname IN ('sys','dbsaci','dbms_metadata','dbms_utility','dbms_lob')
   LOOP
     EXECUTE format('GRANT USAGE ON SCHEMA %I TO PUBLIC', s);
     EXECUTE format('GRANT SELECT ON ALL TABLES IN SCHEMA %I TO PUBLIC', s);
@@ -1305,7 +1305,7 @@ const SYS_CATALOG_FACADE: &str = "
       SELECT upper(n.nspname)::varchar AS username, n.oid::bigint AS user_id,
              NULL::timestamp AS created, 'NO'::varchar AS common,
              (CASE WHEN n.nspname LIKE 'pg\\_%'
-                    OR n.nspname IN ('information_schema','sys','pgsaci')
+                    OR n.nspname IN ('information_schema','sys','dbsaci')
                    THEN 'YES' ELSE 'NO' END)::varchar AS oracle_maintained,
              'OPEN'::varchar  AS account_status,
              'USERS'::varchar AS default_tablespace,
@@ -2052,7 +2052,7 @@ const IDE_INTROSPECTION_STUBS: &str = "
 
     -- version / NLS / DB props ---------------------------------------------
     CREATE OR REPLACE VIEW sys.product_component_version AS
-      SELECT 'PgSaci'::varchar AS product,
+      SELECT 'DbSaci'::varchar AS product,
              (current_setting('server_version_num')::int / 10000 || '.0.0.0.0')::varchar AS version,
              (current_setting('server_version_num')::int / 10000 || '.0.0.0.0')::varchar AS version_full,
              'Production'::varchar AS status;
@@ -2204,7 +2204,7 @@ pub struct DescribeCaps {
     /// PG `timestamp(0)`), and ojdbc maps Oracle `DATE` straight to
     /// `java.sql.Timestamp`, so `rs.getObject()` returns what apps expect —
     /// native `TIMESTAMP` would return `oracle.sql.TIMESTAMP` and break a
-    /// `(java.sql.Timestamp)` cast (exactly as against real Oracle, but pgSaci
+    /// `(java.sql.Timestamp)` cast (exactly as against real Oracle, but dbSaci
     /// can't tell DATE-origin from TIMESTAMP-origin PG `timestamp` apart).
     /// Known limitation: an Oracle `TIMESTAMP(n>0)` column queried over
     /// ojdbc/ODP.NET comes back with second precision and
@@ -2276,7 +2276,7 @@ fn pg_error_detail(e: &tokio_postgres::Error) -> String {
 }
 
 /// SQLSTATE 42501 — the role lacks the privilege for the statement. Expected for
-/// a read-only login role against the PgSaci compatibility objects.
+/// a read-only login role against the DbSaci compatibility objects.
 fn is_insufficient_privilege(e: &tokio_postgres::Error) -> bool {
     e.as_db_error().map(|db| db.code().code()) == Some("42501")
 }
@@ -2290,7 +2290,7 @@ async fn facade_installed(c: &Client) -> bool {
             "SELECT to_regprocedure('public.sys_context(text,text)') IS NOT NULL \
                  AND to_regprocedure('public.sessiontimezone()')     IS NOT NULL \
                  AND to_regclass('sys.all_users')                    IS NOT NULL \
-                 AND to_regclass('pgsaci.facade_ver')                IS NOT NULL",
+                 AND to_regclass('dbsaci.facade_ver')                IS NOT NULL",
             &[],
         )
         .await
@@ -2312,7 +2312,7 @@ fn warn_facade_install_error(what: &str, e: &tokio_postgres::Error) {
         static WARNED: AtomicBool = AtomicBool::new(false);
         if !WARNED.swap(true, Ordering::Relaxed) {
             tracing::warn!(
-                "PgSaci's compatibility objects are not installed and this role cannot \
+                "DbSaci's compatibility objects are not installed and this role cannot \
                  create them. Make one connection with a role that has CREATE on the \
                  database and on schema `public` (or provision them out of band); \
                  unprivileged login roles then work against them. First failure — \
@@ -2752,7 +2752,7 @@ fn pg_value_to_oracle_bytes(
     }
 }
 
-fn encode_oracle_date(value: NaiveDateTime) -> Vec<u8> {
+pub(crate) fn encode_oracle_date(value: NaiveDateTime) -> Vec<u8> {
     vec![
         (value.year() / 100 + 100) as u8,
         (value.year() % 100 + 100) as u8,
@@ -2766,7 +2766,7 @@ fn encode_oracle_date(value: NaiveDateTime) -> Vec<u8> {
 
 /// Oracle TIMESTAMP wire form: the 7-byte DATE followed by 4 big-endian bytes of
 /// sub-second nanoseconds.
-fn encode_oracle_timestamp(value: NaiveDateTime, tz: Option<(i8, i8)>) -> Vec<u8> {
+pub(crate) fn encode_oracle_timestamp(value: NaiveDateTime, tz: Option<(i8, i8)>) -> Vec<u8> {
     let mut out = encode_oracle_date(value);
     // `nanosecond()` folds a leap second into 1_000_000_000..2e9; clamp so the
     // wire value never exceeds a second's worth of nanoseconds.

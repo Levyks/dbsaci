@@ -2,14 +2,14 @@
 # Benchmark orchestrator: run the identical workload (bench/workload.py,
 # python-oracledb thin) against
 #   1. a real Oracle XE 21c instance  (gvenzl/oracle-xe:21-slim)
-#   2. PostgreSQL fronted by pgSaci    (testcontainers image + the pgSaci image)
+#   2. PostgreSQL fronted by dbSaci    (testcontainers image + the dbSaci image)
 # and print side-by-side latency + throughput tables.
 #
 # EVERYTHING runs in Docker on one user-defined bridge network — the workload
-# client, Oracle XE, PostgreSQL and pgSaci. Every hop is a container-to-container
+# client, Oracle XE, PostgreSQL and dbSaci. Every hop is a container-to-container
 # veth inside the Docker VM: no host port-proxy, and both targets are reached
-# over an identical path. pgSaci runs from its published image
-# (levyks/pgsaci:0.0.9 by default; PGSACI_IMAGE=... to override), so the number
+# over an identical path. dbSaci runs from its published image
+# (levyks/dbsaci:0.1.0 by default; DBSACI_IMAGE=... to override), so the number
 # reflects what you actually ship — a static musl build.
 #
 # Fairness: both database containers get --cpus=2 and --memory=$BENCH_MEM
@@ -21,13 +21,13 @@
 #     2.5 GiB is proven sufficient with the full licence spent.
 #   * PostgreSQL gets the same ceiling and a config tuned to that envelope (the
 #     -c flags below) instead of the stock 128 MB / 4 MB defaults.
-# The pgSaci proxy container runs unconstrained — it is the overhead under test,
+# The dbSaci proxy container runs unconstrained — it is the overhead under test,
 # not a third contestant.
 #
 #   bench/run.sh
 #   BENCH_ITERS=500 BENCH_HEAVY_ITERS=10 BENCH_BIG_ROWS=50000 bench/run.sh   # quick
 #   BENCH_KEEP=1 bench/run.sh          # leave the network + containers up afterwards
-#   PGSACI_IMAGE=pgsaci:dev bench/run.sh
+#   DBSACI_IMAGE=dbsaci:dev bench/run.sh
 #
 # Requires: docker. (No local cargo / python needed.)
 set -euo pipefail
@@ -44,8 +44,8 @@ if command -v cygpath >/dev/null 2>&1; then hostpath() { cygpath -w "$1"; }
 else hostpath() { printf '%s' "$1"; }; fi
 
 ora_image="gvenzl/oracle-xe:21-slim"
-pg_image="${PGSACI_TEST_PG_IMAGE:-pgsaci-test-pg:18}"
-pgsaci_image="${PGSACI_IMAGE:-levyks/pgsaci:0.0.9}"
+pg_image="${DBSACI_TEST_PG_IMAGE:-dbsaci-test-pg:18}"
+dbsaci_image="${DBSACI_IMAGE:-levyks/dbsaci:0.1.0}"
 client_image="bench-client:local"
 
 cpus="${BENCH_CPUS:-2}"
@@ -121,8 +121,8 @@ if ! docker image inspect "$pg_image" >/dev/null 2>&1; then
   echo "== building $pg_image =="
   docker build --build-arg "PG_VERSION=${pg_image##*:}" -t "$pg_image" "$root/testcontainers"
 fi
-docker image inspect "$pgsaci_image" >/dev/null 2>&1 || {
-  echo "== pulling $pgsaci_image =="; docker pull -q "$pgsaci_image" >/dev/null; }
+docker image inspect "$dbsaci_image" >/dev/null 2>&1 || {
+  echo "== pulling $dbsaci_image =="; docker pull -q "$dbsaci_image" >/dev/null; }
 
 # ---------------------------------------------------------------- Oracle XE ---
 echo "== starting Oracle XE ($ora_image) — SGA ${ora_sga}M + PGA ${ora_pga}M, ${cpus} CPU / $mem — first boot takes a few minutes =="
@@ -146,7 +146,7 @@ done
 echo "== workload vs real Oracle XE =="
 run_client "$ora_name:1521/XEPDB1" oracle.json
 
-# ------------------------------------------------------- PostgreSQL + pgSaci ---
+# ------------------------------------------------------- PostgreSQL + dbSaci ---
 echo "== starting PostgreSQL ($pg_image), ${cpus} CPU / $mem, tuned =="
 docker run -d --name "$pg_name" --network "$net" \
   --cpus="$cpus" --memory="$mem" --memory-swap="$mem" --shm-size=512m \
@@ -159,13 +159,13 @@ DROP ROLE IF EXISTS bench;
 CREATE ROLE bench WITH LOGIN PASSWORD 'bench' SUPERUSER;
 SQL
 
-echo "== starting pgSaci ($pgsaci_image), unconstrained =="
+echo "== starting dbSaci ($dbsaci_image), unconstrained =="
 docker run -d --name "$saci_name" --network "$net" \
-  -e PGSACI_LISTEN=0.0.0.0:1521 \
-  -e PGSACI_PG_HOST="$pg_name" -e PGSACI_PG_PORT=5432 \
-  -e PGSACI_PG_DB=postgres -e PGSACI_PG_PASSWORD=bench \
-  -e PGSACI_HEALTH_ADDR=0.0.0.0:9500 -e RUST_LOG=pgsaci=warn \
-  "$pgsaci_image" >/dev/null
+  -e DBSACI_LISTEN=0.0.0.0:1521 \
+  -e DBSACI_PG_HOST="$pg_name" -e DBSACI_PG_PORT=5432 \
+  -e DBSACI_PG_DB=postgres -e DBSACI_PG_PASSWORD=bench \
+  -e DBSACI_HEALTH_ADDR=0.0.0.0:9500 -e RUST_LOG=dbsaci=warn \
+  "$dbsaci_image" >/dev/null
 # scratch image: no shell to exec into. Poll the listener from a throwaway client.
 docker run --rm --network "$net" "$client_image" python -c "
 import socket, sys, time
@@ -175,10 +175,10 @@ for _ in range(120):
         sys.exit(0)
     time.sleep(0.5)
 sys.exit(1)
-" || { echo 'pgSaci listener never came up'; docker logs --tail 60 "$saci_name"; exit 1; }
+" || { echo 'dbSaci listener never came up'; docker logs --tail 60 "$saci_name"; exit 1; }
 
-echo "== workload vs PostgreSQL via pgSaci =="
-run_client "$saci_name:1521/FREEPDB1" pgsaci.json
+echo "== workload vs PostgreSQL via dbSaci =="
+run_client "$saci_name:1521/FREEPDB1" dbsaci.json
 
 # ------------------------------------------------------------------- report ---
 echo
@@ -186,7 +186,7 @@ docker run --rm -i -e BENCH_MEM="$mem" -v "$(hostpath "$outdir"):/out" "$client_
 import json, os
 MEM = os.environ.get("BENCH_MEM", "?")
 O = json.load(open("/out/oracle.json"))
-P = json.load(open("/out/pgsaci.json"))
+P = json.load(open("/out/dbsaci.json"))
 o, p = O["results"], P["results"]
 
 def cell(d, key):
@@ -194,7 +194,7 @@ def cell(d, key):
 
 def table(kind, note):
     print(f"\n**{kind}** {note}\n")
-    print("| operation | Oracle XE p50 | pgSaci p50 | Oracle p95 | pgSaci p95 | pgSaci / Oracle (p50) |")
+    print("| operation | Oracle XE p50 | dbSaci p50 | Oracle p95 | dbSaci p95 | dbSaci / Oracle (p50) |")
     print("| --- | ---: | ---: | ---: | ---: | ---: |")
     for k, a in o.items():
         if a.get("kind") != kind:
@@ -211,12 +211,12 @@ def table(kind, note):
     for k, msg in errs.items():
         print(f"\n> `{k}` errored: {msg}")
 
-print(f"Oracle XE 21c vs PostgreSQL via pgSaci — all in Docker on one bridge network, "
+print(f"Oracle XE 21c vs PostgreSQL via dbSaci — all in Docker on one bridge network, "
       f"{O.get('light_iters', '?')} latency iters. Both DB containers: 2 CPU / {MEM} "
       f"(XE spends its full 2 GiB licence: 1536M SGA + 512M PGA; PostgreSQL tuned to "
       f"that envelope). Single connection. bench_big = {O['big_rows']} rows.")
-table("latency", "(small statements — wall-clock is per-query overhead; lower ratio = pgSaci closer)")
-table("throughput", "(scan / sort / aggregate / bulk write — wall-clock is the DB engine; ratio < 1 = pgSaci+PostgreSQL faster)")
+table("latency", "(small statements — wall-clock is per-query overhead; lower ratio = dbSaci closer)")
+table("throughput", "(scan / sort / aggregate / bulk write — wall-clock is the DB engine; ratio < 1 = dbSaci+PostgreSQL faster)")
 PY
 echo
-echo "raw JSON in $outdir (oracle.json, pgsaci.json)"
+echo "raw JSON in $outdir (oracle.json, dbsaci.json)"

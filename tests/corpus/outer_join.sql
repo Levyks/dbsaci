@@ -1,5 +1,5 @@
 # Legacy Oracle (+) outer-join syntax. Still pervasive in pre-2010 application
-# SQL and in hand-written reports. PgSaci currently handles only a single
+# SQL and in hand-written reports. DbSaci currently handles only a single
 # two-table equality (+) predicate, so the multi-predicate / multi-table shapes
 # that real code uses are the interesting cases here.
 

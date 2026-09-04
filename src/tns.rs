@@ -181,7 +181,7 @@ impl TnsStream {
             payload_len = payload.len(),
             "TNS packet read"
         );
-        if std::env::var("PGSACI_WIRE_DUMP").is_ok() {
+        if std::env::var("DBSACI_WIRE_DUMP").is_ok() {
             eprintln!(
                 "<< {:?} len={} payload={}",
                 packet_type,
@@ -317,7 +317,7 @@ impl TnsStream {
         buf.extend_from_slice(payload);
 
         tracing::debug!(packet_type = ?packet_type, length = buf.len(), "TNS packet written");
-        if std::env::var("PGSACI_WIRE_DUMP").is_ok() {
+        if std::env::var("DBSACI_WIRE_DUMP").is_ok() {
             eprintln!(
                 ">> {:?} len={} payload={}",
                 packet_type,

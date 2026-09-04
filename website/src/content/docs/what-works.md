@@ -1,11 +1,11 @@
 ---
 title: What works
-description: The Oracle surface pgSaci covers today, verified by an end-to-end golden corpus.
+description: The Oracle surface dbSaci covers today, verified by an end-to-end golden corpus.
 ---
 
 Everything below has golden-corpus coverage. See the
-[Compatibility matrix](/pgsaci/compatibility/) for per-area status and
-[Limitations](/pgsaci/limitations/) for what is missing.
+[Compatibility matrix](/dbsaci/compatibility/) for per-area status and
+[Limitations](/dbsaci/limitations/) for what is missing.
 
 ## Drivers & sessions
 
@@ -18,7 +18,7 @@ Everything below has golden-corpus coverage. See the
 - The **OCI thick client** (Instant Client, via `python-oracledb` thick mode)
   runs the golden corpus too: 634 / 637, the 3 skips being cases Oracle itself
   rejects over that transport (`ORA-01036` ×2, `ORA-00925`). It uses its own TTC
-  dialect — little-endian fixed-width integers — which pgSaci emits from the
+  dialect — little-endian fixed-width integers — which dbSaci emits from the
   negotiated `TNS_CCAP_OCI1` capability. Not run in CI (needs a licensed Instant
   Client).
 - **Scalar and array binds** go across as PostgreSQL parameters. A cached
@@ -50,7 +50,7 @@ constraints, indexes, sequences, comments, triggers, users; `V$VERSION`;
 An IDE schema browser — DataGrip / IntelliJ was the reference — introspects the
 tree end to end against these, including `DBMS_METADATA.GET_DDL` for the "copy
 DDL" action (rendered as PostgreSQL DDL). Objects appear under the connected
-user's node: pgSaci gives each user a PostgreSQL schema of its own name
+user's node: dbSaci gives each user a PostgreSQL schema of its own name
 (Oracle's "schema == user"), and `ALL_*` / `USER_*` report honest owners
 against it.
 

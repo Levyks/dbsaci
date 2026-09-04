@@ -1,10 +1,11 @@
 # MERGE: the standard Oracle upsert, ubiquitous in ETL / staging-to-target
 # loads. PostgreSQL 15+ has MERGE with compatible syntax, so the gap here is
-# mostly routing (PgSaci treats MERGE as neither a query nor known DML).
+# mostly routing (DbSaci treats MERGE as neither a query nor known DML).
 # `MERGE` is a hard PostgreSQL 15 floor with no portable lowering (the
 # rowcount-reporting case in particular cannot be a DO block), so this group is
 # skipped on older backends.
 # requires-pg: 15
+# skip: mariadb (MariaDB has no MERGE statement and no portable lowering)
 #
 # Cases that need to inspect the result run the MERGE in `-- setup:` and assert
 # the resulting table state in the body.

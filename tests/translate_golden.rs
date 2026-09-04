@@ -1,4 +1,4 @@
-//! Golden tests for `pgsaci::translate::oracle_to_postgres` — pure string→string
+//! Golden tests for `dbsaci::translate::oracle_to_postgres` — pure string→string
 //! SQL translation, no backend. Cases live in `tests/corpus/translate/*.txt`,
 //! one per line as `oracle SQL  =>  expected PostgreSQL`, or `oracle SQL  =>  !`
 //! to assert the translator rejects it.
@@ -8,7 +8,7 @@
 
 use std::path::Path;
 
-use pgsaci::translate::oracle_to_postgres;
+use dbsaci::translate::oracle_to_postgres;
 
 const DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/corpus/translate");
 

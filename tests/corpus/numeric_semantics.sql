@@ -49,7 +49,7 @@ SELECT TRUNC(12345, -2) FROM DUAL
 12300
 -- end
 
-# NOTE: PgSaci trims trailing zeros from NUMBER results (declared scale is not
+# NOTE: DbSaci trims trailing zeros from NUMBER results (declared scale is not
 # carried on the wire), so 1.500 comes back as 1.5.
 -- case: number_trailing_zeros_are_trimmed
 SELECT CAST(1.5 AS NUMBER(10,3)) FROM DUAL
@@ -70,6 +70,7 @@ SELECT 9999999999999999 + 1 FROM DUAL
 -- end
 
 -- case: division_by_zero_raises
+-- skip: mariadb (MariaDB does not raise on division by zero in a SELECT expression)
 SELECT 1 / 0 FROM DUAL
 -- error: ORA-01476
 -- end
@@ -81,6 +82,7 @@ SELECT '10' + 5 FROM DUAL
 -- end
 
 -- case: non_numeric_string_arithmetic_errors
+-- skip: mariadb (MariaDB coerces instead of raising ORA-01722 in SELECT)
 SELECT 'abc' + 1 FROM DUAL
 -- error: ORA-01722
 -- end

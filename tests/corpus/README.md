@@ -1,7 +1,7 @@
-# PgSaci compatibility corpus
+# DbSaci compatibility corpus
 
 Golden files describing how a real Oracle client (`oracle-rs`, over TNS, through
-PgSaci, against PostgreSQL + orafce) should behave for a given piece of SQL.
+DbSaci, against PostgreSQL + orafce) should behave for a given piece of SQL.
 Runner: [`tests/corpus.rs`](../corpus.rs). Pure string→string translation
 goldens live in [`translate/`](translate), run by
 [`tests/translate_golden.rs`](../translate_golden.rs).
@@ -13,9 +13,9 @@ cargo test --test corpus -- --exact oracle_dates::add_months_forward
 cargo test --test translate_golden
 ```
 
-One PostgreSQL/orafce container and one PgSaci proxy start once per run and are
+One PostgreSQL/orafce container and one DbSaci proxy start once per run and are
 shared by every case (custom `libtest-mimic` harness), so cases are cheap to
-add. The image (`pgsaci-test-pg:18`, from
+add. The image (`dbsaci-test-pg:18`, from
 [`testcontainers/Dockerfile`](../../testcontainers/Dockerfile)) must exist and
 Docker must be running.
 
@@ -24,7 +24,7 @@ Docker must be running.
 Cases are written to the **Oracle-correct** result and grouped by **feature
 area** — never by whether they currently pass. A run reports e.g.
 `368 passed; 114 failed`; the failures are the Oracle-compatibility work still
-outstanding, and the number should trend down as PgSaci improves. A case only
+outstanding, and the number should trend down as DbSaci improves. A case only
 moves or changes when *the expectation itself* was wrong about Oracle, not to
 make a red case green.
 
@@ -46,7 +46,7 @@ runner):
 A case that changes state (DML/DDL keyword, `-- rowcount:`, `-- setup:`,
 `-- teardown:`, `-- verify:`) is rolled back and its session reconnected
 afterwards, so cases are order-independent. Client `SAVEPOINT`s can't be used
-for this: PgSaci wraps every statement in `SAVEPOINT pgsaci_statement … RELEASE`,
+for this: DbSaci wraps every statement in `SAVEPOINT dbsaci_statement … RELEASE`,
 and `RELEASE SAVEPOINT` also drops any savepoint established after it.
 
 ## File format

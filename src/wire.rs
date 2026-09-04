@@ -12,7 +12,7 @@ pub type AuthParameters = Vec<(String, Vec<u8>)>;
 /// (`TNS_CCAP_*`) in `adjust_for_server_compile_caps`, so it must be a full
 /// array, not a stub. These are the values a real 19c client negotiates;
 /// index 7 (`TNS_CCAP_FIELD_VERSION`) is 12 = 12.2, which matches the row
-/// metadata layout PgSaci emits (oaccolid, pre-vector/domain fields).
+/// metadata layout DbSaci emits (oaccolid, pre-vector/domain fields).
 ///
 /// Index 15 bit `0x01` advertises end-of-call-status support. `write_ttc_status`
 /// always emits the `[status ub4][seq ub2]` trailer, and python-oracledb thin /
@@ -158,7 +158,7 @@ pub fn build_protocol_response() -> Bytes {
 /// Given a DATA payload whose first TTC message is a PIGGYBACK (`0x11` at
 /// offset 2 — ojdbc uses it to carry a deferred CLOSE_CURSORS ahead of the real
 /// call), return the slice starting at the embedded `0x03` FUNCTION message.
-/// PgSaci owns its single streamed cursor, so the piggyback body itself needs no
+/// DbSaci owns its single streamed cursor, so the piggyback body itself needs no
 /// action. Returns `None` if no embedded FUNCTION message is found.
 pub fn strip_piggyback(payload: &[u8]) -> Option<&[u8]> {
     // Real TTC functions that can follow a piggyback. `0x11` is the piggyback
@@ -256,7 +256,7 @@ pub fn parse_data_types_caps(payload: &[u8]) -> Result<(Vec<u8>, Vec<u8>)> {
 /// A real Oracle server replies with the datatype triples it supports (a
 /// subset), terminated by a zero type — *not* an echo of the request's
 /// capability preamble. Lenient clients (`oracle-rs`) tolerate the echo; strict
-/// clients (`python-oracledb` thin, JDBC thin) stall on it. PgSaci answers "I
+/// clients (`python-oracledb` thin, JDBC thin) stall on it. DbSaci answers "I
 /// support every type you offered" by reflecting just the triple list.
 pub fn build_data_types_response(request_payload: &[u8]) -> Bytes {
     let mut out = WriteBuffer::new();
@@ -312,7 +312,7 @@ pub fn echo_data_types_response(payload: &[u8]) -> Bytes {
 /// of ODP.NET managed, which parses the response differently from
 /// python-oracledb / JDBC thin:
 ///
-///  * Because PgSaci advertises `SERVER_RUNTIME_CAPS[1] & 1`, this client reads
+///  * Because DbSaci advertises `SERVER_RUNTIME_CAPS[1] & 1`, this client reads
 ///    a fixed **11-byte DB-timezone blob** first, before any type list.
 ///    python-oracledb / JDBC don't read this at all, so it must *only* be
 ///    emitted here.
@@ -324,7 +324,7 @@ pub fn echo_data_types_response(payload: &[u8]) -> Bytes {
 ///    (empty) list.
 ///
 /// The 11-byte blob is the wire form for UTC
-/// (`80 00 00 00 3C 3C 3C 80 00 00 00`); PgSaci's backing PostgreSQL runs UTC.
+/// (`80 00 00 00 3C 3C 3C 80 00 00 00`); DbSaci's backing PostgreSQL runs UTC.
 pub fn build_data_types_response_na_no_verlist() -> Bytes {
     const DB_TZ_UTC: [u8; 11] = [0x80, 0, 0, 0, 0x3C, 0x3C, 0x3C, 0x80, 0, 0, 0];
     let mut out = WriteBuffer::new();
@@ -428,7 +428,7 @@ pub fn build_auth_phase_two_response_na_no_verlist(
     write_auth_kv(&mut buf, "AUTH_SERIAL_NUM", "1");
     write_auth_kv(&mut buf, "AUTH_VERSION_NO", &version_no.to_string());
     write_auth_kv(&mut buf, "AUTH_VERSION_STRING", version_string);
-    write_auth_kv(&mut buf, "AUTH_SC_DBUNIQUE_NAME", "PGSACI");
+    write_auth_kv(&mut buf, "AUTH_SC_DBUNIQUE_NAME", "DBSACI");
     write_auth_kv(&mut buf, "AUTH_SC_SERVICE_NAME", "FREEPDB1");
     write_auth_kv(&mut buf, "AUTH_MAX_OPEN_CURSORS", "1000");
     write_auth_kv(&mut buf, "AUTH_MAX_IDEN_LENGTH", "128");
@@ -517,7 +517,7 @@ pub fn build_auth_phase_two_response(
     write_auth_kv(&mut buf, "AUTH_SERIAL_NUM", "1");
     write_auth_kv(&mut buf, "AUTH_VERSION_NO", &version_no.to_string());
     write_auth_kv(&mut buf, "AUTH_VERSION_STRING", version_string);
-    write_auth_kv(&mut buf, "AUTH_SC_DBUNIQUE_NAME", "PGSACI");
+    write_auth_kv(&mut buf, "AUTH_SC_DBUNIQUE_NAME", "DBSACI");
     write_auth_kv(&mut buf, "AUTH_SC_SERVICE_NAME", "FREEPDB1");
     write_auth_kv(&mut buf, "AUTH_MAX_OPEN_CURSORS", "1000");
     write_auth_kv(&mut buf, "AUTH_MAX_IDEN_LENGTH", "128");
@@ -730,7 +730,7 @@ fn parse_auth_request(payload: &[u8], one_byte_chunks: bool) -> Result<(String, 
     let _function = buf.read_u8()?;
     let _seq = buf.read_u8()?;
     // Oracle 23ai (TTC field version >= 18) adds a token UB8 after the
-    // sequence number. PgSaci advertises 19c, where this field is absent.
+    // sequence number. DbSaci advertises 19c, where this field is absent.
     // The 23ai form starts with a zero-length UB8 in oracle-rs, so retain
     // support for both forms while parsing client authentication packets.
     if buf.remaining_slice().first() == Some(&0) {
@@ -876,7 +876,7 @@ fn parse_execute_strict(payload: &[u8]) -> Result<ExecuteRequest> {
     let _msg_type = buf.read_u8()?;
     let _function = buf.read_u8()?;
     let _seq = buf.read_u8()?;
-    // PgSaci negotiates TTC field version 12 (19c), which has no token field.
+    // DbSaci negotiates TTC field version 12 (19c), which has no token field.
     let _exec_opts = buf.read_ub4()?;
     let _cursor_id = buf.read_ub4()?;
     let sql_ptr = buf.read_u8()?;
@@ -1348,7 +1348,7 @@ pub fn parse_execute_request_oci(payload: &[u8]) -> Result<ExecuteRequest> {
             };
         }
     }
-    if start.is_none() && std::env::var("PGSACI_OCI_DEBUG").is_ok() {
+    if start.is_none() && std::env::var("DBSACI_OCI_DEBUG").is_ok() {
         eprintln!(
             "OCI-DEBUG no-sql payload ({} bytes): {}",
             payload.len(),
@@ -2032,7 +2032,7 @@ fn bind_sql_literal(value: &BindValue) -> Result<String> {
 }
 
 /// A DML statement's `RETURNING <exprs> INTO <bind list>` split into the parts
-/// PgSaci needs: the SQL with the `INTO` clause removed (so PostgreSQL sees a
+/// DbSaci needs: the SQL with the `INTO` clause removed (so PostgreSQL sees a
 /// plain `RETURNING`), the number of OUT bind placeholders, and the number of
 /// returned expressions.
 #[derive(Debug, Clone, PartialEq)]
@@ -2351,7 +2351,7 @@ pub fn build_query_response(
 /// `DESCRIBE_INFO` trailer, `ROW_HEADER` (`0x06`), `ROW_DATA` (`0x07`), the
 /// post-row `0x08` block, the literal ROWID (`0x0d`) and the `0x04` end-of-call
 /// were all reverse-engineered byte-for-byte from a live Oracle XE 21c capture
-/// (see `pgsaci-known-gaps.md`, "OCI thick client").
+/// (see `dbsaci-known-gaps.md`, "OCI thick client").
 ///
 /// The per-value encoding inside `ROW_DATA` is identical to the thin wire
 /// (`[u8 length][bytes]`), so callers pass the same `rows` they build for
@@ -3673,6 +3673,25 @@ impl ColumnMeta {
         }
     }
 
+    /// Oracle `RAW` (type 23) — binary payload the client renders as `0x…`.
+    pub fn raw(name: impl Into<String>, size: u32) -> Self {
+        Self {
+            name: name.into(),
+            oracle_type: 23,
+            flags: 0,
+            precision: 0,
+            scale: 0,
+            buffer_size: size,
+            max_size: size,
+            charset_id: 0,
+            charset_form: 0,
+            nullable: true,
+            schema: None,
+            type_name: None,
+            position: 1,
+        }
+    }
+
     pub fn varchar(name: impl Into<String>, size: u32) -> Self {
         Self {
             name: name.into(),
@@ -3684,6 +3703,47 @@ impl ColumnMeta {
             max_size: size,
             charset_id: CHARSET_UTF8,
             charset_form: 1,
+            nullable: true,
+            schema: None,
+            type_name: None,
+            position: 1,
+        }
+    }
+
+    /// Oracle DATE (7-byte date/time form, with second precision).
+    pub fn date(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            oracle_type: 12,
+            flags: 0,
+            precision: 0,
+            scale: 0,
+            buffer_size: 7,
+            max_size: 7,
+            charset_id: 0,
+            charset_form: 0,
+            nullable: true,
+            schema: None,
+            type_name: None,
+            position: 1,
+        }
+    }
+
+    /// Oracle TIMESTAMP (internal type 180) — the 7-byte DATE form plus a
+    /// 4-byte big-endian fractional-second nanoseconds field. `scale` carries
+    /// the fractional-second precision (some client value decoders desync when
+    /// it is left 0).
+    pub fn timestamp(name: impl Into<String>, scale: i8) -> Self {
+        Self {
+            name: name.into(),
+            oracle_type: 180,
+            flags: 0,
+            precision: 0,
+            scale,
+            buffer_size: 11,
+            max_size: 11,
+            charset_id: 0,
+            charset_form: 0,
             nullable: true,
             schema: None,
             type_name: None,

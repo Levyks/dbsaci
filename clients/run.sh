@@ -3,9 +3,9 @@
 #
 #   clients/run.sh <python|java|dotnet> [oracle-version]
 #
-# Starts a real PostgreSQL+orafce container and a real PgSaci proxy, seeds the
+# Starts a real PostgreSQL+orafce container and a real DbSaci proxy, seeds the
 # baseline schema, then runs the named client probe against it. `oracle-version`
-# is passed through as PGSACI_ORACLE_VERSION (default: unset = 19c).
+# is passed through as DBSACI_ORACLE_VERSION (default: unset = 19c).
 #
 # Requires: docker, cargo, and the toolchain for the chosen client
 # (python + `pip install oracledb`; a JDK; or the .NET SDK).
@@ -16,15 +16,15 @@ oracle_version="${2:-}"
 root="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$root"
 
-pg_image="${PGSACI_TEST_PG_IMAGE:-pgsaci-test-pg:18}"
+pg_image="${DBSACI_TEST_PG_IMAGE:-dbsaci-test-pg:18}"
 pg_major="${pg_image##*:}"
-listen_port="${PGSACI_PORT:-15210}"
+listen_port="${DBSACI_PORT:-15210}"
 health_port="15280"
 cid=""
-pgsaci_pid=""
+dbsaci_pid=""
 
 cleanup() {
-  [ -n "$pgsaci_pid" ] && kill "$pgsaci_pid" 2>/dev/null || true
+  [ -n "$dbsaci_pid" ] && kill "$dbsaci_pid" 2>/dev/null || true
   [ -n "$cid" ] && docker rm -f "$cid" >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
@@ -78,28 +78,28 @@ SQL
 done
 [ "$seeded" = 1 ] || { echo "!! could not seed schema" >&2; exit 1; }
 
-echo "== building + starting pgsaci =="
-cargo build --quiet --bin pgsaci
-export PGSACI_LISTEN="127.0.0.1:${listen_port}"
-export PGSACI_PG_HOST=127.0.0.1 PGSACI_PG_PORT="$pg_port"
-export PGSACI_PG_DB=postgres PGSACI_PG_PASSWORD=corpus
-export PGSACI_HEALTH_ADDR="127.0.0.1:${health_port}"
+echo "== building + starting dbsaci =="
+cargo build --quiet --bin dbsaci
+export DBSACI_LISTEN="127.0.0.1:${listen_port}"
+export DBSACI_PG_HOST=127.0.0.1 DBSACI_PG_PORT="$pg_port"
+export DBSACI_PG_DB=postgres DBSACI_PG_PASSWORD=corpus
+export DBSACI_HEALTH_ADDR="127.0.0.1:${health_port}"
 # Mirror tests/corpus.rs: a 2 s per-statement cap so the corpus's
 # `statement_timeout_is_user_cancel` case surfaces ORA-01013.
-export PGSACI_STATEMENT_TIMEOUT_MS="${PGSACI_STATEMENT_TIMEOUT_MS:-2000}"
-export RUST_LOG="${RUST_LOG:-pgsaci=info}"
-[ -n "$oracle_version" ] && export PGSACI_ORACLE_VERSION="$oracle_version"
-./target/debug/pgsaci > /tmp/pgsaci_stderr.log 2>&1 &
-pgsaci_pid=$!
+export DBSACI_STATEMENT_TIMEOUT_MS="${DBSACI_STATEMENT_TIMEOUT_MS:-2000}"
+export RUST_LOG="${RUST_LOG:-dbsaci=info}"
+[ -n "$oracle_version" ] && export DBSACI_ORACLE_VERSION="$oracle_version"
+./target/debug/dbsaci > /tmp/dbsaci_stderr.log 2>&1 &
+dbsaci_pid=$!
 
-echo "== waiting for pgsaci /readyz =="
+echo "== waiting for dbsaci /readyz =="
 for _ in $(seq 1 40); do
   curl -fsS "http://127.0.0.1:${health_port}/readyz" >/dev/null 2>&1 && break
   sleep 0.25
 done
 
-export PGSACI_HOST=127.0.0.1 PGSACI_PORT="$listen_port" \
-       PGSACI_USER=corpus PGSACI_PASSWORD=corpus PGSACI_SERVICE=FREEPDB1
+export DBSACI_HOST=127.0.0.1 DBSACI_PORT="$listen_port" \
+       DBSACI_USER=corpus DBSACI_PASSWORD=corpus DBSACI_SERVICE=FREEPDB1
 
 echo "== running $client probe =="
 rc=0

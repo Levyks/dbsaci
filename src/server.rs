@@ -28,18 +28,18 @@ static BACKEND_ERRORS_TOTAL: AtomicU64 = AtomicU64::new(0);
 fn render_metrics() -> String {
     let g = |c: &AtomicU64| c.load(Ordering::Relaxed);
     format!(
-        "# HELP pgsaci_sessions_active Currently connected Oracle sessions.\n\
-         # TYPE pgsaci_sessions_active gauge\n\
-         pgsaci_sessions_active {}\n\
-         # HELP pgsaci_sessions_total Sessions accepted since start.\n\
-         # TYPE pgsaci_sessions_total counter\n\
-         pgsaci_sessions_total {}\n\
-         # HELP pgsaci_statements_total Execute/Fetch/DML calls served.\n\
-         # TYPE pgsaci_statements_total counter\n\
-         pgsaci_statements_total {}\n\
-         # HELP pgsaci_backend_errors_total PostgreSQL errors mapped and returned to clients.\n\
-         # TYPE pgsaci_backend_errors_total counter\n\
-         pgsaci_backend_errors_total {}\n",
+        "# HELP dbsaci_sessions_active Currently connected Oracle sessions.\n\
+         # TYPE dbsaci_sessions_active gauge\n\
+         dbsaci_sessions_active {}\n\
+         # HELP dbsaci_sessions_total Sessions accepted since start.\n\
+         # TYPE dbsaci_sessions_total counter\n\
+         dbsaci_sessions_total {}\n\
+         # HELP dbsaci_statements_total Execute/Fetch/DML calls served.\n\
+         # TYPE dbsaci_statements_total counter\n\
+         dbsaci_statements_total {}\n\
+         # HELP dbsaci_backend_errors_total PostgreSQL errors mapped and returned to clients.\n\
+         # TYPE dbsaci_backend_errors_total counter\n\
+         dbsaci_backend_errors_total {}\n",
         g(&ACTIVE_SESSIONS),
         g(&SESSIONS_TOTAL),
         g(&STATEMENTS_TOTAL),
@@ -161,7 +161,7 @@ pub struct Config {
     /// Per-statement PostgreSQL limit. `None` preserves Oracle's unlimited
     /// default; when set, timeout cancellation is returned as ORA-01013.
     pub statement_timeout: Option<Duration>,
-    /// Maximum time a connected client may remain silent while PgSaci is reading
+    /// Maximum time a connected client may remain silent while DbSaci is reading
     /// a TNS frame. `None` disables application-level idle reaping.
     pub idle_timeout: Option<Duration>,
     /// `host:port` for the plain-HTTP `/healthz` + `/readyz` probes. `None`
@@ -170,12 +170,12 @@ pub struct Config {
     /// How long `run_with_listener` waits for in-flight sessions to finish
     /// after a shutdown signal (SIGINT / Ctrl-C) before returning anyway.
     pub shutdown_grace: Duration,
-    /// Which Oracle release PgSaci presents itself as (banner, `v$version`,
+    /// Which Oracle release DbSaci presents itself as (banner, `v$version`,
     /// `AUTH_VERSION_*`, and the auth verifier family).
     pub oracle_version: OracleVersion,
 }
 
-/// The Oracle release PgSaci impersonates on the wire.
+/// The Oracle release DbSaci impersonates on the wire.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum OracleVersion {
     /// 11.2.0.4 — 11g O5LOGON verifier. For older JDBC / OCI clients.
@@ -252,7 +252,7 @@ impl Server {
     }
 
     pub async fn run_with_listener(self, listener: TcpListener) -> Result<()> {
-        info!("PgSaci listening on {}", listener.local_addr()?);
+        info!("DbSaci listening on {}", listener.local_addr()?);
         match self.config.idle_timeout {
             Some(d) => info!("idle client reaping after {}s", d.as_secs()),
             None => info!("idle client reaping disabled"),
@@ -642,7 +642,7 @@ async fn handle_connection(stream: TcpStream, session_id: u64, config: Config) -
     sessions_set_user(session_id, &username);
 
     // Resolve the Oracle username to a pre-declared PostgreSQL password. The
-    // login is a challenge/response, so PgSaci must already hold the password to
+    // login is a challenge/response, so DbSaci must already hold the password to
     // both verify the client's proof and open the backend connection with it.
     // An unknown user with no fallback configured is rejected up front.
     let pg_password = match config.credentials.password_for(&username) {
@@ -671,11 +671,11 @@ async fn handle_connection(stream: TcpStream, session_id: u64, config: Config) -
     // The 11g O5LOGON (MD5) verifier is what python-oracledb thin negotiates for
     // an 11g server. ojdbc's O5Logon helper is hardwired to O7L multi-round
     // (PBKDF2) and can't do the MD5 path, so serve it the 12c PBKDF2 verifier
-    // even under `PGSACI_ORACLE_VERSION=11` — only the banner / release number
+    // even under `DBSACI_ORACLE_VERSION=11` — only the banner / release number
     // stay 11g.
     // Both ojdbc thin and ODP.NET managed hardwire O7L multi-round (PBKDF2) and
     // cannot do the 11g O5LOGON (MD5) path, so serve them the 12c verifier even
-    // under `PGSACI_ORACLE_VERSION=11` (only the banner / release stay 11g).
+    // under `DBSACI_ORACLE_VERSION=11` (only the banner / release stay 11g).
     let use_11g =
         config.oracle_version == OracleVersion::V11g && !newer_describe_framing && !oci_dialect;
     let mut auth_state = if use_11g {
@@ -869,7 +869,7 @@ async fn handle_connection(stream: TcpStream, session_id: u64, config: Config) -
     let mut cursor: Option<Box<dyn OracleCursor>> = None;
     // The Oracle SQL text + bind datatype list of the statement last prepared on
     // this session's cursor. `REEXECUTE` / `REEXECUTE_AND_FETCH` re-run it
-    // without re-sending either, so PgSaci has to remember them.
+    // without re-sending either, so DbSaci has to remember them.
     let mut last_execute: Option<(String, Vec<u8>)> = None;
     // OCI keys its client-side statement cache off the cursor id the server
     // reports; reusing one id for two different statements corrupts that cache
@@ -910,7 +910,7 @@ async fn handle_connection(stream: TcpStream, session_id: u64, config: Config) -
                 }
                 // ojdbc prefixes deferred operations (mainly CLOSE_CURSORS) as a
                 // PIGGYBACK message (type 0x11) in the same DATA packet as the
-                // real FUNCTION message. PgSaci manages its single streamed
+                // real FUNCTION message. DbSaci manages its single streamed
                 // cursor itself, so skip the piggyback and act on the embedded
                 // `0x03` message.
                 let payload: std::borrow::Cow<[u8]> = if req.payload.get(2) == Some(&0x11) {
@@ -967,7 +967,7 @@ async fn handle_connection(stream: TcpStream, session_id: u64, config: Config) -
                         // Resolve the statement a bare REEXECUTE re-runs.
                         //
                         // OCI: the cursor id the frame names is authoritative —
-                        // `oci_id_to_sql` is keyed with the exact id PgSaci
+                        // `oci_id_to_sql` is keyed with the exact id DbSaci
                         // assigned and echoed in that statement's original `0x5E`
                         // response, so the client names it verbatim. Fall back to
                         // the seq byte, then the most-recent statement, only when
@@ -979,12 +979,12 @@ async fn handle_connection(stream: TcpStream, session_id: u64, config: Config) -
                         // map must NOT be consulted here: `req_seq` is a wrapping
                         // u8, and after a large multi-batch fetch a later
                         // REEXECUTE's seq can alias a slot last written by an
-                        // unrelated bind-carrying statement — PgSaci would then
+                        // unrelated bind-carrying statement — DbSaci would then
                         // load that statement's datatype list and demand a bind
                         // RowData marker the query re-execute never sends
                         // (ORA-01008, seen by bench `big_fetch_25k_rows`). Thin
                         // drivers re-parse (a full `0x5E` with SQL) on every
-                        // statement change and PgSaci streams a single cursor, so
+                        // statement change and DbSaci streams a single cursor, so
                         // `last_execute` alone is the correct resolution.
                         let named_id = wire::parse_reexecute_cursor_id_oci(&payload, func_code);
                         let resolved = if oci_dialect {
@@ -995,7 +995,7 @@ async fn handle_connection(stream: TcpStream, session_id: u64, config: Config) -
                         } else {
                             last_execute.as_ref()
                         };
-                        if std::env::var("PGSACI_OCI_DEBUG").is_ok() {
+                        if std::env::var("DBSACI_OCI_DEBUG").is_ok() {
                             eprintln!(
                                 "OCI-DEBUG reexec func=0x{:02x} seq=0x{:02x} named_id={:?} \
                                  id_map={:?} resolved={:?}",
@@ -1025,9 +1025,9 @@ async fn handle_connection(stream: TcpStream, session_id: u64, config: Config) -
                         Ok(execute) => execute,
                         Err(e) => {
                             // A `0x5E` that carries no SQL text is ojdbc thin
-                            // re-executing a statement it expects PgSaci to have
+                            // re-executing a statement it expects DbSaci to have
                             // cached on a server-side cursor (its implicit
-                            // statement cache). PgSaci does not keep that cache
+                            // statement cache). DbSaci does not keep that cache
                             // on the thin/jdbc path, so answer the Oracle-correct
                             // "cursor has no statement" — ojdbc then re-parses
                             // and re-sends the SQL, which succeeds. This is
@@ -1044,10 +1044,10 @@ async fn handle_connection(stream: TcpStream, session_id: u64, config: Config) -
                             } else {
                                 warn!("could not parse execute request: {}", e);
                             }
-                            if std::env::var_os("PGSACI_LOG_SQL").is_some() {
+                            if std::env::var_os("DBSACI_LOG_SQL").is_some() {
                                 let n = payload.len().min(400);
                                 eprintln!(
-                                    "PGSACI_SQL  BAD-EXEC func=0x{:02x} len={} payload[..{}]={:02x?}",
+                                    "DBSACI_SQL  BAD-EXEC func=0x{:02x} len={} payload[..{}]={:02x?}",
                                     func_code,
                                     payload.len(),
                                     n,
@@ -1242,7 +1242,7 @@ async fn handle_connection(stream: TcpStream, session_id: u64, config: Config) -
                             }
                         };
                     log_sql_translation(&bound.sql, &pg_sql);
-                    if std::env::var("PGSACI_OCI_DEBUG").is_ok() {
+                    if std::env::var("DBSACI_OCI_DEBUG").is_ok() {
                         eprintln!(
                             "OCI-DEBUG exec func=0x{:02x} seq=0x{:02x} is_query={} is_ddl={} sql={:?} raw[0..24]={:02x?}",
                             func_code,
@@ -1690,15 +1690,15 @@ async fn handle_connection(stream: TcpStream, session_id: u64, config: Config) -
     Ok(())
 }
 
-/// When `PGSACI_LOG_SQL` is set, print every Oracle→Postgres translation to
+/// When `DBSACI_LOG_SQL` is set, print every Oracle→Postgres translation to
 /// stderr. Diagnostic only — the app integration harness turns this on to see
 /// exactly what SQL each failing query became.
 fn log_sql_translation(oracle_sql: &str, pg_sql: &str) {
-    if std::env::var_os("PGSACI_LOG_SQL").is_some() {
+    if std::env::var_os("DBSACI_LOG_SQL").is_some() {
         let o = oracle_sql.split_whitespace().collect::<Vec<_>>().join(" ");
         let p = pg_sql.split_whitespace().collect::<Vec<_>>().join(" ");
-        eprintln!("PGSACI_SQL  IN : {o}");
-        eprintln!("PGSACI_SQL  OUT: {p}");
+        eprintln!("DBSACI_SQL  IN : {o}");
+        eprintln!("DBSACI_SQL  OUT: {p}");
     }
 }
 
@@ -1797,7 +1797,7 @@ async fn race_break<T>(
 /// thick client special-cases a *received* ORA-01013 as a stale cancel and
 /// re-drives the Execute regardless. `ALTER SYSTEM CANCEL SQL` on a live
 /// server delivers it via a TCP urgent byte + a single in-band RESET marker +
-/// the error frame; PgSaci reproduces that shape, but the thick client still
+/// the error frame; DbSaci reproduces that shape, but the thick client still
 /// re-drives (its thin path and oracle-rs accept it fine). Left as a known
 /// gap — see `build_timeout_error_response_oci`.
 #[allow(clippy::too_many_arguments)]
@@ -1909,6 +1909,41 @@ fn oracle_error_for_pos(error: &Error) -> (u32, String, u16) {
         "23000" if lower.contains("check constraint") || lower.contains("constraint `ck") => 2290,
         "22000" if lower.contains("out of range") || lower.contains("data too long") => 12899,
         "22000" if lower.contains("incorrect datetime") => 1858,
+        // MariaDB SQLSTATEs (distinct from PostgreSQL's).
+        "42S02" => 942,                                 // unknown table / view
+        "42S22" => 904,                                 // unknown column
+        "42S01" => 955,                                 // table already exists
+        "21S01" => 947,                                 // column count / value count mismatch
+        "22007" if lower.contains("incorrect") => 1858, // MariaDB bad datetime literal
+        "01000" if lower.contains("truncated") => 1438, // MariaDB out-of-range → precision
+        "HY000" if lower.contains("out of range") => 1438,
+        "HY000" if lower.contains("data too long") => 12899,
+        "HY000" if lower.contains("division by 0") || lower.contains("divide by zero") => 1476,
+        "HY000" if lower.contains("incorrect datetime") || lower.contains("incorrect date") => 1858,
+        // MariaDB message-content fallbacks (SQLSTATE varies by version).
+        _ if lower.contains("doesn't exist") || lower.contains("unknown table") => 942,
+        _ if lower.contains("unknown column") => 904,
+        _ if lower.ends_with("already exists") && lower.contains("table") => 955,
+        // MariaDB: inserting a row that omits a NOT NULL column with no default.
+        _ if lower.contains("doesn't have a default value") => 1400,
+        _ if lower.contains("column count doesn't match") => 947,
+        _ if lower.contains("in select is ambiguous") || lower.contains("ambiguous") => 918,
+        _ if lower.contains("regex error") || lower.contains("regular expression") => 12726,
+        _ if lower.contains("truncated incorrect")
+            || lower.contains("incorrect decimal value")
+            || lower.contains("incorrect double value")
+            || lower.contains("incorrect integer value") =>
+        {
+            1722
+        }
+        _ if lower.contains("out of range value") => 1438,
+        _ if lower.contains("data too long") => 12899,
+        _ if lower.contains("isn't in group by")
+            || lower.contains("not in group by")
+            || lower.contains("only_full_group_by") =>
+        {
+            979
+        }
         "42000" if lower.contains("doesn't exist") || lower.contains("unknown table") => 942,
         "42000" if lower.contains("unknown column") => 904,
         "42000" if lower.contains("already exists") => 955,
@@ -2028,9 +2063,9 @@ mod tests {
 
         let metrics = get(health_port, "/metrics").await;
         assert!(metrics.contains("200 OK"));
-        assert!(metrics.contains("pgsaci_sessions_active"));
-        assert!(metrics.contains("pgsaci_statements_total"));
-        assert!(metrics.contains("# TYPE pgsaci_backend_errors_total counter"));
+        assert!(metrics.contains("dbsaci_sessions_active"));
+        assert!(metrics.contains("dbsaci_statements_total"));
+        assert!(metrics.contains("# TYPE dbsaci_backend_errors_total counter"));
 
         let sessions = get(health_port, "/sessions").await;
         assert!(sessions.contains("200 OK"));
