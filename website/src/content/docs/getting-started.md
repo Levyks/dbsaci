@@ -277,12 +277,17 @@ table created in PostgreSQL as `"Employees"` (quoted, mixed case) is not
 reachable from an Oracle client, exactly as it would not be in Oracle itself.
 
 On **MariaDB** dbSaci goes further: identifiers in table-name position are
-lowered regardless of quoting rules, so `FROM MY_TABLE` finds a lower-case
-`my_table` no matter how `lower_case_table_names` is set on the server — the
-flag is not required. Quoted mixed-case names are still respected as the
-case-sensitive escape hatch, and the session's `collation_connection` is pinned
-to the schema's default collation so client literals aggregate cleanly with the
-schema's columns.
+folded to one case regardless of quoting, via `sqlparser`'s AST rather than
+text matching, so `FROM MY_TABLE` / `FROM my_table` / `FROM "MY_TABLE"` all
+find the same backend object no matter how `lower_case_table_names` is set on
+the server — the flag is not required. `--identifier-case upper|lower` /
+`DBSACI_IDENTIFIER_CASE` picks the direction (default **`upper`**, matching
+Oracle's own unquoted-identifier behaviour — author the MariaDB schema in that
+case, or pass `lower` for the PostgreSQL/MariaDB convention). Genuinely
+mixed-case quoted names are still respected as the case-sensitive escape
+hatch, and the session's `collation_connection` is pinned to the schema's
+default collation so client literals aggregate cleanly with the schema's
+columns.
 
 ## Time zones
 

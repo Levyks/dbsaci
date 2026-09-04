@@ -13,3 +13,4 @@ pub mod wire;
 pub use backend::BackendKind;
 pub use credentials::Credentials;
 pub use server::{Config, OracleVersion, Server};
+pub use translate::IdentifierCase;

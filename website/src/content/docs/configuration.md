@@ -16,6 +16,7 @@ The flag wins when both are set. Run `dbsaci --help` for the authoritative list.
 | `--db-port <PORT>` | `DBSACI_DB_PORT` | `5432` | Backend port (`5432` PostgreSQL, `3306` MariaDB). |
 | `--db-name <NAME>` | `DBSACI_DB_NAME` | `postgres` | Backend database. Shared fallback schema when a login has no database of its own name. PostgreSQL requires `orafce`. |
 | `--oracle-version <V>` | `DBSACI_ORACLE_VERSION` | `19` | Impersonated Oracle release: `11` / `11g` / `11.2`, or `19` / `19c`. Changes the banner, `AUTH_VERSION_*`, and the auth-verifier family. |
+| `--identifier-case <upper\|lower>` | `DBSACI_IDENTIFIER_CASE` | `upper` | MariaDB only: folds table identifiers to this case (AST-based) so `lower_case_table_names` does not matter. `upper` matches Oracle's own unquoted-identifier behaviour. No effect on PostgreSQL, which folds unquoted identifiers itself. |
 | `--health-addr <ADDR>` | `DBSACI_HEALTH_ADDR` | *(off)* | `host:port` for `/healthz` + `/readyz` + `/metrics`. Unset → no health server. |
 
 ## Timeouts & lifecycle

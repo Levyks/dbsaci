@@ -18,6 +18,7 @@
 //! | `--health-addr`       | `DBSACI_HEALTH_ADDR`  | unset          | `host:port` for `/healthz` + `/readyz` |
 //! | `--shutdown-grace-ms` | `DBSACI_SHUTDOWN_GRACE_MS`    | `30000` | drain window after SIGINT/SIGTERM |
 //! | `--oracle-version`    | `DBSACI_ORACLE_VERSION`      | `19c`   | impersonated Oracle release (`11` or `19`) |
+//! | `--identifier-case`   | `DBSACI_IDENTIFIER_CASE`     | `upper` | MariaDB table-identifier folding (`upper`/`lower`); no effect on PostgreSQL |
 //!
 //! ## Credential model
 //!
@@ -33,7 +34,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use clap::{Parser, ValueEnum};
-use dbsaci::{Config, Credentials, OracleVersion, Server};
+use dbsaci::{Config, Credentials, IdentifierCase, OracleVersion, Server};
 
 /// Oracle TNS/TTC proxy in front of PostgreSQL + orafce or MariaDB.
 #[derive(Parser, Debug)]
@@ -93,6 +94,28 @@ struct Cli {
     /// Impersonated Oracle release: `11`/`11g`/`11.2` or `19`/`19c`.
     #[arg(long, env = "DBSACI_ORACLE_VERSION")]
     oracle_version: Option<String>,
+
+    /// How MariaDB table identifiers are folded — `upper` (Oracle's own
+    /// unquoted-identifier behaviour; matches a vendored `data.sql`-style
+    /// schema) or `lower` (PostgreSQL/MariaDB convention). No effect on the
+    /// PostgreSQL backend, which folds unquoted identifiers itself.
+    #[arg(long, env = "DBSACI_IDENTIFIER_CASE", value_enum)]
+    identifier_case: Option<CliIdentifierCase>,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum CliIdentifierCase {
+    Upper,
+    Lower,
+}
+
+impl From<CliIdentifierCase> for IdentifierCase {
+    fn from(c: CliIdentifierCase) -> Self {
+        match c {
+            CliIdentifierCase::Upper => IdentifierCase::Upper,
+            CliIdentifierCase::Lower => IdentifierCase::Lower,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -154,6 +177,10 @@ async fn main() {
         db_host: cli.db_host.unwrap_or(default.db_host),
         db_port: cli.db_port.unwrap_or(default.db_port),
         db_name: cli.db_name.unwrap_or(default.db_name),
+        identifier_case: cli
+            .identifier_case
+            .map(IdentifierCase::from)
+            .unwrap_or(default.identifier_case),
         credentials,
         statement_timeout: cli.statement_timeout_ms.map(Duration::from_millis),
         idle_timeout: match cli.idle_timeout_ms {

@@ -5,16 +5,95 @@
 //! unsupported Oracle-only constructs are left for the `orafce` extension or
 //! reported by PostgreSQL, instead of silently rewriting a different query.
 
+use std::ops::ControlFlow;
+
 use sqlparser::ast::helpers::attached_token::AttachedToken;
 use sqlparser::ast::{
     BinaryOperator, CaseWhen, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, Ident, Join,
     JoinConstraint, JoinOperator, LimitClause, ObjectName, ObjectNamePart, OrderBy, OrderByExpr,
     OrderByKind, Query, SelectItem, SetExpr, Statement, TableFactor, Value, ValueWithSpan,
+    visit_relations_mut,
 };
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
 
 use crate::error::{Error, Result};
+
+/// How the MariaDB backend normalizes Oracle table identifiers so a client
+/// that mixes case (`A_TABLE`, `a_table`, `"A_TABLE"` — all the same object to
+/// Oracle) reaches one consistently-cased MariaDB object regardless of the
+/// server's `lower_case_table_names` setting.
+///
+/// Oracle itself folds *unquoted* identifiers to upper case and leaves *quoted*
+/// ones exactly as written; `Upper` mirrors that (and is what `data.sql`-style
+/// vendored Oracle schemas already look like), so it is the default. Choose
+/// `Lower` when the backend schema was authored in the PostgreSQL/MariaDB
+/// convention of lower-case objects. Either way the point is consistency, not
+/// which case is "correct" — the backend schema must be authored to match.
+///
+/// PostgreSQL is not affected by this setting: it downcases unquoted
+/// identifiers itself, so a quoted-uppercase Oracle identifier already folds
+/// to a lower-case PostgreSQL one via [`fold_uppercase_quoted_identifiers`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum IdentifierCase {
+    #[default]
+    Upper,
+    Lower,
+}
+
+impl IdentifierCase {
+    fn apply(self, s: &str) -> String {
+        match self {
+            IdentifierCase::Upper => s.to_ascii_uppercase(),
+            IdentifierCase::Lower => s.to_ascii_lowercase(),
+        }
+    }
+}
+
+impl std::str::FromStr for IdentifierCase {
+    type Err = String;
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s.to_ascii_lowercase().as_str() {
+            "upper" => Ok(IdentifierCase::Upper),
+            "lower" => Ok(IdentifierCase::Lower),
+            other => Err(format!(
+                "unknown identifier case {other:?} (want upper or lower)"
+            )),
+        }
+    }
+}
+
+/// Fold every table/view identifier reachable in table-name position (`FROM`,
+/// `JOIN`, `UPDATE`, `INSERT INTO`, DDL targets, …) to `case`, via
+/// `sqlparser`'s relation visitor rather than text scanning.
+///
+/// `DUAL` (a pseudo-table, not a schema object) is left alone. An unquoted
+/// identifier is always folded — Oracle would have upshifted it regardless of
+/// how the client wrote it. A *quoted* identifier is folded only when it is
+/// already single-case (all upper or all lower): that is indistinguishable
+/// from a client that just quoted an ordinary name, whereas genuine
+/// `"MixedCase"` is Oracle's case-sensitive escape hatch and must survive
+/// untouched.
+fn fold_relation_case(statements: &mut Vec<Statement>, case: IdentifierCase) {
+    let _ = visit_relations_mut(statements, |name: &mut ObjectName| {
+        for part in &mut name.0 {
+            if let ObjectNamePart::Identifier(ident) = part
+                && !ident.value.eq_ignore_ascii_case("dual")
+                && (ident.quote_style.is_none() || is_single_case(&ident.value))
+            {
+                ident.value = case.apply(&ident.value);
+            }
+        }
+        ControlFlow::<()>::Continue(())
+    });
+}
+
+/// `true` if `s` has no letters of the non-dominant case — i.e. it reads as a
+/// plain unquoted-style identifier (`FOO`, `foo`, `foo_2`) rather than a
+/// deliberately mixed-case one (`FooBar`).
+fn is_single_case(s: &str) -> bool {
+    !(s.bytes().any(|b| b.is_ascii_uppercase()) && s.bytes().any(|b| b.is_ascii_lowercase()))
+}
 
 /// Separator the MariaDB translator uses when a single Oracle statement must be
 /// executed as several MariaDB statements (multi-event trigger, `INSERT ALL`).
@@ -114,11 +193,17 @@ fn parse_query(sql: &str) -> Result<Query> {
         })
 }
 
-/// Translate Oracle SQL for the selected database engine.
-pub fn oracle_to_backend(sql: &str, backend: crate::backend::BackendKind) -> Result<String> {
+/// Translate Oracle SQL for the selected database engine. `identifier_case`
+/// only affects the MariaDB backend (see [`IdentifierCase`]); PostgreSQL folds
+/// unquoted identifiers itself.
+pub fn oracle_to_backend(
+    sql: &str,
+    backend: crate::backend::BackendKind,
+    identifier_case: IdentifierCase,
+) -> Result<String> {
     match backend {
         crate::backend::BackendKind::Postgres => oracle_to_postgres(sql),
-        crate::backend::BackendKind::MariaDb => oracle_to_mariadb(sql),
+        crate::backend::BackendKind::MariaDb => oracle_to_mariadb_with_case(sql, identifier_case),
     }
 }
 
@@ -672,6 +757,12 @@ fn rewrite_numto_interval_arith(sql: &str) -> String {
 /// Keep this deliberately conservative: MariaDB-specific rewrites should be
 /// added only when a corpus case demonstrates that Oracle mode needs help.
 pub fn oracle_to_mariadb(sql: &str) -> Result<String> {
+    oracle_to_mariadb_with_case(sql, IdentifierCase::default())
+}
+
+/// See [`oracle_to_mariadb`]. `identifier_case` controls how table identifiers
+/// are folded — see [`IdentifierCase`].
+pub fn oracle_to_mariadb_with_case(sql: &str, identifier_case: IdentifierCase) -> Result<String> {
     let sql = sql.trim().trim_end_matches(';');
 
     // `ALTER SESSION SET x = y` — MariaDB has no such statement. Map the few
@@ -773,25 +864,34 @@ pub fn oracle_to_mariadb(sql: &str) -> Result<String> {
         sql
     };
 
-    // Oracle up-shifts unquoted identifiers; MariaDB (unlike PostgreSQL) does not
-    // fold table names at all, so `FROM A_TABLE` misses a lower-case table unless
-    // the server runs `lower_case_table_names=1`. Fold identifiers in table-name
-    // position to lower case here so the backend schema can be authored in the
-    // natural lower-case form regardless of that server flag. Only table
-    // positions are touched — column and alias resolution is already
-    // case-insensitive in MariaDB — and quoted identifiers (`"X"`, `` `x` ``)
-    // are left exactly as written, as the deliberate case-sensitive escape hatch.
-    let sql = lowercase_mariadb_table_refs(&sql);
+    // MariaDB (unlike PostgreSQL) does not fold table names at all, so a client
+    // that mixes `A_TABLE` / `a_table` / `"A_TABLE"` (all one object to Oracle)
+    // misses a table unless the server runs `lower_case_table_names=1`. Fold
+    // identifiers in table-name position to `identifier_case` instead, so the
+    // backend schema can be authored consistently regardless of that flag.
+    // AST-based (via sqlparser's relation visitor) whenever the statement
+    // parses; falls back to a text scan for the syntax sqlparser 0.62 does not
+    // represent (anonymous PL/SQL blocks, some DDL bodies).
+    let sql = match Parser::parse_sql(&GenericDialect {}, &sql) {
+        Ok(mut statements) if statements.len() == 1 => {
+            fold_relation_case(&mut statements, identifier_case);
+            statements[0].to_string()
+        }
+        _ => fold_mariadb_table_refs_textual(&sql, identifier_case),
+    };
 
     Ok(sql)
 }
 
-/// Lower-case every identifier that sits in table-name position: the name (and
-/// any `schema.` qualifier) right after `FROM` / `JOIN` / `STRAIGHT_JOIN` /
-/// `UPDATE` / `INSERT INTO` / `DELETE FROM` / `TABLE`, including each entry of a
-/// comma-separated table list. Strings, comments and quoted identifiers pass
-/// through untouched.
-fn lowercase_mariadb_table_refs(sql: &str) -> String {
+/// Text-scan fallback for [`oracle_to_mariadb_with_case`] when the statement
+/// does not round-trip through `sqlparser` (anonymous PL/SQL blocks, trigger /
+/// procedure bodies, and other syntax sqlparser 0.62 does not represent).
+/// Folds the identifier (and any `schema.` qualifier) right after `FROM` /
+/// `JOIN` / `STRAIGHT_JOIN` / `UPDATE` / `INSERT INTO` / `DELETE FROM` /
+/// `TABLE` / `VIEW` / `REFERENCES`, including each entry of a comma-separated
+/// table list. Strings, comments and quoted identifiers pass through
+/// untouched; `DUAL` is left alone.
+fn fold_mariadb_table_refs_textual(sql: &str, case: IdentifierCase) -> String {
     let bytes = sql.as_bytes();
     let mut out = String::with_capacity(sql.len());
     let mut i = 0;
@@ -856,7 +956,7 @@ fn lowercase_mariadb_table_refs(sql: &str) -> String {
                     out.push_str(word);
                     expect_table = false;
                 } else if expect_table {
-                    out.push_str(&word.to_ascii_lowercase());
+                    out.push_str(&case.apply(word));
                     // consume a dotted chain: `schema.table`
                     loop {
                         let mut j = i;
@@ -876,7 +976,7 @@ fn lowercase_mariadb_table_refs(sql: &str) -> String {
                         while i < bytes.len() && is_ident(bytes[i]) {
                             i += 1;
                         }
-                        out.push_str(&sql[seg..i].to_ascii_lowercase());
+                        out.push_str(&case.apply(&sql[seg..i]));
                     }
                     expect_table = false;
                 } else {
@@ -2394,7 +2494,7 @@ mod mariadb_tests {
     fn rewrites_postgres_ordered_string_agg_for_mariadb() {
         assert_eq!(
             oracle_to_mariadb("SELECT STRING_AGG(name, ',' ORDER BY id) FROM people").unwrap(),
-            "SELECT GROUP_CONCAT(name ORDER BY id SEPARATOR ',') FROM people"
+            "SELECT GROUP_CONCAT(name ORDER BY id SEPARATOR ',') FROM PEOPLE"
         );
     }
 
@@ -2405,7 +2505,7 @@ mod mariadb_tests {
                 "SELECT LISTAGG(name, ', ') WITHIN GROUP (ORDER BY id) FROM people WHERE team_id = 1"
             )
             .unwrap(),
-            "SELECT GROUP_CONCAT(name ORDER BY id SEPARATOR ', ') FROM people WHERE team_id = 1"
+            "SELECT GROUP_CONCAT(name ORDER BY id SEPARATOR ', ') FROM PEOPLE WHERE team_id = 1"
         );
     }
 
@@ -2426,11 +2526,11 @@ mod mariadb_tests {
         assert_eq!(
             oracle_to_mariadb("SELECT TO_CHAR(SYSTIMESTAMP, 'YYYY-MM-DD\"T\"HH24:MI:SS') FROM t")
                 .unwrap(),
-            "SELECT DATE_FORMAT(CURRENT_TIMESTAMP(6), '%Y-%m-%dT%H:%i:%s') FROM t"
+            "SELECT DATE_FORMAT(CURRENT_TIMESTAMP(6), '%Y-%m-%dT%H:%i:%s') FROM T"
         );
         assert_eq!(
             oracle_to_mariadb("SELECT TO_CHAR(amount, 'FM999,999.00') FROM t").unwrap(),
-            "SELECT FORMAT(amount, 2, 'en_US') FROM t"
+            "SELECT FORMAT(amount, 2, 'en_US') FROM T"
         );
     }
 
@@ -2442,7 +2542,7 @@ mod mariadb_tests {
         );
         assert_eq!(
             oracle_to_mariadb("SELECT people.name FROM people, dual WHERE people.id = 1").unwrap(),
-            "SELECT people.name FROM people WHERE people.id = 1"
+            "SELECT people.name FROM PEOPLE WHERE people.id = 1"
         );
     }
 
@@ -2474,11 +2574,11 @@ mod mariadb_tests {
         // Not a hardcoded query: the month count is computed from `<y>-<m>`.
         assert_eq!(
             oracle_to_mariadb("SELECT hire_date + INTERVAL '2-3' YEAR TO MONTH FROM emp").unwrap(),
-            "SELECT hire_date + INTERVAL 27 MONTH FROM emp"
+            "SELECT hire_date + INTERVAL 27 MONTH FROM EMP"
         );
         assert_eq!(
             oracle_to_mariadb("SELECT d - INTERVAL '-1-6' YEAR TO MONTH FROM t").unwrap(),
-            "SELECT d - INTERVAL -18 MONTH FROM t"
+            "SELECT d - INTERVAL -18 MONTH FROM T"
         );
     }
 
@@ -2502,7 +2602,7 @@ mod mariadb_tests {
                 "SELECT EXTRACT(DAY FROM (TIMESTAMP '2020-02-01 00:00:00' - t.start_ts)) FROM t"
             )
             .unwrap(),
-            "SELECT DATEDIFF('2020-02-01 00:00:00', t.start_ts) FROM t"
+            "SELECT DATEDIFF('2020-02-01 00:00:00', t.start_ts) FROM T"
         );
     }
 
@@ -2521,12 +2621,12 @@ mod mariadb_tests {
     fn mariadb_reserved_words_are_quoted_only_as_identifiers() {
         assert_eq!(
             oracle_to_mariadb("SELECT t.body, rank FROM doc t").unwrap(),
-            "SELECT t.`body`, `rank` FROM doc t"
+            "SELECT t.`body`, `rank` FROM DOC t"
         );
         // A same-named function call is left alone.
         assert_eq!(
             oracle_to_mariadb("SELECT RANK() OVER (ORDER BY x) FROM t").unwrap(),
-            "SELECT RANK() OVER (ORDER BY x) FROM t"
+            "SELECT RANK() OVER (ORDER BY x) FROM T"
         );
     }
 }

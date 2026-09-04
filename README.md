@@ -145,11 +145,21 @@ Oracle's *schema == user*.
 
 ### Identifiers and collation (MariaDB)
 
-Identifiers in table-name position are folded to lower case, so `FROM MY_TABLE`
-resolves against a lower-case `my_table` no matter how `lower_case_table_names`
-is set on the server. Quoted identifiers (`"MixedCase"`, `` `MixedCase` ``) are
-left exactly as written — the deliberate case-sensitive escape hatch. The
-session's `collation_connection` is pinned to the current schema's default
+Identifiers in table-name position are folded to one case — via `sqlparser`'s
+relation visitor, falling back to a text scan only for syntax it cannot
+represent (anonymous PL/SQL blocks, some DDL bodies) — so `FROM MY_TABLE` /
+`FROM my_table` / `FROM "MY_TABLE"` all resolve the same backend object no
+matter how `lower_case_table_names` is set on the server. `--identifier-case
+upper|lower` / `DBSACI_IDENTIFIER_CASE` picks the direction; **`upper` is the
+default**, matching Oracle's own unquoted-identifier behaviour (and how a
+vendored `data.sql`-style schema is already spelled) — author the MariaDB
+schema in that case, or pass `lower` to match the PostgreSQL/MariaDB
+convention instead. Genuinely mixed-case quoted identifiers (`"MixedCase"`,
+`` `MixedCase` ``) are left exactly as written — the deliberate case-sensitive
+escape hatch — and `DUAL` is never touched. This has no effect on the
+PostgreSQL backend, which folds unquoted identifiers to lower case itself.
+
+The session's `collation_connection` is pinned to the current schema's default
 collation so string literals in client SQL aggregate cleanly with the schema's
 columns (no `ER_CANT_AGGREGATE_2COLLATIONS` against `utf8mb4_uca1400_ai_ci`).
 
