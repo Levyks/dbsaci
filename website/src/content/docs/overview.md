@@ -51,7 +51,7 @@ to stay exactly as they are.
 ## Requirements
 
 - **PostgreSQL** (a recent release) with the **`orafce`** extension available
-  (`CREATE EXTENSION orafce`), or **MariaDB 11.4+** with `SQL_MODE=ORACLE`.
+  (`CREATE EXTENSION orafce`), or **MariaDB 11.4+** (dbSaci enables `SQL_MODE=ORACLE` per session).
 - A login role on the selected backend for the proxy to connect as. **One
   Oracle session maps to one dedicated backend connection**, so size the
   backend connection capacity accordingly.

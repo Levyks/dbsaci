@@ -17,6 +17,10 @@ use crate::wire::{BindValue, ColumnMeta, encode_oracle_number_decimal};
 pub struct MariaDbBackend {
     /// The `mysql://` URL, kept so a dropped connection can be rebuilt.
     url: String,
+    /// Schema this session resolves unqualified names in: the Oracle login name
+    /// when a database of that name exists (Oracle's schema == user), otherwise
+    /// the configured default database. Re-applied on every reconnect.
+    schema: String,
     conn: tokio::sync::Mutex<Conn>,
     /// Oracle defines CURRVAL per session and rejects it before that session
     /// has requested NEXTVAL. MariaDB's Oracle mode instead yields a value.
@@ -390,27 +394,53 @@ impl MariaDbBackend {
         password: &str,
         database: &str,
     ) -> Result<Self> {
+        let user = user.to_lowercase();
+        // Connect without a default database so `establish` can resolve the
+        // effective schema (Oracle's schema == user) against `information_schema`.
         let url = format!(
-            "mysql://{}:{}@{}:{}/{}",
+            "mysql://{}:{}@{}:{}",
             // Oracle usernames are case-insensitive and the server passes the
             // authenticated name in uppercase; MariaDB account names are not.
-            urlencoding(&user.to_lowercase()),
+            urlencoding(&user),
             urlencoding(password),
             host,
             port,
-            urlencoding(database),
         );
-        let conn = Self::establish(&url).await?;
+        // Prefer a database named after the Oracle login; fall back to the
+        // configured one. `USE` is exclusive in MariaDB (no `search_path`), so
+        // this is a choice of exactly one, not a lookup chain.
+        let schema = {
+            let probe_opts = Opts::from_url(&format!("{url}/{}", urlencoding(database)))
+                .map_err(|e| Error::Postgres(format!("invalid MariaDB connection URL: {e}")))?;
+            let mut probe = Conn::new(probe_opts)
+                .await
+                .map_err(|e| Error::Postgres(format!("MariaDB connection failed: {e}")))?;
+            let found: Option<String> = probe
+                .exec_first(
+                    "SELECT SCHEMA_NAME FROM information_schema.SCHEMATA WHERE SCHEMA_NAME = ?",
+                    (&user,),
+                )
+                .await
+                .ok()
+                .flatten();
+            let _ = probe.disconnect().await;
+            found.unwrap_or_else(|| database.to_string())
+        };
+
+        let conn = Self::establish(&url, &schema).await?;
         Ok(Self {
             url,
+            schema,
             conn: tokio::sync::Mutex::new(conn),
             sequences_with_currval: tokio::sync::Mutex::new(HashSet::new()),
         })
     }
 
     /// Open a fresh MariaDB connection with Oracle mode, the `information_schema`
-    /// facade, the compat functions, and an open transaction.
-    async fn establish(url: &str) -> Result<Conn> {
+    /// facade, the compat functions, and an open transaction. `schema` is the
+    /// database unqualified names resolve in; re-applied here so a reconnect
+    /// keeps it.
+    async fn establish(url: &str, schema: &str) -> Result<Conn> {
         let opts = Opts::from_url(url)
             .map_err(|e| Error::Postgres(format!("invalid MariaDB connection URL: {e}")))?;
         let mut conn = Conn::new(opts)
@@ -422,9 +452,26 @@ impl MariaDbBackend {
         conn.query_drop(SESSION_SQL_MODE)
             .await
             .map_err(|e| Error::Postgres(format!("MariaDB Oracle mode failed: {e}")))?;
+        // Oracle's schema == user: resolve unqualified names in the login's own
+        // database when it exists. Best-effort — a session with no such schema
+        // and no default simply qualifies its names.
+        if !schema.is_empty() {
+            let use_stmt = format!("USE `{}`", schema.replace('`', "``"));
+            if let Err(e) = conn.query_drop(&use_stmt).await {
+                tracing::warn!("could not `USE {schema}` ({e}); names resolve unqualified");
+            }
+        }
         conn.query_drop("SET NAMES utf8mb4")
             .await
             .map_err(|e| Error::Postgres(format!("MariaDB charset setup failed: {e}")))?;
+        // Pin the connection collation to the current schema's default so string
+        // literals in client SQL aggregate cleanly with the schema's columns.
+        // Without this a `utf8mb4_general_ci` connection default (some drivers)
+        // trips ER_CANT_AGGREGATE_2COLLATIONS against `utf8mb4_uca1400_ai_ci`
+        // columns (the MariaDB 11.5+ table default).
+        conn.query_drop("SET collation_connection = @@collation_database")
+            .await
+            .ok();
         // `SQL_MODE=ORACLE` supplies syntax and built-ins but not Oracle's data
         // dictionary or a few session functions. Install a portable facade over
         // `information_schema`. Best-effort: a role without the rights to create
@@ -457,7 +504,7 @@ impl MariaDbBackend {
                     return Err(e);
                 }
                 tracing::warn!("MariaDB connection lost ({e}); reconnecting");
-                *conn = Self::establish(&self.url).await?;
+                *conn = Self::establish(&self.url, &self.schema).await?;
                 conn.query_drop("SELECT 1")
                     .await
                     .map_err(|e| Error::Postgres(format!("MariaDB query failed: {e}")))
@@ -503,7 +550,7 @@ impl OracleBackend for Arc<MariaDbBackend> {
             match fetch_all(&mut conn, sql, binds).await {
                 Err(ref e) if is_connection_lost(e) => {
                     tracing::warn!("MariaDB connection lost ({e}); reconnecting and retrying once");
-                    *conn = MariaDbBackend::establish(&self.url).await?;
+                    *conn = MariaDbBackend::establish(&self.url, &self.schema).await?;
                     fetch_all(&mut conn, sql, binds).await?
                 }
                 other => other?,

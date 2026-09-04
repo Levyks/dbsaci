@@ -4,12 +4,12 @@ description: Run dbSaci in front of PostgreSQL or MariaDB and connect an Oracle 
 ---
 
 dbSaci needs either PostgreSQL with the [`orafce`](https://github.com/orafce/orafce)
-extension available, or MariaDB 11.4+ with `SQL_MODE=ORACLE`, plus a login role
-for the proxy to use. Below, "the client" is any supported Oracle driver.
+extension available, or MariaDB 11.4+ (dbSaci sets `SQL_MODE=ORACLE` on each
+session itself), plus a login role for the proxy to use. Below, "the client" is any supported Oracle driver.
 
 :::note[Getting the image / binary]
-`docker pull levyks/dbsaci:0.1.0` — a **~12 MB** image (a static musl binary on
-`scratch`; dbSaci has no C dependencies). It is also buildable from the repo's
+`docker pull levyks/dbsaci:0.1.1` — a small [distroless](https://github.com/GoogleContainerTools/distroless)
+image (glibc + CA roots + the dbSaci binary; no shell, no package manager). It is also buildable from the repo's
 [`Dockerfile`](https://github.com/Levyks/dbsaci/blob/main/Dockerfile), and
 [building from source](#option-e--build-from-source) is a single `cargo build`.
 Pre-built stand-alone binaries, when published, land on the
@@ -39,14 +39,14 @@ services:
     ports: ["5432:5432"]
 
   dbsaci:
-    image: levyks/dbsaci:0.1.0
+    image: levyks/dbsaci:0.1.1
     depends_on: [postgres]
     environment:
       DBSACI_LISTEN: 0.0.0.0:1521
-      DBSACI_PG_HOST: postgres
-      DBSACI_PG_PORT: "5432"
-      DBSACI_PG_DB: appdb
-      DBSACI_PG_PASSWORD: pgpw
+      DBSACI_DB_HOST: postgres
+      DBSACI_DB_PORT: "5432"
+      DBSACI_DB_NAME: appdb
+      DBSACI_DB_PASSWORD: pgpw
       DBSACI_ORACLE_VERSION: "19"     # or "11"
       DBSACI_HEALTH_ADDR: 0.0.0.0:9500
     ports:
@@ -67,13 +67,13 @@ PostgreSQL role and password (here `postgres` / `pgpw` — see
 ```bash
 docker run --rm -p 1521:1521 -p 9500:9500 \
   -e DBSACI_LISTEN=0.0.0.0:1521 \
-  -e DBSACI_PG_HOST=host.docker.internal \
-  -e DBSACI_PG_PORT=5432 \
-  -e DBSACI_PG_DB=appdb \
-  -e DBSACI_PG_PASSWORD=pgpw \
+  -e DBSACI_DB_HOST=host.docker.internal \
+  -e DBSACI_DB_PORT=5432 \
+  -e DBSACI_DB_NAME=appdb \
+  -e DBSACI_DB_PASSWORD=pgpw \
   -e DBSACI_ORACLE_VERSION=19 \
   -e DBSACI_HEALTH_ADDR=0.0.0.0:9500 \
-  levyks/dbsaci:0.1.0
+  levyks/dbsaci:0.1.1
 ```
 
 Your PostgreSQL must have `orafce` installed in the target database
@@ -81,28 +81,25 @@ Your PostgreSQL must have `orafce` installed in the target database
 
 ## Option C — MariaDB backend
 
-MariaDB 11.4+ supplies an Oracle compatibility mode. dbSaci enables the mode on
-each backend session and adds rewrites for the Oracle constructs MariaDB does
-not implement itself:
+MariaDB 11.4+ supplies an Oracle compatibility mode. dbSaci enables it on each
+backend session (no server `sql-mode` needed), folds table identifiers to lower
+case, and adds rewrites for the Oracle constructs MariaDB does not implement
+itself:
 
 ```bash
 docker run -d --name dbsaci-mariadb \
   -e MARIADB_ROOT_PASSWORD=root \
   -e MARIADB_DATABASE=appdb \
   -e MARIADB_USER=appuser -e MARIADB_PASSWORD=apppw \
-  -p 3306:3306 mariadb:11.4 --sql-mode=ORACLE
+  -p 3306:3306 mariadb:11.4
 
 DBSACI_BACKEND=mariadb \
 DBSACI_LISTEN=0.0.0.0:1521 \
-DBSACI_PG_HOST=127.0.0.1 DBSACI_PG_PORT=3306 \
-DBSACI_PG_DB=appdb DBSACI_PG_PASSWORD=apppw \
+DBSACI_DB_HOST=127.0.0.1 DBSACI_DB_PORT=3306 \
+DBSACI_DB_NAME=appdb DBSACI_DB_PASSWORD=apppw \
 cargo run --release --bin dbsaci
 ```
 
-The `PG` names in the backend connection options are retained for command-line
-compatibility; in MariaDB mode they identify the MariaDB host, port, database,
-and password. See the [compatibility matrix](/dbsaci/compatibility/) for the
-feature-by-feature PostgreSQL/MariaDB comparison.
 
 ## Option D — Binary from GitHub Releases
 
@@ -112,8 +109,8 @@ Download the archive for your platform from the
 ```bash
 ./dbsaci \
   --listen 0.0.0.0:1521 \
-  --pg-host 127.0.0.1 --pg-port 5432 \
-  --pg-db appdb --pg-password pgpw \
+  --db-host 127.0.0.1 --db-port 5432 \
+  --db-name appdb --db-password pgpw \
   --oracle-version 19 \
   --health-addr 127.0.0.1:9500
 ```
@@ -132,8 +129,8 @@ docker build -t dbsaci-test-pg:18 testcontainers
 docker run -d -e POSTGRES_PASSWORD=postgres -P dbsaci-test-pg:18
 
 DBSACI_LISTEN=0.0.0.0:1521 \
-DBSACI_PG_HOST=127.0.0.1 DBSACI_PG_PORT=<mapped-port> \
-DBSACI_PG_DB=postgres DBSACI_PG_PASSWORD=postgres \
+DBSACI_DB_HOST=127.0.0.1 DBSACI_DB_PORT=<mapped-port> \
+DBSACI_DB_NAME=postgres DBSACI_DB_PASSWORD=postgres \
 cargo run --release --bin dbsaci
 ```
 
@@ -181,15 +178,15 @@ would use against PostgreSQL directly:
 
 ```bash
 dbsaci \
-  --pg-user alice:s3cret --pg-user bob:hunter2 \   # repeatable, CLI only
-  --pg-users-file /etc/dbsaci/users              \ # file of user:password lines
-  --pg-password postgres                           # fallback for anyone not listed
+  --db-user alice:s3cret --db-user bob:hunter2 \   # repeatable, CLI only
+  --db-users-file /etc/dbsaci/users              \ # file of user:password lines
+  --db-password postgres                           # fallback for anyone not listed
 ```
 
-Environment equivalents: `DBSACI_PG_USERS="alice:s3cret,bob:hunter2"`,
-`DBSACI_PG_USERS_FILE=...`, `DBSACI_PG_PASSWORD=...`.
+Environment equivalents: `DBSACI_DB_USERS="alice:s3cret,bob:hunter2"`,
+`DBSACI_DB_USERS_FILE=...`, `DBSACI_DB_PASSWORD=...`.
 
-Sources layer **file &lt; `DBSACI_PG_USERS` &lt; `--pg-user`**. The username is
+Sources layer **file &lt; `DBSACI_DB_USERS` &lt; `--db-user`**. The username is
 matched case-insensitively; a user with no match and no fallback is rejected with
 `ORA-01017`. The matched password drives both the login challenge and the backend
 PostgreSQL connection.
@@ -212,6 +209,12 @@ PostgreSQL schema named after the user exists (`CREATE SCHEMA IF NOT EXISTS
 
 If the backend role lacks `CREATE` on the database the connection still
 succeeds; objects then resolve via `oracle` / `public` and a warning is logged.
+
+On **MariaDB** a database *is* the schema and `USE` selects exactly one (there is
+no `search_path`). dbSaci issues `USE <user>` when a database of that name
+exists, otherwise `USE <DBSACI_DB_NAME>`. Give each Oracle login its own
+database, or point every login at one shared `DBSACI_DB_NAME` and qualify
+cross-schema references. `ALTER SESSION SET CURRENT_SCHEMA = x` maps to `USE x`.
 
 ## Provisioning (read-only / least-privilege roles)
 
@@ -272,6 +275,14 @@ case-sensitive on both sides, as they are in Oracle.
 The practical rule: **use lower-case identifiers in the target schema.** A
 table created in PostgreSQL as `"Employees"` (quoted, mixed case) is not
 reachable from an Oracle client, exactly as it would not be in Oracle itself.
+
+On **MariaDB** dbSaci goes further: identifiers in table-name position are
+lowered regardless of quoting rules, so `FROM MY_TABLE` finds a lower-case
+`my_table` no matter how `lower_case_table_names` is set on the server — the
+flag is not required. Quoted mixed-case names are still respected as the
+case-sensitive escape hatch, and the session's `collation_connection` is pinned
+to the schema's default collation so client literals aggregate cleanly with the
+schema's columns.
 
 ## Time zones
 

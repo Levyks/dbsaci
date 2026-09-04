@@ -295,9 +295,9 @@ impl TestBackend {
             let _ = Server::new(DbSaciConfig {
                 backend: dbsaci::BackendKind::Postgres,
                 listen_addr: format!("127.0.0.1:{proxy_port}"),
-                pg_host: host,
-                pg_port: port,
-                pg_db: "postgres".into(),
+                db_host: host,
+                db_port: port,
+                db_name: "postgres".into(),
                 credentials: dbsaci::Credentials::with_fallback(CORPUS_USER),
                 // Exercise the proxy's per-statement timeout while leaving
                 // ordinary corpus queries ample time to run.
@@ -440,9 +440,9 @@ impl TestBackend {
             let _ = Server::new(DbSaciConfig {
                 backend: dbsaci::BackendKind::MariaDb,
                 listen_addr: format!("127.0.0.1:{proxy_port}"),
-                pg_host: backend_host,
-                pg_port: port,
-                pg_db: "corpus".into(),
+                db_host: backend_host,
+                db_port: port,
+                db_name: "corpus".into(),
                 credentials: dbsaci::Credentials::with_fallback(CORPUS_USER),
                 statement_timeout: Some(Duration::from_secs(2)),
                 idle_timeout: Some(Duration::from_secs(30)),

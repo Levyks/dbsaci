@@ -1,17 +1,17 @@
-//! Per-user PostgreSQL credentials.
+//! Per-user backend credentials.
 //!
 //! An Oracle client authenticates with a challenge/response: the password never
 //! crosses the wire, only a proof derived from it. DbSaci therefore has to
 //! *already know* the password so it can (a) run the same derivation and verify
-//! the client's proof, and (b) open the backend PostgreSQL connection with it.
+//! the client's proof, and (b) open the backend connection with it.
 //!
-//! The model is a pre-declared list of `pg_user -> pg_password` pairs (from a
-//! file, `DBSACI_PG_USERS`, and/or repeated `--pg-user` flags). On login DbSaci
-//! looks the Oracle username up in that list (case-insensitively — PostgreSQL
+//! The model is a pre-declared list of `user -> password` pairs (from a
+//! file, `DBSACI_DB_USERS`, and/or repeated `--db-user` flags). On login DbSaci
+//! looks the Oracle username up in that list (case-insensitively — the backend
 //! folds unquoted role names to lower case) and runs the challenge with the
 //! matching password, so an Oracle client logs in with the *same* credentials
-//! it would use for PostgreSQL directly. A user absent from the list falls back
-//! to the single `pg_password` / `DBSACI_PG_PASSWORD` if one is set, and is
+//! it would use for the backend directly. A user absent from the list falls back
+//! to the single `DBSACI_DB_PASSWORD` if one is set, and is
 //! rejected with ORA-01017 otherwise.
 
 use std::collections::HashMap;

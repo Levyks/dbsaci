@@ -773,7 +773,136 @@ pub fn oracle_to_mariadb(sql: &str) -> Result<String> {
         sql
     };
 
+    // Oracle up-shifts unquoted identifiers; MariaDB (unlike PostgreSQL) does not
+    // fold table names at all, so `FROM A_TABLE` misses a lower-case table unless
+    // the server runs `lower_case_table_names=1`. Fold identifiers in table-name
+    // position to lower case here so the backend schema can be authored in the
+    // natural lower-case form regardless of that server flag. Only table
+    // positions are touched — column and alias resolution is already
+    // case-insensitive in MariaDB — and quoted identifiers (`"X"`, `` `x` ``)
+    // are left exactly as written, as the deliberate case-sensitive escape hatch.
+    let sql = lowercase_mariadb_table_refs(&sql);
+
     Ok(sql)
+}
+
+/// Lower-case every identifier that sits in table-name position: the name (and
+/// any `schema.` qualifier) right after `FROM` / `JOIN` / `STRAIGHT_JOIN` /
+/// `UPDATE` / `INSERT INTO` / `DELETE FROM` / `TABLE`, including each entry of a
+/// comma-separated table list. Strings, comments and quoted identifiers pass
+/// through untouched.
+fn lowercase_mariadb_table_refs(sql: &str) -> String {
+    let bytes = sql.as_bytes();
+    let mut out = String::with_capacity(sql.len());
+    let mut i = 0;
+    // `true` once we have just seen a table-introducing keyword (or a comma that
+    // continues a table list) and are waiting for the identifier chain.
+    let mut expect_table = false;
+
+    let is_ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b == b'$' || b == b'#';
+
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\'' | b'"' | b'`' => {
+                let end = skip_quoted(sql, i);
+                out.push_str(&sql[i..end]);
+                i = end;
+                expect_table = false;
+            }
+            b'-' if bytes.get(i + 1) == Some(&b'-') => {
+                let end = bytes[i..]
+                    .iter()
+                    .position(|&b| b == b'\n')
+                    .map_or(bytes.len(), |o| i + o);
+                out.push_str(&sql[i..end]);
+                i = end;
+            }
+            b'/' if bytes.get(i + 1) == Some(&b'*') => {
+                let end = bytes[i + 2..]
+                    .windows(2)
+                    .position(|w| w == b"*/")
+                    .map_or(bytes.len(), |o| i + 4 + o);
+                out.push_str(&sql[i..end]);
+                i = end;
+            }
+            b if b.is_ascii_whitespace() => {
+                out.push(b as char);
+                i += 1;
+            }
+            b',' if expect_table => {
+                // comma inside a table list — the next identifier is still a table
+                out.push(',');
+                i += 1;
+            }
+            b':' | b'@' => {
+                // bind placeholder / user variable — copy the sigil and its name
+                out.push(bytes[i] as char);
+                i += 1;
+                while i < bytes.len() && is_ident(bytes[i]) {
+                    out.push(bytes[i] as char);
+                    i += 1;
+                }
+                expect_table = false;
+            }
+            b if is_ident(b) && !b.is_ascii_digit() => {
+                let start = i;
+                while i < bytes.len() && is_ident(bytes[i]) {
+                    i += 1;
+                }
+                let word = &sql[start..i];
+                if expect_table && word.eq_ignore_ascii_case("DUAL") {
+                    // `DUAL` is a pseudo-table, not a schema object — leave its
+                    // case (and any following real FROM item) alone.
+                    out.push_str(word);
+                    expect_table = false;
+                } else if expect_table {
+                    out.push_str(&word.to_ascii_lowercase());
+                    // consume a dotted chain: `schema.table`
+                    loop {
+                        let mut j = i;
+                        while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                            j += 1;
+                        }
+                        if bytes.get(j) != Some(&b'.') {
+                            break;
+                        }
+                        j += 1;
+                        while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                            j += 1;
+                        }
+                        out.push_str(&sql[i..j]);
+                        i = j;
+                        let seg = i;
+                        while i < bytes.len() && is_ident(bytes[i]) {
+                            i += 1;
+                        }
+                        out.push_str(&sql[seg..i].to_ascii_lowercase());
+                    }
+                    expect_table = false;
+                } else {
+                    out.push_str(word);
+                    let u = word.to_ascii_uppercase();
+                    expect_table = matches!(
+                        u.as_str(),
+                        "FROM"
+                            | "JOIN"
+                            | "STRAIGHT_JOIN"
+                            | "UPDATE"
+                            | "TABLE"
+                            | "VIEW"
+                            | "INTO"
+                            | "REFERENCES"
+                    );
+                }
+            }
+            b => {
+                out.push(b as char);
+                i += 1;
+                expect_table = false;
+            }
+        }
+    }
+    out
 }
 
 /// Lower the portable subset of Oracle `INSERT ALL` / `INSERT FIRST` to one

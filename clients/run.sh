@@ -81,8 +81,8 @@ done
 echo "== building + starting dbsaci =="
 cargo build --quiet --bin dbsaci
 export DBSACI_LISTEN="127.0.0.1:${listen_port}"
-export DBSACI_PG_HOST=127.0.0.1 DBSACI_PG_PORT="$pg_port"
-export DBSACI_PG_DB=postgres DBSACI_PG_PASSWORD=corpus
+export DBSACI_DB_HOST=127.0.0.1 DBSACI_DB_PORT="$pg_port"
+export DBSACI_DB_NAME=postgres DBSACI_DB_PASSWORD=corpus
 export DBSACI_HEALTH_ADDR="127.0.0.1:${health_port}"
 # Mirror tests/corpus.rs: a 2 s per-statement cap so the corpus's
 # `statement_timeout_is_user_cancel` case surfaces ORA-01013.

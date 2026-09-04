@@ -6,13 +6,13 @@
 //! | flag | env | default | meaning |
 //! | --- | --- | --- | --- |
 //! | `--listen`            | `DBSACI_LISTEN`        | `0.0.0.0:1521` | Oracle TNS listen address |
-//! | `--pg-host`           | `DBSACI_PG_HOST`       | `localhost`   | PostgreSQL host |
-//! | `--pg-port`           | `DBSACI_PG_PORT`       | `5432`        | PostgreSQL port |
-//! | `--pg-db`             | `DBSACI_PG_DB`         | `postgres`    | PostgreSQL database |
-//! | `--pg-password`       | `DBSACI_PG_PASSWORD`   | `postgres`    | fallback password for users not in the list |
-//! | `--pg-user u:p`       | —                     | —             | one `user:password` pair; repeatable |
-//! | `--pg-users`          | `DBSACI_PG_USERS`     | —             | comma-separated `user:password,user:password` |
-//! | `--pg-users-file`     | `DBSACI_PG_USERS_FILE`| —             | file of `user:password` lines (`#` comments ok) |
+//! | `--db-host`           | `DBSACI_DB_HOST`       | `localhost`   | backend host (PostgreSQL or MariaDB) |
+//! | `--db-port`           | `DBSACI_DB_PORT`       | `5432`/`3306` | backend port |
+//! | `--db-name`             | `DBSACI_DB_NAME`         | `postgres`    | backend database/schema |
+//! | `--db-password`       | `DBSACI_DB_PASSWORD`   | `postgres`    | fallback password for users not in the list |
+//! | `--db-user u:p`       | —                     | —             | one `user:password` pair; repeatable |
+//! | `--db-users`          | `DBSACI_DB_USERS`     | —             | comma-separated `user:password,user:password` |
+//! | `--db-users-file`     | `DBSACI_DB_USERS_FILE`| —             | file of `user:password` lines (`#` comments ok) |
 //! | `--statement-timeout-ms` | `DBSACI_STATEMENT_TIMEOUT_MS` | unset | per-statement timeout; ORA-01013 on expiry |
 //! | `--idle-timeout-ms`   | `DBSACI_IDLE_TIMEOUT_MS`      | `900000` | idle client reaping; `0` disables |
 //! | `--health-addr`       | `DBSACI_HEALTH_ADDR`  | unset          | `host:port` for `/healthz` + `/readyz` |
@@ -22,11 +22,11 @@
 //! ## Credential model
 //!
 //! An Oracle client authenticates with a challenge/response, so DbSaci must
-//! already hold each user's PostgreSQL password. Declare them ahead of time and
+//! already hold each user's backend password. Declare them ahead of time and
 //! an Oracle client then logs in with the *same* user/password it would use
-//! against PostgreSQL directly. Sources are layered (later overrides earlier):
-//! `--pg-users-file` / `DBSACI_PG_USERS_FILE`, then `DBSACI_PG_USERS`, then each
-//! `--pg-user` flag. A user not in the list falls back to `--pg-password` if set,
+//! against the backend directly. Sources are layered (later overrides earlier):
+//! `--db-users-file` / `DBSACI_DB_USERS_FILE`, then `DBSACI_DB_USERS`, then each
+//! `--db-user` flag. A user not in the list falls back to `--db-password` if set,
 //! and is rejected with ORA-01017 otherwise.
 
 use std::path::PathBuf;
@@ -46,33 +46,33 @@ struct Cli {
     #[arg(long, env = "DBSACI_LISTEN")]
     listen: Option<String>,
 
-    /// PostgreSQL host.
-    #[arg(long, env = "DBSACI_PG_HOST")]
-    pg_host: Option<String>,
+    /// Backend host (PostgreSQL or MariaDB).
+    #[arg(long, env = "DBSACI_DB_HOST")]
+    db_host: Option<String>,
 
-    /// PostgreSQL port.
-    #[arg(long, env = "DBSACI_PG_PORT")]
-    pg_port: Option<u16>,
+    /// Backend port.
+    #[arg(long, env = "DBSACI_DB_PORT")]
+    db_port: Option<u16>,
 
-    /// PostgreSQL database.
-    #[arg(long, env = "DBSACI_PG_DB")]
-    pg_db: Option<String>,
+    /// Backend database (PostgreSQL) or default schema (MariaDB).
+    #[arg(long, env = "DBSACI_DB_NAME")]
+    db_name: Option<String>,
 
     /// Fallback password for any user not named in the credential list.
-    #[arg(long, env = "DBSACI_PG_PASSWORD")]
-    pg_password: Option<String>,
+    #[arg(long, env = "DBSACI_DB_PASSWORD")]
+    db_password: Option<String>,
 
     /// One `user:password` pair. Repeatable. Overrides the file and env list.
-    #[arg(long = "pg-user", value_name = "USER:PASSWORD")]
-    pg_users: Vec<String>,
+    #[arg(long = "db-user", value_name = "USER:PASSWORD")]
+    db_users: Vec<String>,
 
     /// Comma-separated `user:password,user:password` list.
-    #[arg(long = "pg-users", env = "DBSACI_PG_USERS", value_name = "LIST")]
-    pg_users_list: Option<String>,
+    #[arg(long = "db-users", env = "DBSACI_DB_USERS", value_name = "LIST")]
+    db_users_list: Option<String>,
 
     /// File of `user:password` lines (`#` comments and blank lines ignored).
-    #[arg(long, env = "DBSACI_PG_USERS_FILE", value_name = "PATH")]
-    pg_users_file: Option<PathBuf>,
+    #[arg(long, env = "DBSACI_DB_USERS_FILE", value_name = "PATH")]
+    db_users_file: Option<PathBuf>,
 
     /// Per-statement timeout in milliseconds; ORA-01013 on expiry.
     #[arg(long, env = "DBSACI_STATEMENT_TIMEOUT_MS")]
@@ -114,14 +114,14 @@ fn parse_oracle_version(raw: Option<&str>) -> OracleVersion {
 
 fn build_credentials(cli: &Cli) -> Result<Credentials, String> {
     let mut creds = Credentials::default();
-    if let Some(path) = &cli.pg_users_file {
+    if let Some(path) = &cli.db_users_file {
         creds.extend_file(path)?;
     }
-    if let Some(list) = &cli.pg_users_list {
+    if let Some(list) = &cli.db_users_list {
         creds.extend_comma_list(list)?;
     }
-    creds.extend_pairs(cli.pg_users.iter().map(String::as_str))?;
-    creds.set_fallback(cli.pg_password.clone().or_else(|| Some("postgres".into())));
+    creds.extend_pairs(cli.db_users.iter().map(String::as_str))?;
+    creds.set_fallback(cli.db_password.clone().or_else(|| Some("postgres".into())));
     Ok(creds)
 }
 
@@ -151,9 +151,9 @@ async fn main() {
             CliBackend::Mariadb => dbsaci::BackendKind::MariaDb,
         },
         listen_addr: cli.listen.unwrap_or(default.listen_addr),
-        pg_host: cli.pg_host.unwrap_or(default.pg_host),
-        pg_port: cli.pg_port.unwrap_or(default.pg_port),
-        pg_db: cli.pg_db.unwrap_or(default.pg_db),
+        db_host: cli.db_host.unwrap_or(default.db_host),
+        db_port: cli.db_port.unwrap_or(default.db_port),
+        db_name: cli.db_name.unwrap_or(default.db_name),
         credentials,
         statement_timeout: cli.statement_timeout_ms.map(Duration::from_millis),
         idle_timeout: match cli.idle_timeout_ms {

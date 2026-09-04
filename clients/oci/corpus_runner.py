@@ -7,8 +7,8 @@ it exercises DbSaci's OCI wire path end to end.
 
 Environment:
   DBSACI_HOST / DBSACI_PORT / DBSACI_USER / DBSACI_PASSWORD / DBSACI_SERVICE
-  DBSACI_PG_HOST / DBSACI_PG_PORT / DBSACI_PG_DB / DBSACI_PG_USER /
-  DBSACI_PG_PASSWORD   direct TCP connection to the backing Postgres (for
+  DBSACI_DB_HOST / DBSACI_DB_PORT / DBSACI_DB_NAME / DBSACI_DB_USER /
+  DBSACI_DB_PASSWORD   direct TCP connection to the backing Postgres (for
                     fixtures, teardown, and `-- verify` on a second connection)
   ORACLE_INSTANT_CLIENT   Instant Client dir (default: Windows install path)
   CORPUS_FILTER     optional substring; only run groups/cases containing it
@@ -60,11 +60,11 @@ SVC = os.environ.get("DBSACI_SERVICE", "FREEPDB1")
 DSN = f"{HOST}:{PORT}/{SVC}"
 FILTER = os.environ.get("CORPUS_FILTER", "")
 
-PG_HOST = os.environ.get("DBSACI_PG_HOST", "127.0.0.1")
-PG_PORT = int(os.environ.get("DBSACI_PG_PORT", "5432"))
-PG_DB = os.environ.get("DBSACI_PG_DB", "postgres")
-PG_USER = os.environ.get("DBSACI_PG_USER", "corpus")
-PG_PW = os.environ.get("DBSACI_PG_PASSWORD", "corpus")
+PG_HOST = os.environ.get("DBSACI_DB_HOST", "127.0.0.1")
+PG_PORT = int(os.environ.get("DBSACI_DB_PORT", "5432"))
+PG_DB = os.environ.get("DBSACI_DB_NAME", "postgres")
+PG_USER = os.environ.get("DBSACI_DB_USER", "corpus")
+PG_PW = os.environ.get("DBSACI_DB_PASSWORD", "corpus")
 
 
 def _pg_cell(v) -> str:

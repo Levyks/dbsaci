@@ -70,9 +70,9 @@ async fn mariadb_oracle_mode_executes_basic_queries_and_binds() {
         Server::new(Config {
             backend: BackendKind::MariaDb,
             listen_addr: format!("127.0.0.1:{proxy_port}"),
-            pg_host: host,
-            pg_port: port,
-            pg_db: "postgres".into(),
+            db_host: host,
+            db_port: port,
+            db_name: "postgres".into(),
             credentials: Credentials::with_fallback("corpus"),
             statement_timeout: Some(Duration::from_secs(5)),
             idle_timeout: Some(Duration::from_secs(30)),

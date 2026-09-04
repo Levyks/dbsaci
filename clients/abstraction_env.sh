@@ -62,8 +62,8 @@ SQL
 
   echo "== starting dbsaci on 127.0.0.1:${listen_port} -> PG :${pg_port} =="
   DBSACI_LISTEN="127.0.0.1:${listen_port}" \
-  DBSACI_PG_HOST=127.0.0.1 DBSACI_PG_PORT="$pg_port" \
-  DBSACI_PG_DB=postgres DBSACI_PG_PASSWORD=hexing \
+  DBSACI_DB_HOST=127.0.0.1 DBSACI_DB_PORT="$pg_port" \
+  DBSACI_DB_NAME=postgres DBSACI_DB_PASSWORD=hexing \
   DBSACI_HEALTH_ADDR="127.0.0.1:${health_port}" \
   DBSACI_ORACLE_VERSION=11 \
   DBSACI_LOG_SQL="${DBSACI_LOG_SQL:-}" \

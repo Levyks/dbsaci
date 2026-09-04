@@ -151,12 +151,12 @@ pub struct Config {
     /// Database engine behind the Oracle wire protocol.
     pub backend: BackendKind,
     pub listen_addr: String,
-    pub pg_host: String,
-    pub pg_port: u16,
-    pub pg_db: String,
-    /// Per-user PostgreSQL passwords. The Oracle login challenge is run with the
+    pub db_host: String,
+    pub db_port: u16,
+    pub db_name: String,
+    /// Per-user backend passwords. The Oracle login challenge is run with the
     /// password matched here (or the fallback), so an Oracle client authenticates
-    /// with the same credentials it would use against PostgreSQL directly.
+    /// with the same credentials it would use against the backend directly.
     pub credentials: Credentials,
     /// Per-statement PostgreSQL limit. `None` preserves Oracle's unlimited
     /// default; when set, timeout cancellation is returned as ORA-01013.
@@ -224,9 +224,9 @@ impl Default for Config {
         Self {
             backend: BackendKind::Postgres,
             listen_addr: "0.0.0.0:1521".to_string(),
-            pg_host: "localhost".to_string(),
-            pg_port: 5432,
-            pg_db: "postgres".to_string(),
+            db_host: "localhost".to_string(),
+            db_port: 5432,
+            db_name: "postgres".to_string(),
             credentials: Credentials::with_fallback("postgres"),
             statement_timeout: None,
             idle_timeout: Some(Duration::from_secs(15 * 60)),
@@ -260,9 +260,9 @@ impl Server {
 
         if let Some(addr) = self.config.health_addr.clone() {
             let probe = HealthProbe {
-                pg_host: self.config.pg_host.clone(),
-                pg_port: self.config.pg_port,
-                pg_db: self.config.pg_db.clone(),
+                db_host: self.config.db_host.clone(),
+                db_port: self.config.db_port,
+                db_name: self.config.db_name.clone(),
             };
             match TcpListener::bind(&addr).await {
                 Ok(l) => {
@@ -345,13 +345,13 @@ async fn shutdown_signal() {
 }
 
 struct HealthProbe {
-    pg_host: String,
-    pg_port: u16,
-    pg_db: String,
+    db_host: String,
+    db_port: u16,
+    db_name: String,
 }
 
 /// Minimal HTTP/1.1 health server. `/healthz` = process/listener up;
-/// `/readyz` = a fresh TCP connection to the configured PostgreSQL port
+/// `/readyz` = a fresh TCP connection to the configured backend port
 /// succeeds; `/metrics` = Prometheus text; `GET /sessions` = JSON list of live
 /// Oracle sessions (id, addr, user, age); `DELETE /sessions/<id>` = abort one
 /// (drops its backend PostgreSQL connection, releasing any locks it held). No
@@ -361,9 +361,9 @@ async fn serve_health(listener: TcpListener, probe: HealthProbe) {
         let Ok((mut stream, _)) = listener.accept().await else {
             continue;
         };
-        let probe_host = probe.pg_host.clone();
-        let probe_port = probe.pg_port;
-        let _db = probe.pg_db.clone();
+        let probe_host = probe.db_host.clone();
+        let probe_port = probe.db_port;
+        let _db = probe.db_name.clone();
         tokio::spawn(async move {
             use tokio::io::{AsyncReadExt, AsyncWriteExt};
             let mut buf = [0u8; 1024];
@@ -641,11 +641,11 @@ async fn handle_connection(stream: TcpStream, session_id: u64, config: Config) -
 
     sessions_set_user(session_id, &username);
 
-    // Resolve the Oracle username to a pre-declared PostgreSQL password. The
+    // Resolve the Oracle username to a pre-declared backend password. The
     // login is a challenge/response, so DbSaci must already hold the password to
     // both verify the client's proof and open the backend connection with it.
     // An unknown user with no fallback configured is rejected up front.
-    let pg_password = match config.credentials.password_for(&username) {
+    let db_password = match config.credentials.password_for(&username) {
         Some(p) => p.to_string(),
         None => {
             debug!("no PostgreSQL credential for user {username:?}");
@@ -667,7 +667,7 @@ async fn handle_connection(stream: TcpStream, session_id: u64, config: Config) -
     // Auth verifier family follows the impersonated release. The 12c PBKDF2
     // verifier is required by python-oracledb thin and modern JDBC thin; the
     // 11g O5LOGON verifier is for older clients.
-    let password = pg_password.clone();
+    let password = db_password.clone();
     // The 11g O5LOGON (MD5) verifier is what python-oracledb thin negotiates for
     // an 11g server. ojdbc's O5Logon helper is hardwired to O7L multi-round
     // (PBKDF2) and can't do the MD5 path, so serve it the 12c PBKDF2 verifier
@@ -820,11 +820,11 @@ async fn handle_connection(stream: TcpStream, session_id: u64, config: Config) -
     // 8. Connect to the selected backend using Oracle credentials.
     let backend: Arc<dyn OracleBackend> = match config.backend {
         BackendKind::Postgres => match PostgresBackend::connect(
-            &config.pg_host,
-            config.pg_port,
+            &config.db_host,
+            config.db_port,
             &username,
-            &pg_password,
-            &config.pg_db,
+            &db_password,
+            &config.db_name,
             config.statement_timeout,
         )
         .await
@@ -842,11 +842,11 @@ async fn handle_connection(stream: TcpStream, session_id: u64, config: Config) -
             }
         },
         BackendKind::MariaDb => match MariaDbBackend::connect(
-            &config.pg_host,
-            config.pg_port,
+            &config.db_host,
+            config.db_port,
             &username,
-            &pg_password,
-            &config.pg_db,
+            &db_password,
+            &config.db_name,
         )
         .await
         {
@@ -2025,7 +2025,7 @@ mod tests {
 
         // A throwaway TCP listener stands in for PostgreSQL so /readyz can connect.
         let fake_pg = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let pg_port = fake_pg.local_addr().unwrap().port();
+        let db_port = fake_pg.local_addr().unwrap().port();
         tokio::spawn(async move {
             loop {
                 if fake_pg.accept().await.is_err() {
@@ -2039,9 +2039,9 @@ mod tests {
         tokio::spawn(serve_health(
             health,
             HealthProbe {
-                pg_host: "127.0.0.1".into(),
-                pg_port,
-                pg_db: "postgres".into(),
+                db_host: "127.0.0.1".into(),
+                db_port,
+                db_name: "postgres".into(),
             },
         ));
 

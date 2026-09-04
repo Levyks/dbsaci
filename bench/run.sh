@@ -162,8 +162,8 @@ SQL
 echo "== starting dbSaci ($dbsaci_image), unconstrained =="
 docker run -d --name "$saci_name" --network "$net" \
   -e DBSACI_LISTEN=0.0.0.0:1521 \
-  -e DBSACI_PG_HOST="$pg_name" -e DBSACI_PG_PORT=5432 \
-  -e DBSACI_PG_DB=postgres -e DBSACI_PG_PASSWORD=bench \
+  -e DBSACI_DB_HOST="$pg_name" -e DBSACI_DB_PORT=5432 \
+  -e DBSACI_DB_NAME=postgres -e DBSACI_DB_PASSWORD=bench \
   -e DBSACI_HEALTH_ADDR=0.0.0.0:9500 -e RUST_LOG=dbsaci=warn \
   "$dbsaci_image" >/dev/null
 # scratch image: no shell to exec into. Poll the listener from a throwaway client.

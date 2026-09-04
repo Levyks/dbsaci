@@ -1,6 +1,6 @@
 [package]
 name = "dbsaci"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 license = "WTFPL"
 description = "An Oracle TNS/TTC wire-protocol proxy for PostgreSQL and MariaDB"
@@ -10,7 +10,10 @@ repository = "https://github.com/Levyks/dbsaci"
 tokio = { version = "1", features = ["full"] }
 tokio-postgres = { version = "0.7", features = ["with-chrono-0_4"] }
 async-trait = "0.1"
-mysql_async = { version = "0.37", default-features = false, features = ["default-rustls"] }
+# `ring` (not `aws-lc-rs`) as the rustls provider: it cross-compiles cleanly to
+# `x86_64-unknown-linux-musl`, so the release image stays a static `scratch`
+# binary. `default-rustls` pulls `aws-lc-sys`, which needs a musl C toolchain.
+mysql_async = { version = "0.37", default-features = false, features = ["default-rustls-ring"] }
 bytes = "1"
 thiserror = "1"
 tracing = "0.1"

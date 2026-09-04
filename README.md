@@ -44,9 +44,11 @@ exactly as they are.
 ## Requirements
 
 - **PostgreSQL** (recent release) with the **`orafce`** extension available
-  (`CREATE EXTENSION orafce`), or **MariaDB 11.4+**. MariaDB should run with
-  `SQL_MODE=ORACLE`; DbSaci adds the remaining structural rewrites and facade
-  objects. A PostgreSQL test image is built from `testcontainers/Dockerfile`.
+  (`CREATE EXTENSION orafce`), or **MariaDB 11.4+**. DbSaci sets
+  `SQL_MODE=ORACLE` on every backend session itself and folds table identifiers
+  to lower case, so the MariaDB server needs no special configuration —
+  `lower_case_table_names` can stay at its default. A PostgreSQL test image is
+  built from `testcontainers/Dockerfile`.
 - **Rust** (stable, 2024 edition) to build DbSaci.
 - A login role on the selected backend for the proxy to connect as; one Oracle
   session maps to one dedicated backend connection, so size the backend's
@@ -65,34 +67,33 @@ docker run -d -e POSTGRES_PASSWORD=postgres -P dbsaci-test-pg:18
 
 # run the proxy (see src/bin/dbsaci.rs for every DBSACI_* variable)
 DBSACI_LISTEN=0.0.0.0:1521 \
-DBSACI_PG_HOST=127.0.0.1 DBSACI_PG_PORT=<mapped-port> \
-DBSACI_PG_DB=postgres DBSACI_PG_PASSWORD=<role-password> \
+DBSACI_DB_HOST=127.0.0.1 DBSACI_DB_PORT=<mapped-port> \
+DBSACI_DB_NAME=postgres DBSACI_DB_PASSWORD=<role-password> \
 cargo run --bin dbsaci
 ```
 
-For MariaDB, start MariaDB with Oracle mode enabled and select the backend:
+For MariaDB, set `DBSACI_BACKEND=mariadb` and point the same options at it
+(no server-side `sql-mode` or `lower-case-table-names` needed):
 
 ```bash
 docker run -d --name dbsaci-mariadb \
   -e MARIADB_ROOT_PASSWORD=root \
   -e MARIADB_DATABASE=appdb -e MARIADB_USER=appuser -e MARIADB_PASSWORD=apppw \
-  -p 3306:3306 mariadb:11.4 --sql-mode=ORACLE
+  -p 3306:3306 mariadb:11.4
 
 DBSACI_BACKEND=mariadb \
-DBSACI_PG_HOST=127.0.0.1 DBSACI_PG_PORT=3306 \
-DBSACI_PG_DB=appdb DBSACI_PG_PASSWORD=apppw \
+DBSACI_DB_HOST=127.0.0.1 DBSACI_DB_PORT=3306 \
+DBSACI_DB_NAME=appdb DBSACI_DB_PASSWORD=apppw \
 cargo run --bin dbsaci
 ```
 
-The `PG` option names are retained for CLI/environment compatibility with the
-original PostgreSQL backend; they point to the selected backend in MariaDB
-mode as well. See the [compatibility matrix](https://levyks.github.io/dbsaci/compatibility/)
+See the [compatibility matrix](https://levyks.github.io/dbsaci/compatibility/)
 for the backend-by-backend feature status.
 
 Then connect any Oracle client to `//host:1521/FREEPDB1`.
 
-Or run it from a container (`levyks/dbsaci:0.1.0`, ~12 MB) —
-`docker run -p 1521:1521 -e DBSACI_PG_HOST=… levyks/dbsaci:0.1.0`. See the
+Or run it from a container (`levyks/dbsaci:0.1.1`) —
+`docker run -p 1521:1521 -e DBSACI_DB_HOST=… levyks/dbsaci:0.1.1`. See the
 [docs](https://levyks.github.io/dbsaci/getting-started/) for a full
 docker-compose.
 
@@ -105,34 +106,52 @@ that both modern and 11g-era clients negotiate successfully.
 ### Credentials (multi-user)
 
 An Oracle login is a challenge/response — the password never crosses the wire —
-so DbSaci must already hold each user's PostgreSQL password. Declare them up
+so DbSaci must already hold each user's backend password. Declare them up
 front and an Oracle client then authenticates with the *same* user/password it
-would use against PostgreSQL directly:
+would use against the backend directly:
 
 ```bash
 dbsaci \
-  --pg-user alice:s3cret --pg-user bob:hunter2 \   # repeatable, CLI only
-  --pg-users-file /etc/dbsaci/users              \ # or a file of user:password lines
-  --pg-password postgres                           # fallback for anyone not listed
-# env equivalents: DBSACI_PG_USERS="alice:s3cret,bob:hunter2",
-#                  DBSACI_PG_USERS_FILE=..., DBSACI_PG_PASSWORD=...
+  --db-user alice:s3cret --db-user bob:hunter2 \   # repeatable, CLI only
+  --db-users-file /etc/dbsaci/users              \ # or a file of user:password lines
+  --db-password postgres                           # fallback for anyone not listed
+# env equivalents: DBSACI_DB_USERS="alice:s3cret,bob:hunter2",
+#                  DBSACI_DB_USERS_FILE=..., DBSACI_DB_PASSWORD=...
 ```
 
-Sources layer file &lt; `DBSACI_PG_USERS` &lt; `--pg-user`. The username is matched
+Sources layer file &lt; `DBSACI_DB_USERS` &lt; `--db-user`. The username is matched
 case-insensitively; a user with no match and no fallback is rejected with
 ORA-01017. The matched password drives both the login challenge and the backend
-PostgreSQL connection.
+connection.
 
 ### Schemas
 
-Oracle's *schema == user*: on connect DbSaci ensures a PostgreSQL schema named
-after the user and sets `search_path` to `"<user>", oracle, public`. Unqualified
-names resolve in the user's own schema first, then in `public` (the shared
-fallback, also reachable as `public.<name>` — so an existing PostgreSQL database
-whose tables live in `public` works unchanged). Other schemas are reached by
-qualifying (`SELECT * FROM hr.emp`, with `GRANT USAGE`/`SELECT`) or
-`ALTER SESSION SET CURRENT_SCHEMA`. If the backend role can't `CREATE` a schema
-the connection still works and logs a warning.
+Oracle's *schema == user*.
+
+* **PostgreSQL** — on connect DbSaci ensures a schema named after the user and
+  sets `search_path` to `"<user>", oracle, public`. Unqualified names resolve in
+  the user's own schema first, then in `public` (the shared fallback, also
+  reachable as `public.<name>` — so an existing database whose tables live in
+  `public` works unchanged). Other schemas are reached by qualifying
+  (`SELECT * FROM hr.emp`, with `GRANT USAGE`/`SELECT`) or
+  `ALTER SESSION SET CURRENT_SCHEMA`. If the role can't `CREATE` a schema the
+  connection still works and logs a warning.
+* **MariaDB** — a database is the schema, and `USE` selects exactly one (there is
+  no `search_path`). DbSaci issues `USE <user>` when a database of that name
+  exists, otherwise `USE <DBSACI_DB_NAME>`. So: give each Oracle login its own
+  database, or point every login at one shared `DBSACI_DB_NAME` and qualify
+  cross-schema references. `ALTER SESSION SET CURRENT_SCHEMA = x` maps to
+  `USE x`.
+
+### Identifiers and collation (MariaDB)
+
+Identifiers in table-name position are folded to lower case, so `FROM MY_TABLE`
+resolves against a lower-case `my_table` no matter how `lower_case_table_names`
+is set on the server. Quoted identifiers (`"MixedCase"`, `` `MixedCase` ``) are
+left exactly as written — the deliberate case-sensitive escape hatch. The
+session's `collation_connection` is pinned to the current schema's default
+collation so string literals in client SQL aggregate cleanly with the schema's
+columns (no `ER_CANT_AGGREGATE_2COLLATIONS` against `utf8mb4_uca1400_ai_ci`).
 
 ## What works
 
@@ -230,7 +249,7 @@ One sample run — 2 000 iterations/op (30 for the heavy ops), single connection
 Everything runs in Docker on one bridge network — the client, Oracle XE,
 PostgreSQL and dbSaci — so every hop is a container veth with no host
 port-proxy in the path. dbSaci runs from its published image
-(`levyks/dbsaci:0.1.0`, a static musl build). Both database containers get
+(`levyks/dbsaci:0.1.1`, a distroless glibc build). Both database containers get
 **2 CPU / 2.5 GiB**: Oracle XE spends its full 2 GiB licence (`INIT_SGA_SIZE`
 1536M + `INIT_PGA_SIZE` 512M), PostgreSQL is **tuned to that envelope**
 (`shared_buffers` 768 MB, 64 MB `work_mem`, parallel workers, `jit=off`). A
@@ -280,7 +299,7 @@ short to parallelise. Integer columns or more cores narrow it. The bulk write is
 
 **This is a single-connection latency benchmark** and says nothing about
 concurrency, mixed OLTP, or a tuned deployment — the areas where PostgreSQL
-usually shines. The shipped image is a musl build (no custom allocator), which
+usually shines. The shipped image is a plain glibc build (no custom allocator), which
 costs a slice of the tiny-op latency.
 <!-- BENCH:END -->
 

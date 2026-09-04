@@ -1,23 +1,23 @@
-# Build: docker build -t levyks/dbsaci:0.1.0 .
-# Run:   docker run --rm -p 1521:1521 -e DBSACI_PG_HOST=... levyks/dbsaci:0.1.0
+# Build: docker build -t levyks/dbsaci:0.1.1 .
+# Run:   docker run --rm -p 1521:1521 -e DBSACI_DB_HOST=... levyks/dbsaci:0.1.1
 #
-# dbSaci has no C dependencies (tokio-postgres is pure Rust; RustCrypto for the
-# auth ciphers; no libpq, no OpenSSL), so it links fully static against musl and
-# ships on `scratch` — the image is just the ~10 MB binary.
+# dbSaci has no C libraries to link against — `ring` (rustls provider) and the
+# RustCrypto auth ciphers compile from vendored assembly, tokio-postgres and
+# mysql_async are pure Rust, no libpq. It builds as an ordinary dynamic glibc
+# binary and ships on distroless/cc (glibc + libgcc_s + CA roots + tzdata,
+# ~20 MB), so the release image is that base plus the ~18 MB binary. No musl
+# cross-toolchain, no `scratch` static-linking caveats around DNS.
 FROM rust:1-bookworm AS build
 WORKDIR /src
-RUN rustup target add x86_64-unknown-linux-musl
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 # `[[test]]` entries in Cargo.toml must resolve for the manifest to parse.
 COPY tests ./tests
-RUN cargo build --release --locked --target x86_64-unknown-linux-musl --bin dbsaci
+RUN cargo build --release --locked --bin dbsaci \
+ && strip target/release/dbsaci
 
-FROM scratch
-COPY --from=build /src/target/x86_64-unknown-linux-musl/release/dbsaci /dbsaci
-# No shell / package manager / libc — nothing to run as a named user, so use a
-# numeric non-root UID (valid without /etc/passwd).
-USER 10001:10001
+FROM gcr.io/distroless/cc-debian12:nonroot
+COPY --from=build /src/target/release/dbsaci /usr/local/bin/dbsaci
 # Oracle TNS listener; health server (when DBSACI_HEALTH_ADDR is set).
 EXPOSE 1521 9500
-ENTRYPOINT ["/dbsaci"]
+ENTRYPOINT ["/usr/local/bin/dbsaci"]

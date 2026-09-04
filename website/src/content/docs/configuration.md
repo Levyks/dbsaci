@@ -11,10 +11,10 @@ The flag wins when both are set. Run `dbsaci --help` for the authoritative list.
 | Flag | Env | Default | Purpose |
 | --- | --- | --- | --- |
 | `--listen <ADDR>` | `DBSACI_LISTEN` | `0.0.0.0:1521` | Oracle TNS listen address. |
-| `--backend mariadb` | `DBSACI_BACKEND=mariadb` | `postgres` | Select MariaDB instead of PostgreSQL. MariaDB 11.4+ should use `SQL_MODE=ORACLE`. |
-| `--pg-host <HOST>` | `DBSACI_PG_HOST` | `localhost` | Selected backend host (the flag name is retained for compatibility). |
-| `--pg-port <PORT>` | `DBSACI_PG_PORT` | `5432` | Selected backend port. |
-| `--pg-db <NAME>` | `DBSACI_PG_DB` | `postgres` | Selected backend database/schema. PostgreSQL requires `orafce`. |
+| `--backend mariadb` | `DBSACI_BACKEND=mariadb` | `postgres` | Select MariaDB (11.4+) instead of PostgreSQL. dbSaci sets `SQL_MODE=ORACLE` per session — no server config needed. |
+| `--db-host <HOST>` | `DBSACI_DB_HOST` | `localhost` | Backend host (PostgreSQL or MariaDB). |
+| `--db-port <PORT>` | `DBSACI_DB_PORT` | `5432` | Backend port (`5432` PostgreSQL, `3306` MariaDB). |
+| `--db-name <NAME>` | `DBSACI_DB_NAME` | `postgres` | Backend database. Shared fallback schema when a login has no database of its own name. PostgreSQL requires `orafce`. |
 | `--oracle-version <V>` | `DBSACI_ORACLE_VERSION` | `19` | Impersonated Oracle release: `11` / `11g` / `11.2`, or `19` / `19c`. Changes the banner, `AUTH_VERSION_*`, and the auth-verifier family. |
 | `--health-addr <ADDR>` | `DBSACI_HEALTH_ADDR` | *(off)* | `host:port` for `/healthz` + `/readyz` + `/metrics`. Unset → no health server. |
 
@@ -33,12 +33,12 @@ so dbSaci must already hold each user's backend password.
 
 | Flag | Env | Purpose |
 | --- | --- | --- |
-| `--pg-user <USER:PASSWORD>` | *(CLI only)* | One pair. **Repeatable.** Highest precedence. |
-| `--pg-users <LIST>` | `DBSACI_PG_USERS` | Comma-separated `user:password,user:password`. |
-| `--pg-users-file <PATH>` | `DBSACI_PG_USERS_FILE` | File of `user:password` lines (`#` comments and blank lines ignored). |
-| `--pg-password <PASSWORD>` | `DBSACI_PG_PASSWORD` | Fallback for any user not named above. Default fallback: `postgres`. |
+| `--db-user <USER:PASSWORD>` | *(CLI only)* | One pair. **Repeatable.** Highest precedence. |
+| `--db-users <LIST>` | `DBSACI_DB_USERS` | Comma-separated `user:password,user:password`. |
+| `--db-users-file <PATH>` | `DBSACI_DB_USERS_FILE` | File of `user:password` lines (`#` comments and blank lines ignored). |
+| `--db-password <PASSWORD>` | `DBSACI_DB_PASSWORD` | Fallback password for any user not named above. Default fallback: `postgres`. |
 
-Sources layer **file &lt; `DBSACI_PG_USERS` &lt; `--pg-user`**. The Oracle
+Sources layer **file &lt; `DBSACI_DB_USERS` &lt; `--db-user`**. The Oracle
 username is matched case-insensitively; the matched password drives both the
 login challenge and the selected backend connection. An unmatched user with no
 fallback is rejected with `ORA-01017`.
@@ -51,7 +51,7 @@ is `dbsaci=info`.
 | Env | Effect |
 | --- | --- |
 | `RUST_LOG` | Standard `tracing` / `env_filter` directive. |
-| `DBSACI_LOG_SQL` | Log each Oracle statement and its translated PostgreSQL form. |
+| `DBSACI_LOG_SQL` | Log each Oracle statement and its translated backend form. |
 | `DBSACI_WIRE_DUMP` | Hex-dump every TNS packet (very verbose; secrets in `DATA` payloads are still redacted). |
 | `DBSACI_OCI_DEBUG` | Extra tracing on the OCI-dialect execute/re-execute path. |
 
@@ -69,5 +69,6 @@ Served on `DBSACI_HEALTH_ADDR` when set:
 
 **One Oracle session maps to one dedicated backend connection.** Size the
 selected backend's connection capacity for your expected concurrency, or put a session
-pooler (PgBouncer in transaction mode is *not* safe here — dbSaci holds
-session-level state; use a session-mode pooler) between dbSaci and PostgreSQL.
+pooler (a transaction-mode pooler such as PgBouncer is *not* safe here — dbSaci
+holds session-level state; use a session-mode pooler) between dbSaci and the
+backend.
