@@ -2389,8 +2389,9 @@ pub fn build_query_response(
     )
 }
 
-/// Like [`build_query_response`], with `compact_describe_scale` for ODP.NET
-/// (`na_without_version_list`): jdbc describe scale is a compact `sb1`.
+/// Like [`build_query_response`]. `compact_describe_scale` is retained for
+/// call-site compatibility; jdbc describe (`newer_describe_framing`) always
+/// encodes scale as compact `sb1` (ojdbc and ODP.NET).
 #[allow(clippy::too_many_arguments)]
 pub fn build_query_response_ex(
     columns: &[ColumnMeta],
@@ -2689,7 +2690,13 @@ fn build_query_response_inner(
     );
     buf.write_u8(0x10); // DescribeInfo
     if newer_describe_framing {
-        write_describe_jdbc_ex(&mut buf, columns, compact_describe_scale);
+        // Both ojdbc and ODP.NET parse jdbc-describe scale as compact `sb1`.
+        // A raw non-zero scale (e.g. NUMBER scale 2 / TIMESTAMP scale 6) is
+        // read as a length prefix → ORA-17401 / ArrayIndexOutOfBounds.
+        // `compact_describe_scale` historically gated ODP.NET only; ojdbc
+        // needs the same encoding once we report real (p,s).
+        let _ = compact_describe_scale;
+        write_describe_jdbc_ex(&mut buf, columns, true);
     } else {
         // Both oracle-rs and python-oracledb consume a leading chunked-bytes
         // field before the describe body (`skip_raw_bytes_chunked` /
@@ -3583,11 +3590,11 @@ fn write_describe_jdbc(buf: &mut WriteBuffer, columns: &[ColumnMeta]) {
     write_describe_jdbc_ex(buf, columns, false);
 }
 
-/// JDBC-style describe. When `compact_scale` is set (ODP.NET /
-/// `na_without_version_list`), the scale field is a compact `sb1` — a raw
-/// non-zero scale byte is parsed as a length prefix and causes ORA-12592.
-/// Precision stays a raw ub1 (matching the live Oracle→ODP.NET capture for
-/// `NUMBER(10,2)` / `TIMESTAMP(6)`).
+/// JDBC-style describe. When `compact_scale` is set, the scale field is a
+/// compact `sb1` — required for both ojdbc and ODP.NET; a raw non-zero scale
+/// byte is parsed as a length prefix (ORA-17401 / ORA-12592). Precision stays
+/// a raw ub1 (matching the live Oracle→ODP.NET capture for `NUMBER(10,2)` /
+/// `TIMESTAMP(6)`).
 fn write_describe_jdbc_ex(buf: &mut WriteBuffer, columns: &[ColumnMeta], compact_scale: bool) {
     // prologue: `[ub1 n][n ignore bytes]` then an ignored ub4.
     buf.write_u8(0); // n = 0 ignore bytes

@@ -2257,9 +2257,9 @@ impl DescribeCaps {
         let thin_strict = response_completion && !newer_describe_framing;
         let _ = na_without_version_list; // scale compactness is a wire concern
         Self {
-            // ojdbc accepts raw ub1 scale; ODP.NET needs compact sb1 scale
-            // (see `write_describe_jdbc_ex` + live Oracle capture). Both get
-            // real NUMBER(p,s) / TIMESTAMP scale now.
+            // ojdbc and ODP.NET both need compact sb1 scale on the jdbc
+            // describe path (see `write_describe_jdbc_ex`). Both get real
+            // NUMBER(p,s) / TIMESTAMP scale now.
             report_number_scale: true,
             native_binary_floats: thin_strict,
             native_intervals: thin_strict,

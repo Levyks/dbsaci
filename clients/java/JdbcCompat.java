@@ -57,9 +57,7 @@ public class JdbcCompat {
             }
             try (Statement s = c.createStatement(); ResultSet r = s.executeQuery("SELECT price, dv FROM jdbc_types")) {
                 r.next();
-                // ojdbc gets NUMBER(38,0) for the scaled column (its
-                // column-metadata parser desyncs on a non-zero scale field);
-                // the value is still exact.
+                // Real NUMBER(p,s) via compact jdbc-describe scale (same as ODP.NET).
                 check("number_ps_value", r.getBigDecimal(1).toPlainString(), "1234.56");
                 check("number_ps_precision", r.getMetaData().getPrecision(1), 10);
                 check("number_ps_scale", r.getMetaData().getScale(1), 2);
