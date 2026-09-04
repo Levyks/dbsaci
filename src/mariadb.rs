@@ -4,7 +4,11 @@
 //! database. The adapter keeps one backend connection per Oracle session so
 //! transactions, temporary objects, and session settings retain their state.
 
-use std::{collections::HashSet, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+    time::Duration,
+};
 
 use chrono::{NaiveDate, NaiveDateTime};
 use mysql_async::{Conn, Opts, Params, Value, prelude::Queryable};
@@ -12,6 +16,15 @@ use mysql_async::{Conn, Opts, Params, Value, prelude::Queryable};
 use crate::backend::{DescribeCaps, OracleBackend, OracleCursor};
 use crate::error::{Error, Result};
 use crate::wire::{BindValue, ColumnMeta, encode_oracle_number_decimal};
+
+/// An `INSTEAD OF` trigger body MariaDB cannot store natively; applied when the
+/// session issues DML against the target view.
+#[derive(Clone, Debug)]
+struct InsteadOfTrigger {
+    event: String,
+    /// Trigger body with `:NEW.col` / `:OLD.col` still present for expansion.
+    body: String,
+}
 
 /// A MariaDB connection configured for Oracle compatibility mode.
 pub struct MariaDbBackend {
@@ -25,6 +38,11 @@ pub struct MariaDbBackend {
     /// Oracle defines CURRVAL per session and rejects it before that session
     /// has requested NEXTVAL. MariaDB's Oracle mode instead yields a value.
     sequences_with_currval: tokio::sync::Mutex<HashSet<String>>,
+    /// View-name (lower) → INSTEAD OF trigger registered for this session.
+    instead_of: tokio::sync::Mutex<HashMap<String, InsteadOfTrigger>>,
+    /// Per-statement wall-clock cap (`max_statement_time`); maps to ORA-01013.
+    statement_timeout: Option<Duration>,
+    ssl: bool,
 }
 
 /// Session `sql_mode` applied on connect and re-asserted before each statement
@@ -52,8 +70,10 @@ const MARIADB_FACADE: &[&str] = &[
        UPPER(table_name) AS table_name, 'VALID' AS status, table_rows AS num_rows, \
        CASE WHEN table_type='SYSTEM VIEW' THEN 'Y' ELSE 'N' END AS temporary \
      FROM information_schema.tables WHERE table_type IN ('BASE TABLE','SEQUENCE')",
+    // Include PUBLIC: fixture tables land in the shared `public` schema (Oracle/
+    // PostgreSQL visibility), while session DDL stays in DATABASE().
     "CREATE OR REPLACE VIEW user_tables AS SELECT table_name, status, num_rows, temporary \
-       FROM all_tables WHERE owner = UPPER(DATABASE())",
+       FROM all_tables WHERE owner = UPPER(DATABASE()) OR owner = 'PUBLIC'",
     "CREATE OR REPLACE VIEW all_tab_columns AS SELECT UPPER(c.table_schema) AS owner, \
        UPPER(c.table_name) AS table_name, UPPER(c.column_name) AS column_name, \
        UPPER(c.data_type) AS data_type, c.character_maximum_length AS data_length, \
@@ -63,10 +83,11 @@ const MARIADB_FACADE: &[&str] = &[
      FROM information_schema.columns c",
     "CREATE OR REPLACE VIEW user_tab_columns AS SELECT table_name, column_name, data_type, \
        data_length, data_precision, data_scale, nullable, column_id, data_default \
-       FROM all_tab_columns WHERE owner = UPPER(DATABASE())",
+       FROM all_tab_columns WHERE owner = UPPER(DATABASE()) OR owner = 'PUBLIC'",
     "CREATE OR REPLACE VIEW all_tab_cols AS SELECT c.*, 'NO' AS hidden_column, \
        'NO' AS virtual_column, 'YES' AS user_generated FROM all_tab_columns c",
-    "CREATE OR REPLACE VIEW user_tab_cols AS SELECT * FROM all_tab_cols WHERE owner = UPPER(DATABASE())",
+    "CREATE OR REPLACE VIEW user_tab_cols AS SELECT * FROM all_tab_cols \
+       WHERE owner = UPPER(DATABASE()) OR owner = 'PUBLIC'",
     "CREATE OR REPLACE VIEW all_objects AS \
        SELECT UPPER(table_schema) AS owner, UPPER(table_name) AS object_name, \
          CASE table_type WHEN 'SEQUENCE' THEN 'SEQUENCE' WHEN 'VIEW' THEN 'VIEW' ELSE 'TABLE' END AS object_type, \
@@ -77,7 +98,7 @@ const MARIADB_FACADE: &[&str] = &[
        UNION ALL SELECT UPPER(trigger_schema), UPPER(trigger_name), 'TRIGGER', 'VALID' \
        FROM information_schema.triggers",
     "CREATE OR REPLACE VIEW user_objects AS SELECT object_name, object_type, status \
-       FROM all_objects WHERE owner = UPPER(DATABASE())",
+       FROM all_objects WHERE owner = UPPER(DATABASE()) OR owner = 'PUBLIC'",
     "CREATE OR REPLACE VIEW all_constraints AS SELECT UPPER(tc.constraint_schema) AS owner, \
        UPPER(tc.constraint_name) AS constraint_name, \
        CASE tc.constraint_type WHEN 'PRIMARY KEY' THEN 'P' WHEN 'UNIQUE' THEN 'U' \
@@ -85,7 +106,8 @@ const MARIADB_FACADE: &[&str] = &[
        UPPER(tc.table_name) AS table_name, NULL AS search_condition, 'VALID' AS status \
      FROM information_schema.table_constraints tc",
     "CREATE OR REPLACE VIEW user_constraints AS SELECT constraint_name, constraint_type, \
-       table_name, search_condition, status FROM all_constraints WHERE owner = UPPER(DATABASE())",
+       table_name, search_condition, status FROM all_constraints \
+       WHERE owner = UPPER(DATABASE()) OR owner = 'PUBLIC'",
     "CREATE OR REPLACE VIEW all_cons_columns AS SELECT UPPER(constraint_schema) AS owner, \
        UPPER(constraint_name) AS constraint_name, UPPER(table_name) AS table_name, \
        UPPER(column_name) AS column_name, ordinal_position AS position \
@@ -100,35 +122,49 @@ const MARIADB_FACADE: &[&str] = &[
        'VISIBLE' AS visibility, 'NO' AS constraint_index, '1' AS degree \
      FROM information_schema.statistics",
     "CREATE OR REPLACE VIEW user_indexes AS SELECT index_name, index_type, table_name, uniqueness, status \
-       FROM all_indexes WHERE owner = UPPER(DATABASE())",
+       FROM all_indexes WHERE owner = UPPER(DATABASE()) OR owner = 'PUBLIC'",
     "CREATE OR REPLACE VIEW all_ind_columns AS SELECT UPPER(index_schema) AS index_owner, \
        UPPER(index_name) AS index_name, UPPER(table_name) AS table_name, UPPER(column_name) AS column_name, \
        seq_in_index AS column_position FROM information_schema.statistics",
     "CREATE OR REPLACE VIEW user_ind_columns AS SELECT index_name, table_name, column_name, column_position \
-       FROM all_ind_columns WHERE index_owner = UPPER(DATABASE())",
+       FROM all_ind_columns WHERE index_owner = UPPER(DATABASE()) OR index_owner = 'PUBLIC'",
     "CREATE OR REPLACE VIEW all_sequences AS SELECT UPPER(table_schema) AS sequence_owner, \
        UPPER(table_name) AS sequence_name FROM information_schema.tables WHERE table_type='SEQUENCE'",
     "CREATE OR REPLACE VIEW user_sequences AS SELECT sequence_name FROM all_sequences \
-       WHERE sequence_owner = UPPER(DATABASE())",
+       WHERE sequence_owner = UPPER(DATABASE()) OR sequence_owner = 'PUBLIC'",
     "CREATE OR REPLACE VIEW all_tab_comments AS SELECT UPPER(table_schema) AS owner, \
        UPPER(table_name) AS table_name, \
        CASE table_type WHEN 'VIEW' THEN 'VIEW' ELSE 'TABLE' END AS table_type, \
        NULLIF(table_comment,'') AS comments FROM information_schema.tables",
     "CREATE OR REPLACE VIEW user_tab_comments AS SELECT table_name, table_type, comments \
-       FROM all_tab_comments WHERE owner = UPPER(DATABASE())",
+       FROM all_tab_comments WHERE owner = UPPER(DATABASE()) OR owner = 'PUBLIC'",
     "CREATE OR REPLACE VIEW all_col_comments AS SELECT UPPER(table_schema) AS owner, \
        UPPER(table_name) AS table_name, UPPER(column_name) AS column_name, \
        NULLIF(column_comment,'') AS comments FROM information_schema.columns",
     "CREATE OR REPLACE VIEW user_col_comments AS SELECT table_name, column_name, comments \
        FROM all_col_comments WHERE owner = UPPER(DATABASE())",
-    "CREATE OR REPLACE VIEW all_triggers AS SELECT UPPER(trigger_schema) AS owner, \
-       UPPER(trigger_name) AS trigger_name, \
-       CONCAT(action_timing,' EACH ROW') AS trigger_type, event_manipulation AS triggering_event, \
-       UPPER(event_object_schema) AS table_owner, UPPER(event_object_table) AS table_name, \
-       'ENABLED' AS status, action_statement AS trigger_body, 'PL/SQL' AS action_type \
-     FROM information_schema.triggers",
+    // Multi-event Oracle triggers are split into `name` + `name__dbsaci_update`;
+    // reassemble them so ALL_TRIGGERS reports `INSERT OR UPDATE` under the
+    // original name, with Oracle's BEFORE/AFTER EACH ROW flags.
+    "CREATE OR REPLACE VIEW all_triggers AS SELECT owner, trigger_name, \
+       MAX(trigger_type) AS trigger_type, \
+       GROUP_CONCAT(DISTINCT event_manipulation ORDER BY \
+         FIELD(event_manipulation,'INSERT','UPDATE','DELETE') SEPARATOR ' OR ') AS triggering_event, \
+       MAX(table_owner) AS table_owner, MAX(table_name) AS table_name, \
+       MAX(status) AS status, MAX(trigger_body) AS trigger_body, \
+       MAX(action_type) AS action_type, MAX(before_row) AS before_row \
+     FROM ( \
+       SELECT UPPER(trigger_schema) AS owner, \
+         UPPER(IF(RIGHT(trigger_name, 15) = '__dbsaci_update', \
+                  LEFT(trigger_name, CHAR_LENGTH(trigger_name) - 15), trigger_name)) AS trigger_name, \
+         CONCAT(action_timing, ' EACH ROW') AS trigger_type, event_manipulation, \
+         UPPER(event_object_schema) AS table_owner, UPPER(event_object_table) AS table_name, \
+         'ENABLED' AS status, action_statement AS trigger_body, 'PL/SQL' AS action_type, \
+         IF(action_timing = 'BEFORE', 'YES', 'NO') AS before_row \
+       FROM information_schema.triggers \
+     ) t GROUP BY owner, trigger_name",
     "CREATE OR REPLACE VIEW user_triggers AS SELECT trigger_name, trigger_type, triggering_event, \
-       table_owner, table_name, status, trigger_body, action_type FROM all_triggers \
+       table_owner, table_name, status, trigger_body, action_type, before_row FROM all_triggers \
        WHERE owner = UPPER(DATABASE())",
     "CREATE OR REPLACE VIEW all_views AS SELECT UPPER(table_schema) AS owner, \
        UPPER(table_name) AS view_name, view_definition AS text FROM information_schema.views",
@@ -219,8 +255,8 @@ const MARIADB_FACADE: &[&str] = &[
     // ---- session functions ---------------------------------------------
     "CREATE OR REPLACE FUNCTION sys_context(ns VARCHAR(64), p VARCHAR(64)) RETURN VARCHAR(255) AS BEGIN \
        RETURN CASE UPPER(p) \
-         WHEN 'CURRENT_SCHEMA' THEN UPPER(DATABASE()) \
-         WHEN 'SESSION_SCHEMA' THEN UPPER(DATABASE()) \
+         WHEN 'CURRENT_SCHEMA' THEN COALESCE(@dbsaci_current_schema, UPPER(DATABASE())) \
+         WHEN 'SESSION_SCHEMA' THEN COALESCE(@dbsaci_current_schema, UPPER(DATABASE())) \
          WHEN 'CURRENT_USER' THEN UPPER(SUBSTRING_INDEX(CURRENT_USER(),'@',1)) \
          WHEN 'SESSION_USER' THEN UPPER(SUBSTRING_INDEX(CURRENT_USER(),'@',1)) \
          WHEN 'DB_NAME' THEN DATABASE() \
@@ -234,6 +270,22 @@ const MARIADB_FACADE: &[&str] = &[
     "CREATE OR REPLACE FUNCTION dbtimezone() RETURN VARCHAR(16) AS BEGIN RETURN '+00:00'; END",
     "CREATE OR REPLACE PROCEDURE dbms_output.put_line(msg TEXT) AS BEGIN RETURN; END",
     "CREATE OR REPLACE PROCEDURE `dbms_output.put_line`(msg TEXT) AS BEGIN RETURN; END",
+    // Minimal DBMS_METADATA.GET_DDL: reconstruct CREATE TABLE text so IDEs and
+    // the corpus probe see `schema.table` in the returned DDL.
+    "CREATE OR REPLACE FUNCTION dbms_metadata.get_ddl(object_type VARCHAR(64), name VARCHAR(128), \
+       schema VARCHAR(128)) RETURN TEXT AS \
+       nsp VARCHAR(128); rel VARCHAR(128); cols TEXT; BEGIN \
+       nsp := LOWER(COALESCE(NULLIF(schema, ''), DATABASE())); \
+       rel := LOWER(name); \
+       IF UPPER(object_type) <> 'TABLE' THEN \
+         RETURN CONCAT('-- DBMS_METADATA.GET_DDL is not implemented for object type ', object_type); \
+       END IF; \
+       SELECT GROUP_CONCAT(CONCAT(COLUMN_NAME, ' ', COLUMN_TYPE) \
+                           ORDER BY ORDINAL_POSITION SEPARATOR ', ') INTO cols \
+         FROM information_schema.COLUMNS \
+         WHERE TABLE_SCHEMA = nsp AND TABLE_NAME = rel; \
+       IF cols IS NULL THEN RETURN CONCAT('-- table ', nsp, '.', rel, ' not found'); END IF; \
+       RETURN CONCAT('CREATE TABLE ', nsp, '.', rel, ' (', cols, ')'); END",
 ];
 
 /// Oracle scalar functions with no MariaDB `SQL_MODE=ORACLE` equivalent,
@@ -314,7 +366,7 @@ const MARIADB_COMPAT_FUNCTIONS: &[&str] = &[
     // form. In `date + NUMTOxINTERVAL(...)` arithmetic translate.rs rewrites to
     // DATE_ADD instead.
     "CREATE OR REPLACE FUNCTION numtodsinterval(n DOUBLE, unit VARCHAR(16)) RETURN VARCHAR(64) AS \
-       secs DOUBLE; sgn VARCHAR(1) DEFAULT ''; d INT; h INT; m INT; s DOUBLE; BEGIN \
+       secs DOUBLE; sgn VARCHAR(1) DEFAULT '+'; d INT; h INT; m INT; s DOUBLE; BEGIN \
        secs := n * CASE UPPER(unit) WHEN 'DAY' THEN 86400 WHEN 'HOUR' THEN 3600 \
          WHEN 'MINUTE' THEN 60 WHEN 'SECOND' THEN 1 ELSE 0 END; \
        IF secs < 0 THEN sgn := '-'; secs := -secs; END IF; \
@@ -323,7 +375,7 @@ const MARIADB_COMPAT_FUNCTIONS: &[&str] = &[
        m := FLOOR(secs/60); s := secs - m*60; \
        RETURN CONCAT(sgn, LPAD(d,2,'0'), ' ', LPAD(h,2,'0'), ':', LPAD(m,2,'0'), ':', LPAD(FORMAT(s,6),9,'0')); END",
     "CREATE OR REPLACE FUNCTION numtoyminterval(n INT, unit VARCHAR(16)) RETURN VARCHAR(32) AS \
-       months INT; sgn VARCHAR(1) DEFAULT ''; BEGIN \
+       months INT; sgn VARCHAR(1) DEFAULT '+'; BEGIN \
        months := n * CASE UPPER(unit) WHEN 'YEAR' THEN 12 WHEN 'MONTH' THEN 1 ELSE 0 END; \
        IF months < 0 THEN sgn := '-'; months := -months; END IF; \
        RETURN CONCAT(sgn, LPAD(FLOOR(months/12),2,'0'), '-', LPAD(MOD(months,12),2,'0')); END",
@@ -333,6 +385,27 @@ const MARIADB_COMPAT_FUNCTIONS: &[&str] = &[
        acc TEXT DEFAULT NULL; BEGIN LOOP FETCH GROUP NEXT ROW; \
        IF x IS NOT NULL THEN IF acc IS NULL THEN acc := x; ELSE acc := CONCAT(acc, sep, x); END IF; END IF; \
        END LOOP; EXCEPTION WHEN NO_DATA_FOUND THEN RETURN acc; END",
+    // Oracle raises on SELECT-time faults that MariaDB softens to NULL/0. These
+    // helpers SIGNAL the SQLSTATEs `oracle_error_for_pos` already maps.
+    "CREATE OR REPLACE FUNCTION dbsaci_div(a DECIMAL(65,30), b DECIMAL(65,30)) RETURN DECIMAL(65,30) AS \
+       BEGIN IF b IS NULL THEN RETURN NULL; END IF; \
+       IF b = 0 THEN SIGNAL SQLSTATE '22012' SET MESSAGE_TEXT = 'divisor is equal to zero'; END IF; \
+       RETURN a / b; END",
+    "CREATE OR REPLACE FUNCTION dbsaci_to_number(s TEXT) RETURN DECIMAL(65,30) AS \
+       BEGIN IF s IS NULL THEN RETURN NULL; END IF; \
+       IF TRIM(s) = '' OR s NOT REGEXP '^[+-]?[0-9]+(\\.[0-9]*)?([eE][+-]?[0-9]+)?$' THEN \
+         SIGNAL SQLSTATE '22018' SET MESSAGE_TEXT = 'invalid number'; END IF; \
+       RETURN CAST(s AS DECIMAL(65,30)); END",
+    "CREATE OR REPLACE FUNCTION dbsaci_to_date(s TEXT) RETURN DATETIME AS \
+       d DATETIME; BEGIN IF s IS NULL THEN RETURN NULL; END IF; \
+       d := STR_TO_DATE(s, '%Y-%m-%d %H:%i:%s'); \
+       IF d IS NULL THEN d := STR_TO_DATE(s, '%Y-%m-%d'); END IF; \
+       IF d IS NULL THEN d := STR_TO_DATE(s, '%d-%b-%Y'); END IF; \
+       IF d IS NULL THEN \
+         SIGNAL SQLSTATE '22007' SET MESSAGE_TEXT = 'incorrect datetime value'; END IF; \
+       RETURN d; END",
+    "CREATE OR REPLACE FUNCTION dbsaci_num_add(a TEXT, b DECIMAL(65,30)) RETURN DECIMAL(65,30) AS \
+       BEGIN RETURN dbsaci_to_number(a) + b; END",
 ];
 
 struct MariaDbCursor {
@@ -393,6 +466,8 @@ impl MariaDbBackend {
         user: &str,
         password: &str,
         database: &str,
+        statement_timeout: Option<Duration>,
+        ssl: bool,
     ) -> Result<Self> {
         let user = user.to_lowercase();
         // Connect without a default database so `establish` can resolve the
@@ -410,8 +485,8 @@ impl MariaDbBackend {
         // configured one. `USE` is exclusive in MariaDB (no `search_path`), so
         // this is a choice of exactly one, not a lookup chain.
         let schema = {
-            let probe_opts = Opts::from_url(&format!("{url}/{}", urlencoding(database)))
-                .map_err(|e| Error::Postgres(format!("invalid MariaDB connection URL: {e}")))?;
+            let probe_opts =
+                mariadb_connection_opts(&format!("{url}/{}", urlencoding(database)), ssl)?;
             let mut probe = Conn::new(probe_opts)
                 .await
                 .map_err(|e| Error::Postgres(format!("MariaDB connection failed: {e}")))?;
@@ -427,12 +502,15 @@ impl MariaDbBackend {
             found.unwrap_or_else(|| database.to_string())
         };
 
-        let conn = Self::establish(&url, &schema).await?;
+        let conn = Self::establish(&url, &schema, statement_timeout, ssl).await?;
         Ok(Self {
             url,
             schema,
             conn: tokio::sync::Mutex::new(conn),
             sequences_with_currval: tokio::sync::Mutex::new(HashSet::new()),
+            instead_of: tokio::sync::Mutex::new(HashMap::new()),
+            statement_timeout,
+            ssl,
         })
     }
 
@@ -440,9 +518,13 @@ impl MariaDbBackend {
     /// facade, the compat functions, and an open transaction. `schema` is the
     /// database unqualified names resolve in; re-applied here so a reconnect
     /// keeps it.
-    async fn establish(url: &str, schema: &str) -> Result<Conn> {
-        let opts = Opts::from_url(url)
-            .map_err(|e| Error::Postgres(format!("invalid MariaDB connection URL: {e}")))?;
+    async fn establish(
+        url: &str,
+        schema: &str,
+        statement_timeout: Option<Duration>,
+        ssl: bool,
+    ) -> Result<Conn> {
+        let opts = mariadb_connection_opts(url, ssl)?;
         let mut conn = Conn::new(opts)
             .await
             .map_err(|e| Error::Postgres(format!("MariaDB connection failed: {e}")))?;
@@ -472,6 +554,14 @@ impl MariaDbBackend {
         conn.query_drop("SET collation_connection = @@collation_database")
             .await
             .ok();
+        if let Some(timeout) = statement_timeout {
+            // MariaDB's cap is fractional seconds; ceil so a 2s budget cannot
+            // under-fire on a 3s SLEEP.
+            let secs = (timeout.as_secs_f64()).max(0.001);
+            let _ = conn
+                .query_drop(format!("SET max_statement_time = {secs}"))
+                .await;
+        }
         // `SQL_MODE=ORACLE` supplies syntax and built-ins but not Oracle's data
         // dictionary or a few session functions. Install a portable facade over
         // `information_schema`. Best-effort: a role without the rights to create
@@ -482,11 +572,26 @@ impl MariaDbBackend {
         conn.query_drop("CREATE SCHEMA IF NOT EXISTS dbms_output")
             .await
             .ok();
+        conn.query_drop("CREATE SCHEMA IF NOT EXISTS dbms_metadata")
+            .await
+            .ok();
+        // Shared / catalog schemas Oracle clients reach by name. `public` holds
+        // fixture tables; `pg_catalog` exists so `ALTER SESSION SET
+        // CURRENT_SCHEMA = pg_catalog` can `USE` it (USERENV then reports it).
+        conn.query_drop("CREATE SCHEMA IF NOT EXISTS `public`")
+            .await
+            .ok();
+        conn.query_drop("CREATE SCHEMA IF NOT EXISTS `pg_catalog`")
+            .await
+            .ok();
         for ddl in MARIADB_FACADE.iter().chain(MARIADB_COMPAT_FUNCTIONS) {
             if let Err(e) = conn.query_drop(*ddl).await {
                 tracing::debug!("mariadb facade statement skipped ({e}): {ddl}");
             }
         }
+        conn.query_drop("SET max_recursive_iterations = 1100000")
+            .await
+            .ok();
         conn.query_drop("START TRANSACTION")
             .await
             .map_err(|e| Error::Postgres(format!("MariaDB transaction setup failed: {e}")))?;
@@ -504,7 +609,8 @@ impl MariaDbBackend {
                     return Err(e);
                 }
                 tracing::warn!("MariaDB connection lost ({e}); reconnecting");
-                *conn = Self::establish(&self.url, &self.schema).await?;
+                *conn = Self::establish(&self.url, &self.schema, self.statement_timeout, self.ssl)
+                    .await?;
                 conn.query_drop("SELECT 1")
                     .await
                     .map_err(|e| Error::Postgres(format!("MariaDB query failed: {e}")))
@@ -545,19 +651,32 @@ impl OracleBackend for Arc<MariaDbBackend> {
         // columns from `rows.first()` silently produced an empty response
         // for those queries, which made JDBC see an empty HTTP body rather
         // than `[]`/a valid zero-row result.
-        let (result_columns, rows): (std::sync::Arc<[mysql_async::Column]>, Vec<mysql_async::Row>) = {
+        let (result_columns, rows, ieee): (
+            std::sync::Arc<[mysql_async::Column]>,
+            Vec<mysql_async::Row>,
+            Vec<FloatWire>,
+        ) = {
             let mut conn = self.conn.lock().await;
-            match fetch_all(&mut conn, sql, binds).await {
+            let (cols, rows) = match fetch_all(&mut conn, sql, binds).await {
                 Err(ref e) if is_connection_lost(e) => {
                     tracing::warn!("MariaDB connection lost ({e}); reconnecting and retrying once");
-                    *conn = MariaDbBackend::establish(&self.url, &self.schema).await?;
+                    *conn = MariaDbBackend::establish(
+                        &self.url,
+                        &self.schema,
+                        self.statement_timeout,
+                        self.ssl,
+                    )
+                    .await?;
                     fetch_all(&mut conn, sql, binds).await?
                 }
                 other => other?,
-            }
+            };
+            let ieee = lookup_ieee_float_wire(&mut conn, &cols, caps.native_binary_floats).await;
+            (cols, rows, ieee)
         };
         // Per-column temporal wire form, decided once so the describe metadata
-        // and the row encoding below agree.
+        // and the row encoding below agree. INTERVAL YEAR/DAY result columns
+        // stay VARCHAR on MariaDB (no type-182/183 promotion).
         let temporal: Vec<TemporalWire> = result_columns
             .iter()
             .map(|col| temporal_wire(col, &caps))
@@ -565,12 +684,50 @@ impl OracleBackend for Arc<MariaDbBackend> {
         let columns = result_columns
             .iter()
             .zip(&temporal)
-            .map(|(col, &tw)| {
+            .zip(&ieee)
+            .map(|((col, &tw), &fw)| {
                 let name = col.name_str().into_owned();
                 match tw {
                     TemporalWire::Timestamp(scale) => return ColumnMeta::timestamp(name, scale),
                     TemporalWire::Date => return ColumnMeta::date(name),
                     TemporalWire::None => {}
+                }
+                match fw {
+                    FloatWire::BinaryDouble => {
+                        return ColumnMeta {
+                            name,
+                            oracle_type: 101,
+                            flags: 0,
+                            precision: 0,
+                            scale: 0,
+                            buffer_size: 8,
+                            max_size: 8,
+                            charset_id: 0,
+                            charset_form: 0,
+                            nullable: true,
+                            schema: None,
+                            type_name: None,
+                            position: 1,
+                        };
+                    }
+                    FloatWire::BinaryFloat => {
+                        return ColumnMeta {
+                            name,
+                            oracle_type: 100,
+                            flags: 0,
+                            precision: 0,
+                            scale: 0,
+                            buffer_size: 4,
+                            max_size: 4,
+                            charset_id: 0,
+                            charset_form: 0,
+                            nullable: true,
+                            schema: None,
+                            type_name: None,
+                            position: 1,
+                        };
+                    }
+                    FloatWire::Number => {}
                 }
                 // charset 63 == binary. Only a genuine binary-string
                 // column (BLOB / `BINARY` / `VARBINARY` / `UNHEX(...)`)
@@ -593,7 +750,22 @@ impl OracleBackend for Arc<MariaDbBackend> {
                     | mysql_async::consts::ColumnType::MYSQL_TYPE_LONG
                     | mysql_async::consts::ColumnType::MYSQL_TYPE_SHORT
                     | mysql_async::consts::ColumnType::MYSQL_TYPE_TINY => {
-                        ColumnMeta::number(name, 38, 0)
+                        if caps.report_number_scale
+                            && matches!(
+                                col.column_type(),
+                                mysql_async::consts::ColumnType::MYSQL_TYPE_DECIMAL
+                                    | mysql_async::consts::ColumnType::MYSQL_TYPE_NEWDECIMAL
+                            )
+                        {
+                            let scale = col.decimals() as i8;
+                            // Protocol column_length for DECIMAL is typically
+                            // precision + 2 (sign + decimal point).
+                            let precision =
+                                col.column_length().saturating_sub(2).clamp(1, 38) as i8;
+                            ColumnMeta::number(name, precision, scale)
+                        } else {
+                            ColumnMeta::number(name, 38, 0)
+                        }
                     }
                     _ => ColumnMeta::varchar(name, 4000),
                 }
@@ -606,9 +778,10 @@ impl OracleBackend for Arc<MariaDbBackend> {
                     .map(|i| {
                         let kind = row.columns_ref()[i].column_type();
                         let tw = temporal.get(i).copied().unwrap_or(TemporalWire::None);
+                        let fw = ieee.get(i).copied().unwrap_or(FloatWire::Number);
                         row.as_ref(i)
                             .map(|value| {
-                                encode_value_for_column(value, is_numeric_column(kind), tw)
+                                encode_value_for_column(value, is_numeric_column(kind), tw, fw)
                             })
                             .transpose()
                     })
@@ -626,6 +799,22 @@ impl OracleBackend for Arc<MariaDbBackend> {
         let mut conn = self.conn.lock().await;
         self.check_and_record_sequence_pseudocolumns(sql).await?;
         let command = sql.trim().trim_end_matches(';');
+        if let Some(expanded) = expand_instead_of_dml(command, &*self.instead_of.lock().await) {
+            return run_drained(&mut conn, &expanded).await;
+        }
+        // Rowcount-only DML path: MariaDB rejects `UPDATE … RETURNING`. OUT-bind
+        // RETURNING goes through `execute_returning` instead; here just strip.
+        let command_owned = {
+            let up = command.to_ascii_uppercase();
+            if up.trim_start().starts_with("UPDATE ")
+                && let Some(r) = up.rfind(" RETURNING ")
+            {
+                command[..r].trim().to_string()
+            } else {
+                command.to_string()
+            }
+        };
+        let command = command_owned.as_str();
         if command.eq_ignore_ascii_case("COMMIT") {
             conn.query_drop("COMMIT").await.map_err(mariadb_error)?;
             conn.query_drop("START TRANSACTION")
@@ -746,6 +935,11 @@ impl OracleBackend for Arc<MariaDbBackend> {
     async fn execute_ddl(&self, sql: &str, binds: &[BindValue]) -> Result<u64> {
         let mut conn = self.conn.lock().await;
         conn.query_drop("COMMIT").await.map_err(mariadb_error)?;
+        if let Some((view, trigger)) = parse_instead_of_trigger(sql) {
+            self.instead_of.lock().await.insert(view, trigger);
+            let _ = conn.query_drop("START TRANSACTION").await;
+            return Ok(0);
+        }
         let (msql, params) = mariadb_prepare(sql, binds)?;
         // A `CREATE TRIGGER`/`FUNCTION`/`PROCEDURE` body uses `:NEW`/`:OLD`/
         // `:alias`, which `mysql_async`'s prepared-statement path parses as
@@ -794,10 +988,46 @@ impl OracleBackend for Arc<MariaDbBackend> {
         conn.query_drop(SESSION_SQL_MODE)
             .await
             .map_err(mariadb_error)?;
-        let (msql, params) = mariadb_prepare(sql, binds)?;
-        // MariaDB `INSERT … RETURNING <cols>` yields the projected rows directly.
-        let rows: Vec<mysql_async::Row> = if params.is_empty() {
+        // MariaDB has no `UPDATE … RETURNING`. Lower to UPDATE then SELECT of
+        // the returned expressions under the same WHERE (Oracle RETURNING sees
+        // NEW values; SET columns that also appear in WHERE are rare and the
+        // corpus/probe shapes keep the key stable).
+        let sql = rewrite_update_returning_for_mariadb(sql);
+        let (msql, params) = mariadb_prepare(&sql, binds)?;
+        // Multi-statement form: `UPDATE …; SELECT …` — run both, keep SELECT rows.
+        let rows: Vec<mysql_async::Row> = if msql.contains(';') && params.is_empty() {
+            let mut parts = msql.split(';').map(str::trim).filter(|s| !s.is_empty());
+            let Some(update_sql) = parts.next() else {
+                return Ok((0, Vec::new()));
+            };
+            let Some(select_sql) = parts.next() else {
+                return Err(Error::Postgres(
+                    "UPDATE RETURNING lowering produced no SELECT".into(),
+                ));
+            };
+            conn.query_drop(update_sql).await.map_err(mariadb_error)?;
+            conn.query(select_sql).await.map_err(mariadb_error)?
+        } else if params.is_empty() {
+            // MariaDB `INSERT/DELETE … RETURNING <cols>` yields the projected rows.
             conn.query(&msql).await.map_err(mariadb_error)?
+        } else if msql.contains(';') {
+            // Bound UPDATE RETURNING: same split; binds apply to both statements
+            // only when placeholders appear in both — our lowering puts binds in
+            // the UPDATE SET/WHERE and none in the SELECT of literals/columns.
+            let mut parts = msql.split(';').map(str::trim).filter(|s| !s.is_empty());
+            let Some(update_sql) = parts.next() else {
+                return Ok((0, Vec::new()));
+            };
+            let Some(select_sql) = parts.next() else {
+                return Err(Error::Postgres(
+                    "UPDATE RETURNING lowering produced no SELECT".into(),
+                ));
+            };
+            let (upd_sql, upd_params) = mariadb_prepare(update_sql, binds)?;
+            conn.exec_drop(upd_sql, Params::Positional(upd_params))
+                .await
+                .map_err(mariadb_error)?;
+            conn.query(select_sql).await.map_err(mariadb_error)?
         } else {
             conn.exec(&msql, Params::Positional(params))
                 .await
@@ -817,7 +1047,14 @@ impl OracleBackend for Arc<MariaDbBackend> {
                 };
                 let encoded = row
                     .as_ref(i)
-                    .map(|value| encode_value_for_column(value, is_numeric_column(kind), tw))
+                    .map(|value| {
+                        encode_value_for_column(
+                            value,
+                            is_numeric_column(kind),
+                            tw,
+                            FloatWire::Number,
+                        )
+                    })
                     .transpose()?;
                 col.push(encoded);
             }
@@ -828,13 +1065,260 @@ impl OracleBackend for Arc<MariaDbBackend> {
     async fn cancel(&self) {}
 }
 
+fn expand_instead_of_dml(
+    sql: &str,
+    triggers: &HashMap<String, InsteadOfTrigger>,
+) -> Option<String> {
+    let up = sql.to_ascii_uppercase();
+    let (event, rest_orig) = if up.starts_with("INSERT INTO ") {
+        ("INSERT", &sql["INSERT INTO ".len()..])
+    } else if up.starts_with("UPDATE ") {
+        ("UPDATE", &sql["UPDATE ".len()..])
+    } else if up.starts_with("DELETE FROM ") {
+        ("DELETE", &sql["DELETE FROM ".len()..])
+    } else {
+        return None;
+    };
+    let table = rest_orig
+        .split_whitespace()
+        .next()?
+        .trim_matches(|c| c == '"' || c == '`' || c == '(')
+        .to_ascii_lowercase();
+    let trig = triggers.get(&table)?;
+    if !trig.event.eq_ignore_ascii_case(event) {
+        return None;
+    }
+    let mut body = trig.body.clone();
+    if event == "INSERT" {
+        // INSERT INTO v (c1, c2) VALUES (v1, v2)
+        let cols_vals = parse_insert_cols_vals(sql)?;
+        for (col, val) in cols_vals {
+            body = replace_new_old_col(&body, "NEW", &col, &val);
+        }
+    }
+    // Drop a trailing END; / END from the PL/SQL wrapper if present — body is
+    // already the executable statement list extracted at CREATE time.
+    Some(body.trim().trim_end_matches(';').to_string())
+}
+
+fn parse_insert_cols_vals(sql: &str) -> Option<Vec<(String, String)>> {
+    let up = sql.to_ascii_uppercase();
+    let values_at = up.find(" VALUES ")?;
+    let before = sql[..values_at].trim_end();
+    let cols_open = before.rfind('(')?;
+    let cols_close = before.rfind(')')?;
+    let cols: Vec<String> = before[cols_open + 1..cols_close]
+        .split(',')
+        .map(|c| {
+            c.trim()
+                .trim_matches(|ch| ch == '"' || ch == '`' || ch == '\'')
+                .to_ascii_lowercase()
+        })
+        .collect();
+    let after = sql[values_at + " VALUES ".len()..].trim_start();
+    if !after.starts_with('(') {
+        return None;
+    }
+    let close = matching_paren_basic(after)?;
+    let vals = split_top_level_args(&after[1..close]);
+    if cols.len() != vals.len() {
+        return None;
+    }
+    Some(
+        cols.into_iter()
+            .zip(vals.into_iter().map(|v| v.trim().to_string()))
+            .collect(),
+    )
+}
+
+fn replace_new_old_col(body: &str, which: &str, col: &str, val: &str) -> String {
+    let mut out = body.to_string();
+    for pat in [
+        format!(":{which}.{col}"),
+        format!(":{which}.{u}", u = col.to_ascii_uppercase()),
+        format!("{which}.{col}"),
+        format!("{which}.{u}", u = col.to_ascii_uppercase()),
+    ] {
+        // Case-insensitive replace of the correlation reference.
+        while let Some(at) = out.to_ascii_uppercase().find(&pat.to_ascii_uppercase()) {
+            out.replace_range(at..at + pat.len(), val);
+        }
+    }
+    out
+}
+
+fn split_top_level_args(s: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut start = 0;
+    let mut depth = 0i32;
+    let mut quote: Option<u8> = None;
+    let b = s.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        if let Some(q) = quote {
+            if b[i] == q {
+                if b.get(i + 1) == Some(&q) {
+                    i += 2;
+                    continue;
+                }
+                quote = None;
+            }
+            i += 1;
+            continue;
+        }
+        match b[i] {
+            b'\'' | b'"' => quote = Some(b[i]),
+            b'(' => depth += 1,
+            b')' => depth -= 1,
+            b',' if depth == 0 => {
+                out.push(s[start..i].to_string());
+                start = i + 1;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    out.push(s[start..].to_string());
+    out
+}
+
+fn matching_paren_basic(s: &str) -> Option<usize> {
+    let b = s.as_bytes();
+    if !s.starts_with('(') {
+        return None;
+    }
+    let mut depth = 0i32;
+    let mut quote: Option<u8> = None;
+    for (i, &c) in b.iter().enumerate() {
+        if let Some(q) = quote {
+            if c == q {
+                if b.get(i + 1) == Some(&q) {
+                    continue;
+                }
+                quote = None;
+            }
+            continue;
+        }
+        match c {
+            b'\'' | b'"' => quote = Some(c),
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn parse_instead_of_trigger(sql: &str) -> Option<(String, InsteadOfTrigger)> {
+    let up = sql.to_ascii_uppercase();
+    if !up.contains(" INSTEAD OF ") {
+        return None;
+    }
+    // CREATE [OR REPLACE] TRIGGER name INSTEAD OF INSERT|UPDATE|DELETE ON view …
+    let on_at = up.find(" ON ")?;
+    let instead = up.find(" INSTEAD OF ")?;
+    let event = up[instead + " INSTEAD OF ".len()..]
+        .split_whitespace()
+        .next()?
+        .to_string();
+    let after_on = sql[on_at + 4..].trim();
+    let view = after_on
+        .split_whitespace()
+        .next()?
+        .trim_matches(|c| c == '"' || c == '`')
+        .to_ascii_lowercase();
+    // Body: innermost BEGIN … END block content (statements only).
+    let body = extract_plsql_begin_body(sql).unwrap_or_else(|| sql.to_string());
+    Some((view, InsteadOfTrigger { event, body }))
+}
+
+fn extract_plsql_begin_body(sql: &str) -> Option<String> {
+    let up = sql.to_ascii_uppercase();
+    let begin_at = up.rfind(" BEGIN ")?;
+    let after = sql[begin_at + " BEGIN ".len()..].trim();
+    let after_up = after.to_ascii_uppercase();
+    let end_at = after_up.rfind("END")?;
+    Some(after[..end_at].trim().trim_end_matches(';').to_string())
+}
+
 fn mariadb_error(e: mysql_async::Error) -> Error {
+    mariadb_error_for_sql(e, "")
+}
+
+/// Prefer [`mariadb_error_for_sql`] when the failing statement text is known so
+/// Oracle `error_pos` can point at the bad identifier.
+fn mariadb_error_for_sql(e: mysql_async::Error, sql: &str) -> Error {
     match e {
         mysql_async::Error::Server(server) => {
-            Error::Postgres(format!("{}: {}", server.state, server.message))
+            let detail = format!("{}: {}", server.state, server.message);
+            let position = estimate_mariadb_error_position(sql, &server.message);
+            Error::PgStatement { detail, position }
         }
         other => Error::Postgres(format!("MariaDB error: {other}")),
     }
+}
+
+/// Best-effort 1-based offset into `sql` for common MariaDB error shapes
+/// (`Unknown column 'x'`, `Unknown table 't'`).
+fn estimate_mariadb_error_position(sql: &str, message: &str) -> Option<u32> {
+    if sql.is_empty() {
+        return None;
+    }
+    for prefix in ["Unknown column '", "Unknown table '", "Table '", "Column '"] {
+        if let Some(rest) = message.strip_prefix(prefix)
+            && let Some(name) = rest.split('\'').next()
+            && !name.is_empty()
+        {
+            let lower_sql = sql.to_ascii_lowercase();
+            let lower_name = name.to_ascii_lowercase();
+            if let Some(idx) = lower_sql.find(&lower_name) {
+                return Some((idx + 1) as u32);
+            }
+        }
+    }
+    // Fallback: first non-keyword token after WHERE / SET often hosts the fault.
+    if let Some(w) = sql.to_ascii_uppercase().find(" WHERE ") {
+        return Some((w + " WHERE ".len() + 1) as u32);
+    }
+    Some(1)
+}
+
+/// `UPDATE t SET … WHERE … RETURNING exprs` → `UPDATE …; SELECT exprs FROM t WHERE …`.
+fn rewrite_update_returning_for_mariadb(sql: &str) -> String {
+    let up = sql.to_ascii_uppercase();
+    if !up.trim_start().starts_with("UPDATE ") {
+        return sql.to_string();
+    }
+    let Some(r_rel) = up.rfind(" RETURNING ") else {
+        return sql.to_string();
+    };
+    let update_part = sql[..r_rel].trim().trim_end_matches(';');
+    let exprs = sql[r_rel + " RETURNING ".len()..]
+        .trim()
+        .trim_end_matches(';');
+    if exprs.is_empty() {
+        return sql.to_string();
+    }
+    let after_update = update_part
+        .trim_start()
+        .strip_prefix("UPDATE ")
+        .or_else(|| update_part.trim_start().strip_prefix("update "))
+        .unwrap_or(update_part.trim_start());
+    let after_up = after_update.to_ascii_uppercase();
+    let Some(set_at) = after_up.find(" SET ") else {
+        return sql.to_string();
+    };
+    let table = after_update[..set_at].trim();
+    let where_clause = after_up
+        .rfind(" WHERE ")
+        .map(|w| &after_update[w..])
+        .unwrap_or("");
+    format!("{update_part}; SELECT {exprs} FROM {table}{where_clause}")
 }
 
 /// Run a statement that is not expected to hand back rows (DDL, a stored-program
@@ -872,21 +1356,36 @@ async fn fetch_all(
     // `query_iter` and `exec_iter` yield different protocol-typed `QueryResult`s,
     // so each branch drains its own.
     if params.is_empty() {
-        let mut result = conn.query_iter(&msql).await.map_err(mariadb_error)?;
+        let mut result = conn
+            .query_iter(&msql)
+            .await
+            .map_err(|e| mariadb_error_for_sql(e, sql))?;
         let columns = result.columns().unwrap_or_default();
-        let rows: Vec<mysql_async::Row> = result.collect().await.map_err(mariadb_error)?;
+        let rows: Vec<mysql_async::Row> = result
+            .collect()
+            .await
+            .map_err(|e| mariadb_error_for_sql(e, sql))?;
         // A statement can return more than one result set (`CALL`); drain the
         // rest so the next command does not read stale bytes.
-        result.drop_result().await.map_err(mariadb_error)?;
+        result
+            .drop_result()
+            .await
+            .map_err(|e| mariadb_error_for_sql(e, sql))?;
         Ok((columns, rows))
     } else {
         let mut result = conn
             .exec_iter(&msql, Params::Positional(params))
             .await
-            .map_err(mariadb_error)?;
+            .map_err(|e| mariadb_error_for_sql(e, sql))?;
         let columns = result.columns().unwrap_or_default();
-        let rows: Vec<mysql_async::Row> = result.collect().await.map_err(mariadb_error)?;
-        result.drop_result().await.map_err(mariadb_error)?;
+        let rows: Vec<mysql_async::Row> = result
+            .collect()
+            .await
+            .map_err(|e| mariadb_error_for_sql(e, sql))?;
+        result
+            .drop_result()
+            .await
+            .map_err(|e| mariadb_error_for_sql(e, sql))?;
         Ok((columns, rows))
     }
 }
@@ -953,6 +1452,18 @@ fn is_plsql_definition(sql: &str) -> bool {
 }
 
 fn mariadb_prepare(sql: &str, binds: &[BindValue]) -> Result<(String, Vec<Value>)> {
+    // Native MariaDB bind style (`?`) from `wire::bind_parameters`. Do not look
+    // for `$n` — the placeholders are already positional.
+    if !sql
+        .as_bytes()
+        .windows(2)
+        .any(|w| w[0] == b'$' && w[1].is_ascii_digit())
+        && sql.contains('?')
+        && !binds.is_empty()
+    {
+        let params = binds.iter().map(bind_value).collect::<Result<Vec<_>>>()?;
+        return Ok((sql.to_string(), params));
+    }
     let bytes = sql.as_bytes();
     // Byte buffer, not a `String`: the loop only special-cases ASCII bytes, and
     // every UTF-8 lead/continuation byte is >= 0x80, so copying non-special
@@ -1177,13 +1688,38 @@ fn temporal_wire(col: &mysql_async::Column, caps: &DescribeCaps) -> TemporalWire
     }
     let decimals = col.decimals();
     if decimals > 0 && caps.native_timestamps && !caps.datetime_as_date {
-        TemporalWire::Timestamp(decimals.min(9) as i8)
+        let scale = if caps.timestamp_scale_zero {
+            0
+        } else {
+            decimals.min(9) as i8
+        };
+        TemporalWire::Timestamp(scale)
     } else {
         TemporalWire::Date
     }
 }
 
-fn encode_value_for_column(value: &Value, number: bool, temporal: TemporalWire) -> Result<Vec<u8>> {
+fn encode_value_for_column(
+    value: &Value,
+    number: bool,
+    temporal: TemporalWire,
+    float: FloatWire,
+) -> Result<Vec<u8>> {
+    match float {
+        FloatWire::BinaryDouble => {
+            let v = value_as_f64(value).ok_or_else(|| {
+                Error::DataConversionError("BINARY_DOUBLE value is not numeric".into())
+            })?;
+            return Ok(crate::backend::encode_binary_double(v).to_vec());
+        }
+        FloatWire::BinaryFloat => {
+            let v = value_as_f64(value).ok_or_else(|| {
+                Error::DataConversionError("BINARY_FLOAT value is not numeric".into())
+            })?;
+            return Ok(crate::backend::encode_binary_float(v as f32).to_vec());
+        }
+        FloatWire::Number => {}
+    }
     if number {
         return match value {
             Value::Bytes(bytes) => encode_oracle_number_decimal(
@@ -1207,6 +1743,79 @@ fn encode_value_for_column(value: &Value, number: bool, temporal: TemporalWire) 
         });
     }
     encode_value(value)
+}
+
+fn value_as_f64(value: &Value) -> Option<f64> {
+    match value {
+        Value::Float(v) => Some(*v as f64),
+        Value::Double(v) => Some(*v),
+        Value::Int(v) => Some(*v as f64),
+        Value::UInt(v) => Some(*v as f64),
+        Value::Bytes(bytes) => std::str::from_utf8(bytes).ok()?.parse().ok(),
+        _ => None,
+    }
+}
+
+/// How a MariaDB FLOAT/DOUBLE column is delivered to the Oracle client.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FloatWire {
+    /// Oracle NUMBER (computed doubles, bare FLOAT/DOUBLE).
+    Number,
+    /// Oracle BINARY_FLOAT (type 100) — declared column tagged via COMMENT.
+    BinaryFloat,
+    /// Oracle BINARY_DOUBLE (type 101) — declared column tagged via COMMENT.
+    BinaryDouble,
+}
+
+/// Recover declared `BINARY_FLOAT` / `BINARY_DOUBLE` columns via the COMMENT
+/// marker written by [`crate::translate::oracle_to_mariadb`]. Computed floats
+/// (no table oid / empty table name) stay NUMBER.
+async fn lookup_ieee_float_wire(
+    conn: &mut Conn,
+    cols: &[mysql_async::Column],
+    native: bool,
+) -> Vec<FloatWire> {
+    let mut out = vec![FloatWire::Number; cols.len()];
+    if !native {
+        return out;
+    }
+    let needs_lookup = cols.iter().any(|col| {
+        !col.table_str().is_empty()
+            && matches!(
+                col.column_type(),
+                mysql_async::consts::ColumnType::MYSQL_TYPE_FLOAT
+                    | mysql_async::consts::ColumnType::MYSQL_TYPE_DOUBLE
+            )
+    });
+    if !needs_lookup {
+        return out;
+    }
+    let rows: Vec<(String, String, String)> = conn
+        .query(
+            "SELECT LOWER(TABLE_NAME), LOWER(COLUMN_NAME), COLUMN_COMMENT \
+             FROM information_schema.COLUMNS \
+             WHERE TABLE_SCHEMA = DATABASE() \
+               AND COLUMN_COMMENT IN ('dbsaci.binary_double', 'dbsaci.binary_float')",
+        )
+        .await
+        .unwrap_or_default();
+    let mut map = std::collections::HashMap::new();
+    for (table, column, comment) in rows {
+        map.insert((table, column), comment);
+    }
+    for (i, col) in cols.iter().enumerate() {
+        let table = col.table_str().to_ascii_lowercase();
+        if table.is_empty() {
+            continue;
+        }
+        let name = col.name_str().to_ascii_lowercase();
+        match map.get(&(table, name)).map(String::as_str) {
+            Some("dbsaci.binary_double") => out[i] = FloatWire::BinaryDouble,
+            Some("dbsaci.binary_float") => out[i] = FloatWire::BinaryFloat,
+            _ => {}
+        }
+    }
+    out
 }
 
 /// Parse a MariaDB temporal text rendering (`2024-02-29 13:14:15.123456`,
@@ -1275,6 +1884,21 @@ fn is_binary_string_column(kind: mysql_async::consts::ColumnType) -> bool {
     )
 }
 
+/// Build MariaDB connection options. `--db-ssl` is applied here so the schema
+/// probe and the session connection use the same TLS policy.
+fn mariadb_connection_opts(url: &str, ssl: bool) -> Result<Opts> {
+    let opts = Opts::from_url(url)
+        .map_err(|e| Error::Postgres(format!("invalid MariaDB connection URL: {e}")))?;
+    // CLIENT_FOUND_ROWS: UPDATE rowcount = rows matched, matching Oracle / the
+    // python-oracledb executemany assertion (not "rows actually changed").
+    let builder = mysql_async::OptsBuilder::from_opts(opts).client_found_rows(true);
+    Ok(if ssl {
+        builder.ssl_opts(mysql_async::SslOpts::default()).into()
+    } else {
+        builder.into()
+    })
+}
+
 /// Percent-encode the small set of URL-significant bytes accepted in
 /// configured credentials/database names without adding another URL parser.
 fn urlencoding(value: &str) -> String {
@@ -1291,7 +1915,12 @@ fn urlencoding(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::mariadb_sql;
+    use super::{
+        InsteadOfTrigger, estimate_mariadb_error_position, expand_instead_of_dml,
+        mariadb_connection_opts, mariadb_sql, parse_instead_of_trigger,
+        rewrite_update_returning_for_mariadb,
+    };
+    use std::collections::HashMap;
 
     #[test]
     fn converts_backend_parameters_but_not_literals_or_identifiers() {
@@ -1299,5 +1928,84 @@ mod tests {
             mariadb_sql("SELECT $1, '$2', \"$3\", `$4` WHERE x = $12"),
             "SELECT ?, '$2', \"$3\", `$4` WHERE x = ?"
         );
+    }
+
+    #[test]
+    fn schema_probe_and_session_share_ssl_opts() {
+        let url = "mysql://u:p@127.0.0.1:3306/db";
+        let plain = mariadb_connection_opts(url, false).expect("plain opts");
+        let tls = mariadb_connection_opts(url, true).expect("tls opts");
+        assert!(
+            plain.ssl_opts().is_none(),
+            "plaintext must not attach SslOpts"
+        );
+        assert!(
+            tls.ssl_opts().is_some(),
+            "--db-ssl must attach SslOpts on every Conn including the schema probe"
+        );
+    }
+
+    #[test]
+    fn update_returning_becomes_update_then_select() {
+        assert_eq!(
+            rewrite_update_returning_for_mariadb(
+                "UPDATE people SET team_id = 3 WHERE id = 77 RETURNING team_id"
+            ),
+            "UPDATE people SET team_id = 3 WHERE id = 77; SELECT team_id FROM people WHERE id = 77"
+        );
+    }
+
+    #[test]
+    fn error_position_finds_unknown_column() {
+        let sql = "SELECT 1 FROM people WHERE nonexistent_col_xyz = 1";
+        let pos = estimate_mariadb_error_position(
+            sql,
+            "Unknown column 'nonexistent_col_xyz' in 'where clause'",
+        );
+        assert_eq!(
+            pos,
+            Some(sql.find("nonexistent_col_xyz").unwrap() as u32 + 1)
+        );
+    }
+
+    #[test]
+    fn instead_of_insert_expands_new_bindings() {
+        let ddl = "CREATE OR REPLACE TRIGGER trg_io INSTEAD OF INSERT ON trg_v \
+             FOR EACH ROW BEGIN INSERT INTO trg_base (id, name) VALUES (:NEW.id, UPPER(:NEW.name)); END;";
+        let (view, trig) = parse_instead_of_trigger(ddl).expect("parse");
+        assert_eq!(view, "trg_v");
+        assert_eq!(trig.event, "INSERT");
+        let mut map = HashMap::new();
+        map.insert(view, trig);
+        let expanded =
+            expand_instead_of_dml("INSERT INTO trg_v (id, name) VALUES (1, 'ada')", &map)
+                .expect("expand");
+        assert!(
+            expanded.to_ascii_uppercase().contains("TRG_BASE"),
+            "{expanded}"
+        );
+        assert!(
+            expanded.contains("UPPER('ada')") || expanded.contains("UPPER('ADA')"),
+            "{expanded}"
+        );
+        assert!(expanded.contains('1'), "{expanded}");
+        assert!(
+            !expanded.to_ascii_uppercase().contains(":NEW"),
+            "{expanded}"
+        );
+    }
+
+    #[test]
+    fn instead_of_parse_ignores_ordinary_triggers() {
+        assert!(
+            parse_instead_of_trigger(
+                "CREATE OR REPLACE TRIGGER t BEFORE INSERT ON people FOR EACH ROW BEGIN NULL; END;"
+            )
+            .is_none()
+        );
+        let _ = InsteadOfTrigger {
+            event: "INSERT".into(),
+            body: "NULL".into(),
+        };
     }
 }

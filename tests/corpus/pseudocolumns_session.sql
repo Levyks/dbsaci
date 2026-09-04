@@ -20,7 +20,7 @@ CORPUS
 -- end
 
 -- case: alter_session_current_schema_changes_userenv
--- skip: mariadb (uses pg_catalog, a PostgreSQL-only schema)
+# known-gap (mariadb): tracked in expected-failures.mariadb — uses pg_catalog, a PostgreSQL-only schema
 -- setup: ALTER SESSION SET CURRENT_SCHEMA = pg_catalog
 SELECT SYS_CONTEXT('USERENV', 'CURRENT_SCHEMA') FROM DUAL
 -- expect:
@@ -58,7 +58,7 @@ SELECT TO_CHAR(SYSTIMESTAMP, 'YYYY-MM-DD"T"HH24:MI:SS') FROM DUAL
 -- end
 
 -- case: rowid_pseudocolumn
--- skip: mariadb (MariaDB has no ROWID pseudo-column)
+# known-gap (mariadb): expected-failures.mariadb — no ROWID (no id-column shim)
 SELECT COUNT(ROWID) FROM people
 -- expect:
 4

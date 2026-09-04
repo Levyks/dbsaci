@@ -28,8 +28,15 @@ outstanding, and the number should trend down as DbSaci improves. A case only
 moves or changes when *the expectation itself* was wrong about Oracle, not to
 make a red case green.
 
+Known-red cases for CI are listed in `expected-failures.postgres` /
+`expected-failures.mariadb` (one `group::case` per line). With
+`DBSACI_CORPUS_LEDGER=1` the runner exits 0 only when the failure set matches
+that file among executed cases — unexpected failures and unexpected passes
+both fail the job. Remove a line when a case goes green.
+
 `-- tag: skip` exists only for a case that would hang or wedge the shared
-connection in a way the reconnect can't recover; it is not for "known failing".
+connection in a way the reconnect can't recover; it is not for "known failing"
+or "backend cannot do this".
 
 ## Baseline data
 
@@ -66,6 +73,9 @@ build extra scaffolding.
 -- verify: <SQL> => <scalar>   (optional) run on an independent connection; asserts one committed scalar
 -- end
 ```
+
+Backend gaps (`# known-gap (mariadb): …`) are comments only. The case still
+runs; list it in `expected-failures.<backend>` until it is mapped.
 
 ### Expectations
 

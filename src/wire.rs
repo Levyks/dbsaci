@@ -858,6 +858,21 @@ pub fn execute_frame_has_no_sql(payload: &[u8]) -> bool {
     }
 }
 
+/// Cursor id from a thin-driver Execute preamble (`ub4` after exec options).
+pub fn parse_execute_cursor_id(payload: &[u8]) -> Option<u16> {
+    let mut buf = ReadBuffer::from_slice(payload);
+    (|| -> Result<u16> {
+        buf.read_u16_be()?;
+        buf.read_u8()?;
+        buf.read_u8()?;
+        buf.read_u8()?;
+        buf.read_ub4()?;
+        Ok(buf.read_ub4()? as u16)
+    })()
+    .ok()
+    .filter(|id| *id != 0)
+}
+
 pub fn parse_execute_request(payload: &[u8]) -> Result<ExecuteRequest> {
     // oracle-rs and python-oracledb thin write an execute preamble with a fixed
     // field layout (TTC field version 12.2 / 12.2-EXT1). ojdbc thin's layout
@@ -2155,7 +2170,19 @@ fn split_top_level_commas(s: &str) -> Vec<&str> {
 /// Convert Oracle `:name` / `:1` placeholders into PostgreSQL parameters.
 /// Repeated placeholders map to one PostgreSQL parameter, and supplied values
 /// that no placeholder references are not sent to PostgreSQL.
+/// Placeholder dialect for [`bind_parameters`]. MariaDB is first-class: it
+/// gets native `?` placeholders, never `$n::text` that later has to be un-done.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BindStyle {
+    Postgres,
+    MariaDb,
+}
+
 pub fn bind_postgres_parameters(sql: &str, binds: &[BindValue]) -> Result<BoundSql> {
+    bind_parameters(sql, binds, BindStyle::Postgres)
+}
+
+pub fn bind_parameters(sql: &str, binds: &[BindValue], style: BindStyle) -> Result<BoundSql> {
     use std::collections::HashMap;
 
     // PL/SQL definitions and blocks carry `:NEW` / `:OLD` trigger correlations
@@ -2270,16 +2297,26 @@ pub fn bind_postgres_parameters(sql: &str, binds: &[BindValue]) -> Result<BoundS
                 let value = binds.get(bind_index).ok_or_else(|| {
                     Error::DataConversionError(format!("missing value for bind :{name}"))
                 })?;
-                let parameter = match parameter_for_bind.get(&bind_index) {
-                    Some(parameter) => *parameter,
-                    None => {
-                        let parameter = ordered.len() + 1;
-                        parameter_for_bind.insert(bind_index, parameter);
+                match style {
+                    BindStyle::MariaDb => {
+                        // MariaDB `?` is strictly positional and cannot reuse a
+                        // parameter number; repeat the value for every occurrence.
                         ordered.push(value.clone());
-                        parameter
+                        out.push_str(mariadb_placeholder(value));
                     }
-                };
-                out.push_str(&postgres_parameter(parameter, value));
+                    BindStyle::Postgres => {
+                        let parameter = match parameter_for_bind.get(&bind_index) {
+                            Some(parameter) => *parameter,
+                            None => {
+                                let parameter = ordered.len() + 1;
+                                parameter_for_bind.insert(bind_index, parameter);
+                                ordered.push(value.clone());
+                                parameter
+                            }
+                        };
+                        out.push_str(&postgres_parameter(parameter, value));
+                    }
+                }
                 i = end;
                 continue;
             }
@@ -2299,6 +2336,14 @@ pub fn bind_postgres_parameters(sql: &str, binds: &[BindValue]) -> Result<BoundS
 
 /// Text values are cast on the server side. This preserves typed parameter
 /// semantics without interpolating Oracle NUMBER's arbitrary precision text.
+fn mariadb_placeholder(value: &BindValue) -> &'static str {
+    match value {
+        BindValue::Bytes(_) => "CAST(? AS BINARY)",
+        BindValue::Null | BindValue::String(_) => "CAST(? AS CHAR(4000))",
+        _ => "?",
+    }
+}
+
 fn postgres_parameter(parameter: usize, value: &BindValue) -> String {
     let param = format!("${parameter}");
     match value {
@@ -2332,6 +2377,31 @@ pub fn build_query_response(
     newer_describe_framing: bool,
     req_seq: u8,
 ) -> Bytes {
+    build_query_response_ex(
+        columns,
+        rows,
+        cursor_id,
+        has_more,
+        response_completion,
+        newer_describe_framing,
+        req_seq,
+        false,
+    )
+}
+
+/// Like [`build_query_response`], with `compact_describe_scale` for ODP.NET
+/// (`na_without_version_list`): jdbc describe scale is a compact `sb1`.
+#[allow(clippy::too_many_arguments)]
+pub fn build_query_response_ex(
+    columns: &[ColumnMeta],
+    rows: &[Vec<Option<Vec<u8>>>],
+    cursor_id: u16,
+    has_more: bool,
+    response_completion: bool,
+    newer_describe_framing: bool,
+    req_seq: u8,
+    compact_describe_scale: bool,
+) -> Bytes {
     build_query_response_inner(
         columns,
         rows,
@@ -2341,6 +2411,7 @@ pub fn build_query_response(
         newer_describe_framing,
         false,
         req_seq,
+        compact_describe_scale,
     )
 }
 
@@ -2601,6 +2672,7 @@ fn build_query_response_inner(
     newer_describe_framing: bool,
     oci_dialect: bool,
     req_seq: u8,
+    compact_describe_scale: bool,
 ) -> Bytes {
     let mut buf = WriteBuffer::new();
 
@@ -2617,7 +2689,7 @@ fn build_query_response_inner(
     );
     buf.write_u8(0x10); // DescribeInfo
     if newer_describe_framing {
-        write_describe_jdbc(&mut buf, columns);
+        write_describe_jdbc_ex(&mut buf, columns, compact_describe_scale);
     } else {
         // Both oracle-rs and python-oracledb consume a leading chunked-bytes
         // field before the describe body (`skip_raw_bytes_chunked` /
@@ -3506,7 +3578,17 @@ fn write_dalc(buf: &mut WriteBuffer, bytes: &[u8]) {
 /// python-oracledb / oracle-rs describe: no leading chunk, no max-row-size, and
 /// the per-column descriptor fields come in a different order. Verified
 /// byte-for-byte against a live Oracle XE 21c wire capture.
+#[allow(dead_code)]
 fn write_describe_jdbc(buf: &mut WriteBuffer, columns: &[ColumnMeta]) {
+    write_describe_jdbc_ex(buf, columns, false);
+}
+
+/// JDBC-style describe. When `compact_scale` is set (ODP.NET /
+/// `na_without_version_list`), the scale field is a compact `sb1` — a raw
+/// non-zero scale byte is parsed as a length prefix and causes ORA-12592.
+/// Precision stays a raw ub1 (matching the live Oracle→ODP.NET capture for
+/// `NUMBER(10,2)` / `TIMESTAMP(6)`).
+fn write_describe_jdbc_ex(buf: &mut WriteBuffer, columns: &[ColumnMeta], compact_scale: bool) {
     // prologue: `[ub1 n][n ignore bytes]` then an ignored ub4.
     buf.write_u8(0); // n = 0 ignore bytes
     buf.write_ub4(0); // ignored count
@@ -3520,7 +3602,11 @@ fn write_describe_jdbc(buf: &mut WriteBuffer, columns: &[ColumnMeta]) {
         buf.write_u8(col.oracle_type); // datatype
         buf.write_u8(col.flags); // flags
         buf.write_u8(col.precision as u8); // precision
-        buf.write_u8(col.scale as u8); // scale (sb1)
+        if compact_scale {
+            buf.write_sb1(col.scale);
+        } else {
+            buf.write_u8(col.scale as u8); // scale (raw ub1 — ojdbc)
+        }
         buf.write_ub4(col.max_size.max(col.buffer_size)); // max length (sb4)
         buf.write_ub4(0); // max array length (sb4)
         buf.write_ub8(0); // extra flags (sb8)
@@ -4125,5 +4211,30 @@ mod tests {
             .step_by(2)
             .map(|i| u8::from_str_radix(&clean[i..i + 2], 16).unwrap())
             .collect()
+    }
+
+    #[test]
+    fn odpnet_jdbc_describe_uses_compact_scale() {
+        use super::{ColumnMeta, write_describe_jdbc_ex};
+        use crate::buffer::WriteBuffer;
+        let cols = [ColumnMeta::number("PRICE", 10, 2)];
+        let mut raw = WriteBuffer::new();
+        write_describe_jdbc_ex(&mut raw, &cols, false);
+        let mut compact = WriteBuffer::new();
+        write_describe_jdbc_ex(&mut compact, &cols, true);
+        let raw = raw.into_inner();
+        let compact = compact.into_inner();
+        // Raw scale byte 0x02 must not appear as a lone scale field in the
+        // compact form — ODP.NET would treat it as a length prefix.
+        assert_ne!(
+            raw.as_ref(),
+            compact.as_ref(),
+            "compact scale must differ from raw ub1 scale"
+        );
+        // Compact sb1 for +2 is [0x01, 0x02]; precision 10 stays raw 0x0a.
+        assert!(
+            compact.windows(3).any(|w| w == [0x0a, 0x01, 0x02]),
+            "expected prec=10 raw + scale=+2 compact in {compact:02x?}"
+        );
     }
 }

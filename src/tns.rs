@@ -1,10 +1,16 @@
+use std::pin::Pin;
+
 use bytes::{Bytes, BytesMut};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::{Duration, timeout};
 
 use crate::buffer::ReadBuffer;
 use crate::error::{Error, Result};
+
+/// Byte stream the TNS framer reads and writes. Plain TCP or a TLS wrapper.
+pub(crate) trait TnsByteStream: AsyncRead + AsyncWrite + Unpin + Send + Sync {}
+impl<T: AsyncRead + AsyncWrite + Unpin + Send + Sync> TnsByteStream for T {}
 
 /// A peer-controlled TNS length must never turn into an unbounded allocation.
 const MAX_TNS_PACKET_SIZE: usize = 64 * 1024 * 1024;
@@ -60,8 +66,68 @@ pub struct Packet {
     pub payload: Bytes,
 }
 
+enum TnsInner {
+    Plain(TcpStream),
+    Tls(Pin<Box<dyn TnsByteStream>>),
+}
+
+impl TnsInner {
+    async fn io_read_exact(&mut self, buf: &mut [u8]) -> std::io::Result<()> {
+        match self {
+            Self::Plain(s) => {
+                let mut off = 0;
+                while off < buf.len() {
+                    let n = AsyncReadExt::read(s, &mut buf[off..]).await?;
+                    if n == 0 {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::UnexpectedEof,
+                            "eof",
+                        ));
+                    }
+                    off += n;
+                }
+                Ok(())
+            }
+            Self::Tls(s) => {
+                let mut off = 0;
+                while off < buf.len() {
+                    let n = AsyncReadExt::read(&mut **s, &mut buf[off..]).await?;
+                    if n == 0 {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::UnexpectedEof,
+                            "eof",
+                        ));
+                    }
+                    off += n;
+                }
+                Ok(())
+            }
+        }
+    }
+
+    async fn io_write_all(&mut self, buf: &[u8]) -> std::io::Result<()> {
+        match self {
+            Self::Plain(s) => {
+                AsyncWriteExt::write_all(s, buf).await?;
+                Ok(())
+            }
+            Self::Tls(s) => {
+                AsyncWriteExt::write_all(&mut **s, buf).await?;
+                Ok(())
+            }
+        }
+    }
+
+    async fn io_flush(&mut self) -> std::io::Result<()> {
+        match self {
+            Self::Plain(s) => AsyncWriteExt::flush(s).await,
+            Self::Tls(s) => AsyncWriteExt::flush(&mut **s).await,
+        }
+    }
+}
+
 pub struct TnsStream {
-    stream: TcpStream,
+    inner: TnsInner,
     mode: SduMode,
     idle_timeout: Option<Duration>,
     /// OCI thick clients frame their Fetch request with the full declared
@@ -73,7 +139,21 @@ pub struct TnsStream {
 impl TnsStream {
     pub fn new(stream: TcpStream) -> Self {
         Self {
-            stream,
+            inner: TnsInner::Plain(stream),
+            mode: SduMode::Small,
+            idle_timeout: None,
+            oci_client: false,
+        }
+    }
+
+    /// Wrap an already-handshaken TLS stream (TCPS). Urgent/OOB bytes are not
+    /// sent on TLS sessions.
+    pub fn new_tls<S>(stream: S) -> Self
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + Sync + 'static,
+    {
+        Self {
+            inner: TnsInner::Tls(Box::pin(stream)),
             mode: SduMode::Small,
             idle_timeout: None,
             oci_client: false,
@@ -93,7 +173,10 @@ impl TnsStream {
     /// to signal an attention / break before an in-band Marker packet; the OCI
     /// client will not accept a mid-call error without it. Best-effort.
     pub async fn send_urgent_byte(&self, byte: u8) {
-        let sock = socket2::SockRef::from(&self.stream);
+        let TnsInner::Plain(tcp) = &self.inner else {
+            return;
+        };
+        let sock = socket2::SockRef::from(tcp);
         let _ = sock.send_out_of_band(&[byte]);
     }
 
@@ -106,16 +189,18 @@ impl TnsStream {
 
     async fn read_exact(&mut self, buf: &mut [u8]) -> Result<()> {
         match self.idle_timeout {
-            Some(idle_timeout) => match timeout(idle_timeout, self.stream.read_exact(buf)).await {
-                Ok(Ok(_)) => Ok(()),
-                Ok(Err(error)) => Err(error.into()),
-                Err(_) => Err(Error::Protocol(format!(
-                    "TNS peer was idle for {} seconds while a packet was incomplete",
-                    idle_timeout.as_secs()
-                ))),
-            },
+            Some(idle_timeout) => {
+                match timeout(idle_timeout, self.inner.io_read_exact(buf)).await {
+                    Ok(Ok(_)) => Ok(()),
+                    Ok(Err(error)) => Err(error.into()),
+                    Err(_) => Err(Error::Protocol(format!(
+                        "TNS peer was idle for {} seconds while a packet was incomplete",
+                        idle_timeout.as_secs()
+                    ))),
+                }
+            }
             None => {
-                self.stream.read_exact(buf).await?;
+                self.inner.io_read_exact(buf).await?;
                 Ok(())
             }
         }
@@ -272,8 +357,8 @@ impl TnsStream {
                 buf.extend_from_slice(&body[off..end]);
                 off = end;
             }
-            self.stream.write_all(&buf).await?;
-            self.stream.flush().await?;
+            self.inner.io_write_all(&buf).await?;
+            self.inner.io_flush().await?;
             return Ok(());
         }
         self.emit_one_packet(packet_type, flags, payload).await
@@ -325,8 +410,8 @@ impl TnsStream {
                 hex_dump(payload)
             );
         }
-        self.stream.write_all(&buf).await?;
-        self.stream.flush().await?;
+        self.inner.io_write_all(&buf).await?;
+        self.inner.io_flush().await?;
         Ok(())
     }
 

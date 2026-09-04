@@ -125,11 +125,38 @@ using (var c = conn.CreateCommand())
     r.Read();
     Check("number_ps_value", r.GetDecimal(0), 1234.56m);
     Check("binary_double_value", r.GetDouble(1), 3.5);
+    var schema = r.GetSchemaTable();
+    if (schema != null)
+    {
+        Check("number_ps_precision", schema.Rows[0]["NumericPrecision"], 10);
+        Check("number_ps_scale", schema.Rows[0]["NumericScale"], 2);
+    }
 }
 using (var c = conn.CreateCommand())
 {
     c.CommandText = "DROP TABLE dn_types";
     c.ExecuteNonQuery();
+}
+
+using (var c = conn.CreateCommand())
+{
+    c.CommandText = "SELECT CAST(TIMESTAMP '2024-02-29 13:14:15' AS TIMESTAMP) FROM DUAL";
+    using var r = c.ExecuteReader();
+    r.Read();
+    var tn = r.GetDataTypeName(0);
+    Check("timestamp_type_name_is_timestamp", tn.ToUpperInvariant().Contains("TIMESTAMP"), true);
+}
+
+using (var c1 = conn.CreateCommand())
+using (var c2 = conn.CreateCommand())
+{
+    c1.CommandText = "SELECT name FROM people WHERE id = 1";
+    c2.CommandText = "SELECT name FROM people WHERE id = 2";
+    using var r1 = c1.ExecuteReader();
+    using var r2 = c2.ExecuteReader();
+    r1.Read(); r2.Read();
+    Check("multi_cursor_first", r1.GetString(0), "Ada");
+    Check("multi_cursor_second", r2.GetString(0), "Grace");
 }
 
 // 6. array bind (ODP.NET ArrayBindCount / batch DML)

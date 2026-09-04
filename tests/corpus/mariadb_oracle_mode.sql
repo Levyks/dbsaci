@@ -2,7 +2,7 @@
 # They are not MariaDB SQL feature tests. PostgreSQL's current PL/SQL lowering
 # does not implement Oracle packages, so this group documents a real MariaDB
 # compatibility advantage while keeping the shared corpus Oracle-shaped.
-# skip: postgres (PostgreSQL backend has no Oracle PACKAGE lowering)
+# known-gap (postgres): tracked in expected-failures.postgres — no Oracle PACKAGE lowering
 
 -- case: oracle_package_function
 -- setup: CREATE OR REPLACE PACKAGE dbsaci_pkg AS FUNCTION answer RETURN NUMBER; END;

@@ -26,7 +26,7 @@ DD_DEMO
 -- end
 
 -- case: all_tables_has_owner
--- skip: mariadb (facade reports the connected Oracle schema, not the fixture's PostgreSQL PUBLIC alias)
+# known-gap (mariadb): tracked in expected-failures.mariadb — facade reports the connected Oracle schema, not the fixture's PostgreSQL PUBLIC alias
 SELECT owner FROM all_tables WHERE table_name = 'DD_DEMO'
 -- expect:
 PUBLIC
@@ -182,7 +182,7 @@ SELECT COUNT(*) FROM sys.all_ind_expressions
 -- end
 
 -- case: all_triggers_reports_timing_event_action_type
--- skip: mariadb (a BEFORE INSERT OR UPDATE trigger is split into two single-event MariaDB triggers; the all_triggers facade does not reassemble the combined event)
+# known-gap (mariadb): tracked in expected-failures.mariadb — a BEFORE INSERT OR UPDATE trigger is split into two single-event MariaDB triggers; the all_triggers facade does not reassemble the combined event
 -- setup: CREATE TABLE trg_probe (id NUMBER, n NUMBER)
 -- setup: CREATE OR REPLACE TRIGGER trg_probe_biu BEFORE INSERT OR UPDATE ON trg_probe FOR EACH ROW BEGIN :NEW.n := NVL(:NEW.n, 0) + 1; END;
 SELECT trigger_type, triggering_event, action_type, before_row, status

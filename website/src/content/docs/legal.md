@@ -3,8 +3,9 @@ title: Legal & trademarks
 description: Trademark attribution and the scope of what this project ships.
 ---
 
-dbSaci is an independent implementation of a wire-compatible proxy. It is **not
-affiliated with, endorsed by, or sponsored by Oracle Corporation.**
+dbSaci is released under the **Apache License 2.0**. It is an independent
+implementation of a wire-compatible proxy. It is **not affiliated with,
+endorsed by, or sponsored by Oracle Corporation.**
 
 "Oracle", "TNS", "OCI", "JDBC", and related marks are trademarks of Oracle
 Corporation and/or its affiliates. They are used here only descriptively, to

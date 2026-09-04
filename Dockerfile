@@ -1,5 +1,5 @@
-# Build: docker build -t levyks/dbsaci:0.1.1 .
-# Run:   docker run --rm -p 1521:1521 -e DBSACI_DB_HOST=... levyks/dbsaci:0.1.1
+# Build: docker build -t levyks/dbsaci:0.2.0 .
+# Run:   docker run --rm -p 1521:1521 -e DBSACI_DB_HOST=... levyks/dbsaci:0.2.0
 #
 # dbSaci has no C libraries to link against — `ring` (rustls provider) and the
 # RustCrypto auth ciphers compile from vendored assembly, tokio-postgres and

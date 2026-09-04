@@ -1,0 +1,5 @@
+# MariaDB Oracle mode has DUAL; the translator must not drop it the way the
+# PostgreSQL printer does. Table identifiers fold to IdentifierCase::Upper.
+SELECT 1 FROM DUAL => SELECT 1 FROM DUAL
+SELECT 1 FROM dual => SELECT 1 FROM dual
+SELECT 1 FROM Dual => SELECT 1 FROM Dual

@@ -36,7 +36,6 @@ NULL | Marketing
 -- end
 
 -- case: full_outer_join
--- skip: mariadb (MariaDB 11.4 has no FULL OUTER JOIN and no projection-agnostic UNION rewrite)
 SELECT p.name, t.name FROM people p FULL OUTER JOIN teams t ON p.team_id = t.id ORDER BY t.id, p.id
 -- expect:
 Ada | Engineering
@@ -99,7 +98,6 @@ Linus
 -- end
 
 -- case: lateral_join
--- skip: mariadb (MariaDB 11.4 has no LATERAL join)
 SELECT p.name, x.c FROM people p CROSS JOIN LATERAL (SELECT COUNT(*) c FROM people q WHERE q.team_id = p.team_id) x WHERE p.id = 1
 -- expect:
 Ada | 2

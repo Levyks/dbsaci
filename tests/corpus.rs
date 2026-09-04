@@ -11,8 +11,10 @@
 //!
 //! Format reference: `tests/corpus/README.md`.
 
+use std::collections::BTreeSet;
 use std::path::Path;
 use std::sync::mpsc::{Receiver, Sender, channel};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
@@ -60,24 +62,53 @@ fn main() {
         }
     };
 
+    let backend = current_backend();
+    let failed_names: Arc<Mutex<BTreeSet<String>>> = Arc::new(Mutex::new(BTreeSet::new()));
+    let executed_names: Arc<Mutex<BTreeSet<String>>> = Arc::new(Mutex::new(BTreeSet::new()));
+    let all_case_names: BTreeSet<String> = groups
+        .iter()
+        .flat_map(|g| g.cases.iter().map(|c| format!("{}::{}", g.name, c.name)))
+        .collect();
+
     let mut trials = Vec::new();
     for group in &groups {
         // A group can declare a minimum PostgreSQL major (`# requires-pg: N`) for
         // features with a hard version floor (e.g. `MERGE` needs PG 15). Below
-        // that, its cases run as ignored rather than red.
-        let below_floor = group.min_pg.is_some_and(|m| pg_major != 0 && pg_major < m);
-        let backend = current_backend();
-        let group_skipped = group.skip_backends.iter().any(|b| b == backend);
+        // that, its cases run as ignored rather than red. The floor applies only
+        // to the PostgreSQL corpus — MariaDB's VERSION() major must not suppress
+        // Oracle-shaped cases (they stay red via expected-failures.mariadb).
+        let below_floor =
+            backend == "postgres" && group.min_pg.is_some_and(|m| pg_major != 0 && pg_major < m);
         for case in &group.cases {
             let name = format!("{}::{}", group.name, case.name);
             let job_tx = job_tx.clone();
             let case = case.clone();
-            let skip = case.skip
-                || below_floor
-                || group_skipped
-                || case.skip_backends.iter().any(|b| b == backend);
-            trials
-                .push(Trial::test(name, move || run_trial(&job_tx, case)).with_ignored_flag(skip));
+            // `-- tag: skip` is reserved for cases that wedge the shared
+            // connection. Backend gaps are real failures tracked in
+            // `expected-failures.<backend>`, not ignored.
+            let skip = case.skip || below_floor;
+            let failed_names = Arc::clone(&failed_names);
+            let executed_names = Arc::clone(&executed_names);
+            let case_name = name.clone();
+            trials.push(
+                Trial::test(name, move || {
+                    executed_names
+                        .lock()
+                        .expect("executed_names lock")
+                        .insert(case_name.clone());
+                    match run_trial(&job_tx, case) {
+                        Ok(()) => Ok(()),
+                        Err(e) => {
+                            failed_names
+                                .lock()
+                                .expect("failed_names lock")
+                                .insert(case_name);
+                            Err(e)
+                        }
+                    }
+                })
+                .with_ignored_flag(skip),
+            );
         }
     }
 
@@ -88,7 +119,111 @@ fn main() {
     drop(job_tx);
     let _ = handle.join();
 
+    // Ledger mode: compare the failure set to `expected-failures.<backend>`.
+    // CI stays green when the backlog matches; unexpected fails or unexpected
+    // passes (ledger entries that went green) fail the job.
+    if std::env::var_os("DBSACI_CORPUS_LEDGER").is_some() {
+        match evaluate_ledger(
+            backend,
+            &all_case_names,
+            &executed_names.lock().expect("executed_names lock"),
+            &failed_names.lock().expect("failed_names lock"),
+        ) {
+            Ok(()) => std::process::exit(0),
+            Err(msg) => {
+                eprintln!("{msg}");
+                std::process::exit(1);
+            }
+        }
+    }
+
     conclusion.exit();
+}
+
+/// Load `tests/corpus/expected-failures.<backend>` and compare against the run.
+fn evaluate_ledger(
+    backend: &str,
+    all_cases: &BTreeSet<String>,
+    executed: &BTreeSet<String>,
+    failed: &BTreeSet<String>,
+) -> Result<(), String> {
+    let expected = load_expected_failures(backend)?;
+    let unknown: Vec<_> = expected.difference(all_cases).cloned().collect();
+    let not_run: Vec<_> = expected.difference(executed).cloned().collect();
+    let unexpected: Vec<_> = failed.difference(&expected).cloned().collect();
+    let xpass: Vec<_> = expected
+        .intersection(executed)
+        .filter(|name| !failed.contains(*name))
+        .cloned()
+        .collect();
+
+    eprintln!(
+        "corpus ledger ({backend}): {} failed, {} expected, {} unexpected, {} unexpected-pass, {} not-run",
+        failed.len(),
+        expected.len(),
+        unexpected.len(),
+        xpass.len(),
+        not_run.len()
+    );
+    if !unknown.is_empty() {
+        eprintln!(
+            "stale ledger entries (not in corpus):\n  {}",
+            unknown.join("\n  ")
+        );
+    }
+    if !not_run.is_empty() {
+        eprintln!(
+            "expected failures that did not run (ignored/filtered — remove from ledger or un-ignore):\n  {}",
+            not_run.join("\n  ")
+        );
+    }
+    if !unexpected.is_empty() {
+        eprintln!(
+            "unexpected failures (add to expected-failures.{backend} only if Oracle-correct):\n  {}",
+            unexpected.join("\n  ")
+        );
+    }
+    if !xpass.is_empty() {
+        eprintln!(
+            "unexpected passes (remove from expected-failures.{backend}):\n  {}",
+            xpass.join("\n  ")
+        );
+    }
+    if unknown.is_empty() && not_run.is_empty() && unexpected.is_empty() && xpass.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "corpus ledger mismatch for {backend}: {} unexpected fail(s), {} unexpected pass(es), {} not-run, {} stale entr(y/ies)",
+            unexpected.len(),
+            xpass.len(),
+            not_run.len(),
+            unknown.len()
+        ))
+    }
+}
+
+fn load_expected_failures(backend: &str) -> Result<BTreeSet<String>, String> {
+    let path = Path::new(CORPUS_DIR).join(format!("expected-failures.{backend}"));
+    if !path.exists() {
+        return Ok(BTreeSet::new());
+    }
+    let text = std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let mut out = BTreeSet::new();
+    for (lineno, raw) in text.lines().enumerate() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if !line.contains("::") {
+            return Err(format!(
+                "{}:{}: expected `group::case`, got `{line}`",
+                path.display(),
+                lineno + 1
+            ));
+        }
+        out.insert(line.to_string());
+    }
+    Ok(out)
 }
 
 // ---------------------------------------------------------------------------
@@ -353,6 +488,14 @@ impl TestBackend {
             .query_drop("GRANT ALL PRIVILEGES ON *.* TO 'corpus'@'%' WITH GRANT OPTION")
             .await
             .map_err(|e| format!("grant MariaDB cross-schema access: {e}"))?;
+        // Mirror PostgreSQL's `public` + per-user schema model: fixtures that
+        // land in `public` on PG must show owner PUBLIC in ALL_TABLES here too.
+        for db in ["public", "corpus_hr", "pg_catalog"] {
+            admin
+                .query_drop(format!("CREATE DATABASE IF NOT EXISTS `{db}`"))
+                .await
+                .map_err(|e| format!("create MariaDB schema `{db}`: {e}"))?;
+        }
         for statement in MARIADB_BASELINE_SQL
             .split(';')
             .map(str::trim)
@@ -394,12 +537,25 @@ impl TestBackend {
                     .replace("generate_series(1, 300) g", "(SELECT g FROM mariadb_series WHERE g <= 300) g")
                     .replace("generate_series(1, 400000) g", "(SELECT g FROM mariadb_series WHERE g <= 400000) g")
                     .replace("generate_series(1, 1000000) g", "(SELECT g FROM mariadb_series WHERE g <= 1000000) g");
+                // `CREATE SCHEMA` → `CREATE DATABASE`; keep `public.` / `corpus_hr.`
+                // qualifiers so ALL_TABLES owners match Oracle/PG.
+                let statement = if let Some(rest) = statement
+                    .strip_prefix("CREATE SCHEMA IF NOT EXISTS ")
+                    .or_else(|| statement.strip_prefix("CREATE SCHEMA "))
+                {
+                    let name = rest
+                        .split_whitespace()
+                        .next()
+                        .unwrap_or(rest)
+                        .trim_matches(|c| c == '"' || c == '`');
+                    format!("CREATE DATABASE IF NOT EXISTS `{name}`")
+                } else {
+                    statement.to_string()
+                };
                 let statement = statement
-                    .replace(
-                        "public.corpus_shared_ref (k text PRIMARY KEY",
-                        "corpus_shared_ref (k varchar(255) PRIMARY KEY",
-                    )
-                    .replace("public.corpus_shared_ref", "corpus_shared_ref");
+                    .replace(" text PRIMARY KEY", " varchar(255) PRIMARY KEY")
+                    .replace(" text)", " varchar(255))")
+                    .replace(" text,", " varchar(255),");
                 // MariaDB has no dedicated `timestamptz`; fixtures that declare
                 // one still need a table so the cases that read it are visible
                 // (their time-zone *semantics* remain a MariaDB limitation). The
@@ -414,6 +570,13 @@ impl TestBackend {
                     .replace("plain timestamp", "plain datetime");
                 let statement = if let Some(rest) = statement.strip_prefix("COMMENT ON TABLE ") {
                     if let Some((table, comment)) = rest.split_once(" IS ") {
+                        let table = if table.contains('.') {
+                            table.to_string()
+                        } else if mariadb_fixture_owns_public(table) {
+                            format!("`public`.{table}")
+                        } else {
+                            table.to_string()
+                        };
                         format!("ALTER TABLE {table} COMMENT = {comment}")
                     } else {
                         statement.to_string()
@@ -421,6 +584,8 @@ impl TestBackend {
                 } else {
                     statement.to_string()
                 };
+                // Unqualified fixture DDL (PG's public schema) → `public` DB.
+                let statement = qualify_mariadb_public_fixture(&statement);
                 // Fixtures are intentionally shared with PostgreSQL. MariaDB
                 // should still start and report the affected cases when a
                 // fixture uses PostgreSQL-only DDL (COMMENT ON, extensions,
@@ -430,6 +595,12 @@ impl TestBackend {
                 }
             }
         }
+        // Unqualified fallback for `public` objects (PG search_path behaviour).
+        let _ = admin
+            .query_drop(
+                "CREATE OR REPLACE VIEW corpus.corpus_shared_ref AS SELECT * FROM `public`.corpus_shared_ref",
+            )
+            .await;
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -750,6 +921,83 @@ async fn connect_admin(host: &str, port: u16) -> Result<Client, String> {
     Err(format!("admin connect to postgres: {last}"))
 }
 
+/// Whether an unqualified fixture object should live in MariaDB `public` so
+/// ALL_TABLES reports owner PUBLIC. Only the data-dictionary / shared-ref
+/// fixtures need that; other fixtures must stay in `corpus` so unqualified
+/// DML from the session (USE corpus) still resolves — MariaDB has no
+/// search_path.
+fn mariadb_fixture_owns_public(name: &str) -> bool {
+    let n = name
+        .trim_matches(|c| c == '"' || c == '`')
+        .to_ascii_lowercase();
+    n.starts_with("dd_") || n == "corpus_shared_ref"
+}
+
+/// Place selected unqualified fixture DDL into MariaDB's `public` database.
+/// Already-qualified names (`public.x`, `corpus_hr.x`) and `CREATE DATABASE`
+/// statements are left alone.
+fn qualify_mariadb_public_fixture(statement: &str) -> String {
+    let trimmed = statement.trim_start();
+    let up = trimmed.to_ascii_uppercase();
+    if up.starts_with("CREATE DATABASE ") || up.starts_with("USE ") {
+        return statement.to_string();
+    }
+    for (prefix, after_kw) in [
+        ("CREATE TABLE IF NOT EXISTS ", "CREATE TABLE IF NOT EXISTS "),
+        ("CREATE TABLE ", "CREATE TABLE "),
+        ("CREATE INDEX IF NOT EXISTS ", "CREATE INDEX IF NOT EXISTS "),
+        ("CREATE INDEX ", "CREATE INDEX "),
+        (
+            "CREATE SEQUENCE IF NOT EXISTS ",
+            "CREATE SEQUENCE IF NOT EXISTS ",
+        ),
+        ("CREATE SEQUENCE ", "CREATE SEQUENCE "),
+        (
+            "CREATE UNIQUE INDEX IF NOT EXISTS ",
+            "CREATE UNIQUE INDEX IF NOT EXISTS ",
+        ),
+        ("CREATE UNIQUE INDEX ", "CREATE UNIQUE INDEX "),
+        ("TRUNCATE ", "TRUNCATE "),
+        ("INSERT INTO ", "INSERT INTO "),
+        ("ALTER TABLE ", "ALTER TABLE "),
+    ] {
+        if let Some(rest) = up.strip_prefix(prefix) {
+            let rest_orig = &trimmed[prefix.len()..];
+            let name = rest
+                .split_whitespace()
+                .next()
+                .unwrap_or("")
+                .trim_matches(|c| c == '"' || c == '`');
+            if name.is_empty() || name.contains('.') {
+                return statement.to_string();
+            }
+            // CREATE INDEX name ON table — qualify the table, not the index name.
+            if prefix.contains("INDEX") {
+                if let Some(on_at) = rest_orig.to_ascii_uppercase().find(" ON ") {
+                    let table_part = rest_orig[on_at + 4..].trim_start();
+                    let table = table_part
+                        .split_whitespace()
+                        .next()
+                        .unwrap_or("")
+                        .trim_matches(|c| c == '"' || c == '`' || c == '(');
+                    if mariadb_fixture_owns_public(table) {
+                        let (before_on, _) = rest_orig.split_at(on_at);
+                        let after_table = &table_part[table.len()..];
+                        return format!("{after_kw}{before_on} ON `public`.{table}{after_table}");
+                    }
+                }
+                return statement.to_string();
+            }
+            if !mariadb_fixture_owns_public(name) {
+                return statement.to_string();
+            }
+            let after_name = &rest_orig[name.len()..];
+            return format!("{after_kw}`public`.{name}{after_name}");
+        }
+    }
+    statement.to_string()
+}
+
 async fn connect_maria_admin(host: &str, port: u16) -> Result<MariaConn, String> {
     let url = format!("mysql://root@{host}:{port}/corpus");
     let opts = mysql_async::Opts::from_url(&url).map_err(|e| e.to_string())?;
@@ -798,8 +1046,6 @@ struct Group {
     /// Minimum PostgreSQL major required for this group's feature (from a
     /// `# requires-pg: N` line). Cases run as ignored on older backends.
     min_pg: Option<u32>,
-    /// Backends this whole group cannot run on (`# skip: mariadb`).
-    skip_backends: Vec<String>,
 }
 
 #[derive(Clone)]
@@ -812,9 +1058,6 @@ struct Case {
     expect: Expect,
     verify: Option<Verify>,
     skip: bool,
-    /// Backends this case cannot run on (`-- skip: mariadb (reason)`); it runs
-    /// as ignored there instead of red.
-    skip_backends: Vec<String>,
 }
 
 /// The engine the corpus is exercising, from `DBSACI_CORPUS_BACKEND`.
@@ -823,18 +1066,6 @@ fn current_backend() -> &'static str {
         Ok("mariadb") => "mariadb",
         _ => "postgres",
     }
-}
-
-/// Parse the backend list in a `-- skip:` / `# skip:` directive — a
-/// whitespace-separated set of backend names, an optional `(reason)` ignored.
-fn parse_skip_backends(value: &str) -> Vec<String> {
-    value
-        .split('(')
-        .next()
-        .unwrap_or("")
-        .split_whitespace()
-        .map(str::to_string)
-        .collect()
 }
 
 #[derive(Clone)]
@@ -883,7 +1114,6 @@ fn parse_group(name: &str, text: &str) -> Result<Group, String> {
     let mut fixtures = Vec::new();
     let mut cases: Vec<Case> = Vec::new();
     let mut min_pg: Option<u32> = None;
-    let mut group_skip_backends: Vec<String> = Vec::new();
     let mut lines = text.lines().peekable();
 
     while let Some(raw) = lines.next() {
@@ -891,10 +1121,6 @@ fn parse_group(name: &str, text: &str) -> Result<Group, String> {
         let trimmed = line.trim();
         if let Some(rest) = trimmed.strip_prefix("# requires-pg:") {
             min_pg = rest.trim().parse().ok();
-            continue;
-        }
-        if let Some(rest) = trimmed.strip_prefix("# skip:") {
-            group_skip_backends.extend(parse_skip_backends(rest));
             continue;
         }
         if trimmed.is_empty()
@@ -915,7 +1141,6 @@ fn parse_group(name: &str, text: &str) -> Result<Group, String> {
         let mut teardown = Vec::new();
         let mut binds = Vec::new();
         let mut skip = false;
-        let mut skip_backends: Vec<String> = Vec::new();
         let mut sql_lines: Vec<String> = Vec::new();
         let mut expect: Option<Expect> = None;
         let mut verify: Option<Verify> = None;
@@ -944,8 +1169,6 @@ fn parse_group(name: &str, text: &str) -> Result<Group, String> {
                     "skip" => skip = true,
                     other => return Err(format!("case `{case_name}`: unknown tag `{other}`")),
                 }
-            } else if let Some(v) = directive(l, "skip") {
-                skip_backends.extend(parse_skip_backends(v));
             } else if let Some(v) = directive(l, "verify") {
                 let (sql, exp) = v.split_once("=>").ok_or_else(|| {
                     format!("case `{case_name}`: `-- verify:` needs `SQL => EXPECTED`")
@@ -1013,7 +1236,6 @@ fn parse_group(name: &str, text: &str) -> Result<Group, String> {
             expect,
             verify,
             skip,
-            skip_backends,
         });
     }
 
@@ -1022,7 +1244,6 @@ fn parse_group(name: &str, text: &str) -> Result<Group, String> {
         fixtures,
         cases,
         min_pg,
-        skip_backends: group_skip_backends,
     })
 }
 
@@ -1035,7 +1256,6 @@ fn is_directive(line: &str) -> bool {
         "-- teardown:",
         "-- bind:",
         "-- tag:",
-        "-- skip:",
         "-- verify:",
         "-- expect:",
         "-- expect-regex:",

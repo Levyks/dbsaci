@@ -70,7 +70,7 @@ SELECT 9999999999999999 + 1 FROM DUAL
 -- end
 
 -- case: division_by_zero_raises
--- skip: mariadb (MariaDB does not raise on division by zero in a SELECT expression)
+# known-gap (mariadb): tracked in expected-failures.mariadb — MariaDB does not raise on division by zero in a SELECT expression
 SELECT 1 / 0 FROM DUAL
 -- error: ORA-01476
 -- end
@@ -82,7 +82,7 @@ SELECT '10' + 5 FROM DUAL
 -- end
 
 -- case: non_numeric_string_arithmetic_errors
--- skip: mariadb (MariaDB coerces instead of raising ORA-01722 in SELECT)
+# known-gap (mariadb): tracked in expected-failures.mariadb — MariaDB coerces instead of raising ORA-01722 in SELECT
 SELECT 'abc' + 1 FROM DUAL
 -- error: ORA-01722
 -- end

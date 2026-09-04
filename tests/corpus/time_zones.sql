@@ -41,7 +41,7 @@ SELECT SESSIONTIMEZONE FROM dual
 -- end
 
 -- case: timestamptz_rendered_in_session_zone
--- skip: mariadb (MariaDB has no TIMESTAMP WITH TIME ZONE type)
+# known-gap (mariadb): tracked in expected-failures.mariadb — MariaDB has no TIMESTAMP WITH TIME ZONE type
 -- setup: ALTER SESSION SET TIME_ZONE = 'America/Sao_Paulo'
 SELECT TO_CHAR(ts, 'YYYY-MM-DD HH24:MI TZH:TZM') FROM tz_corpus WHERE id = 1
 -- expect:
@@ -49,7 +49,7 @@ SELECT TO_CHAR(ts, 'YYYY-MM-DD HH24:MI TZH:TZM') FROM tz_corpus WHERE id = 1
 -- end
 
 -- case: timestamptz_binary_value_follows_session_zone
--- skip: mariadb (MariaDB has no TIMESTAMP WITH TIME ZONE type)
+# known-gap (mariadb): tracked in expected-failures.mariadb — MariaDB has no TIMESTAMP WITH TIME ZONE type
 -- setup: ALTER SESSION SET TIME_ZONE = 'America/Sao_Paulo'
 SELECT TO_CHAR(ts, 'HH24:MI') FROM tz_corpus WHERE id = 1
 -- expect:
@@ -57,7 +57,7 @@ SELECT TO_CHAR(ts, 'HH24:MI') FROM tz_corpus WHERE id = 1
 -- end
 
 -- case: timestamptz_offset_zone
--- skip: mariadb (MariaDB has no TIMESTAMP WITH TIME ZONE type)
+# known-gap (mariadb): tracked in expected-failures.mariadb — MariaDB has no TIMESTAMP WITH TIME ZONE type
 -- setup: ALTER SESSION SET TIME_ZONE = '-05:00'
 SELECT TO_CHAR(ts, 'HH24:MI') FROM tz_corpus WHERE id = 1
 -- expect:
@@ -75,7 +75,7 @@ SELECT TO_CHAR(plain, 'YYYY-MM-DD HH24:MI') FROM tz_corpus WHERE id = 1
 # server-side TO_CHAR — exercises the wire-encoding path directly. The UTC
 # instant carries the session zone's offset (client renders `utc + offset`).
 -- case: raw_timestamptz_carries_session_offset_region
--- skip: mariadb (MariaDB has no TIMESTAMP WITH TIME ZONE type)
+# known-gap (mariadb): tracked in expected-failures.mariadb — MariaDB has no TIMESTAMP WITH TIME ZONE type
 -- setup: ALTER SESSION SET TIME_ZONE = 'America/Sao_Paulo'
 SELECT ts FROM tz_corpus WHERE id = 1
 -- expect:
@@ -83,7 +83,7 @@ SELECT ts FROM tz_corpus WHERE id = 1
 -- end
 
 -- case: raw_timestamptz_carries_session_offset_fixed
--- skip: mariadb (MariaDB has no TIMESTAMP WITH TIME ZONE type)
+# known-gap (mariadb): tracked in expected-failures.mariadb — MariaDB has no TIMESTAMP WITH TIME ZONE type
 -- setup: ALTER SESSION SET TIME_ZONE = '-05:00'
 SELECT ts FROM tz_corpus WHERE id = 1
 -- expect:

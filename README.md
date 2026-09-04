@@ -46,15 +46,17 @@ exactly as they are.
 - **PostgreSQL** (recent release) with the **`orafce`** extension available
   (`CREATE EXTENSION orafce`), or **MariaDB 11.4+**. DbSaci sets
   `SQL_MODE=ORACLE` on every backend session itself and folds table identifiers
-  to lower case, so the MariaDB server needs no special configuration —
-  `lower_case_table_names` can stay at its default. A PostgreSQL test image is
-  built from `testcontainers/Dockerfile`.
+  to **upper** case by default (`--identifier-case upper|lower`), so the MariaDB
+  server needs no special `lower_case_table_names` setting. A PostgreSQL test
+  image is built from `testcontainers/Dockerfile`.
 - **Rust** (stable, 2024 edition) to build DbSaci.
 - A login role on the selected backend for the proxy to connect as; one Oracle
   session maps to one dedicated backend connection, so size the backend's
   connection capacity accordingly.
-- Transport is **plaintext** on both sides today. Run DbSaci behind a
-  TLS-terminating boundary if you need encryption in transit.
+- Transport defaults to **plaintext**. Enable TCPS on the TNS listener with
+  `--tls-cert` / `--tls-key` (`DBSACI_TLS_CERT` / `DBSACI_TLS_KEY`) and require
+  TLS to the backend with `--db-ssl` (`DBSACI_DB_SSL`). A TLS-terminating
+  boundary in front of a plaintext listener is still valid.
 
 ## Running it
 
@@ -92,8 +94,8 @@ for the backend-by-backend feature status.
 
 Then connect any Oracle client to `//host:1521/FREEPDB1`.
 
-Or run it from a container (`levyks/dbsaci:0.1.1`) —
-`docker run -p 1521:1521 -e DBSACI_DB_HOST=… levyks/dbsaci:0.1.1`. See the
+Or run it from a container (`levyks/dbsaci:0.2.0`) —
+`docker run -p 1521:1521 -e DBSACI_DB_HOST=… levyks/dbsaci:0.2.0`. See the
 [docs](https://levyks.github.io/dbsaci/getting-started/) for a full
 docker-compose.
 
@@ -117,6 +119,8 @@ dbsaci \
   --db-password postgres                           # fallback for anyone not listed
 # env equivalents: DBSACI_DB_USERS="alice:s3cret,bob:hunter2",
 #                  DBSACI_DB_USERS_FILE=..., DBSACI_DB_PASSWORD=...
+# There is no built-in default password. Unknown users are ORA-01017
+# unless --db-password / a user list entry matches.
 ```
 
 Sources layer file &lt; `DBSACI_DB_USERS` &lt; `--db-user`. The username is matched
@@ -197,7 +201,9 @@ columns (no `ER_CANT_AGGREGATE_2COLLATIONS` against `utf8mb4_uca1400_ai_ci`).
   row/statement, `WHEN (...)`, `:NEW`/`:OLD`, and bodies that do column
   assignment, an audit `INSERT`, or `RAISE_APPLICATION_ERROR` — lowered to a
   PostgreSQL trigger function.
-- **Anonymous PL/SQL blocks** and basic standalone function/procedure bodies.
+- **Anonymous PL/SQL blocks** and basic standalone function/procedure bodies
+  (PostgreSQL lane is richer: `%TYPE`/`%ROWTYPE`, explicit cursors,
+  `WHERE CURRENT OF`, `PRAGMA EXCEPTION_INIT` — see the compatibility matrix).
 - **Errors**: ~40 PostgreSQL `SQLSTATE`s map to real `ORA-` numbers
   (deadlock, serialization failure, unique/foreign-key/not-null/check
   violations, lock timeout, statement cancellation, connection loss, …).
@@ -212,25 +218,21 @@ Roughly most-likely-to-bite first.
 
 - **Package-scale PL/SQL.** Packages (state, overloading, the PL/SQL type
   system), `BULK COLLECT` / `FORALL`, pipelined functions, and compound
-  triggers. Anonymous blocks, standalone functions/procedures, and simple
-  triggers translate — including `%TYPE`/`%ROWTYPE`, explicit cursors,
-  `WHERE CURRENT OF`, statement `CASE`, `WHILE`/`LOOP`, exception handlers, and
-  `PRAGMA EXCEPTION_INIT` — but the further a body strays from that, the more
-  likely the translation is to be wrong rather than merely rejected.
+  triggers. On **MariaDB**, also no honest `ROWID`, autonomous transactions,
+  `WHERE CURRENT OF`, or `PRAGMA EXCEPTION_INIT` (those are not faked with
+  column-named-`id` shims). Anonymous blocks and simple routines still run
+  where MariaDB Oracle mode accepts them.
 - **OUT binds and `SYS_REFCURSOR`.** `RETURNING <cols> INTO :out` DML works for
   `python-oracledb` thin (ojdbc / ODP.NET get `ORA-03001`). PL/SQL OUT
   parameters (`BEGIN :x := … END`) and `SYS_REFCURSOR` are not implemented.
 - **LOB streaming.** `CLOB`/`BLOB` values are delivered inline and capped at one
   ~64 MiB TTC packet. There are no TTC LOB locators and no multi-gigabyte
   streaming. `DBMS_LOB.GETLENGTH/SUBSTR/INSTR` exist as plain SQL functions.
-- **Declared `NUMBER(p,s)` precision/scale in result metadata for ojdbc /
-  ODP.NET.** Those two drivers see every `NUMBER` as `(38,0)` (their
-  column-metadata parser desyncs on a non-zero scale field);
-  `python-oracledb` thin and `oracle-rs` get the real precision/scale. Values
-  are always exact.
-- **Native TTC encodings for `INTERVAL`, `BINARY_FLOAT` / `BINARY_DOUBLE`** on
-  result columns are complete for `python-oracledb` thin; other drivers get
-  `NUMBER` / an Oracle-style interval text rendering.
+- **Native TTC encodings for `INTERVAL`** on MariaDB result columns (text only
+  today; PostgreSQL + python-oracledb thin get types 182/183). `BINARY_FLOAT` /
+  `BINARY_DOUBLE` native wire is complete for python-oracledb thin.
+  `NUMBER(p,s)` and `TIMESTAMP` describe are reported for ojdbc / ODP.NET from
+  0.2.0.
 - **Full Oracle implicit type conversion / NLS behaviour**, autonomous
   transactions.
 - **Non-UTF-8 wire character sets.** The server side is AL32UTF8 only.
@@ -259,7 +261,7 @@ One sample run — 2 000 iterations/op (30 for the heavy ops), single connection
 Everything runs in Docker on one bridge network — the client, Oracle XE,
 PostgreSQL and dbSaci — so every hop is a container veth with no host
 port-proxy in the path. dbSaci runs from its published image
-(`levyks/dbsaci:0.1.1`, a distroless glibc build). Both database containers get
+(`levyks/dbsaci:0.2.0`, a distroless glibc build). Both database containers get
 **2 CPU / 2.5 GiB**: Oracle XE spends its full 2 GiB licence (`INIT_SGA_SIZE`
 1536M + `INIT_PGA_SIZE` 512M), PostgreSQL is **tuned to that envelope**
 (`shared_buffers` 768 MB, 64 MB `work_mem`, parallel workers, `jit=off`). A
@@ -338,18 +340,22 @@ Other suites:
 
 - `cargo test --lib` — fast unit tests (auth crypto vectors, NUMBER codec,
   translator), no container.
-- `cargo test --test translate_golden` — pure `oracle_to_postgres` string→string
-  goldens, no container.
+- `cargo test --test translate_golden` — `oracle_to_postgres` and
+  `oracle_to_mariadb` string→string goldens, no container.
 - `clients/run.sh <python|java|dotnet> [11]` — end-to-end probe with a real
   third-party Oracle driver (`python-oracledb` thin, ojdbc thin, ODP.NET
-  managed on .NET 10). CI runs all three against both the 19c and 11g personas.
+  managed on .NET 10). Probes always send Oracle SQL;
+  `DBSACI_CLIENT_BACKEND` only selects the container. Known reds live in
+  `clients/expected-failures`; CI sets `DBSACI_CLIENT_LEDGER=1`. Matrix:
+  `{python,java,dotnet}` × `{postgres,mariadb}` × `{19c,11g}`.
+- Corpus known reds: `tests/corpus/expected-failures.<backend>`; CI sets
+  `DBSACI_CORPUS_LEDGER=1` so the job stays green iff the failure set matches.
 - `bench/run.sh` — the latency microbenchmark behind *How slow is this?* above.
 
 ## License
 
-[WTFPL](LICENSE) — Do What The Fuck You Want To Public License, v2. Use it,
-fork it, ship it, sell it; no attribution required. (See *Legal / trademarks*
-below — that covers Oracle's marks and drivers, not this code.)
+[Apache-2.0](LICENSE). (See *Legal / trademarks* below — that covers Oracle's
+marks and drivers, not this code.)
 
 ## Legal / trademarks
 

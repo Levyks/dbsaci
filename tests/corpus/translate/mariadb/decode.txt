@@ -1,0 +1,3 @@
+# DECODE is native in MariaDB Oracle mode (except the 2-arg hex form).
+SELECT DECODE(1, 1, 'a', 'b') FROM DUAL => SELECT DECODE(1, 1, 'a', 'b') FROM DUAL
+SELECT DECODE(team_id, 1, 'eng', 'other') FROM people => SELECT DECODE(team_id, 1, 'eng', 'other') FROM PEOPLE

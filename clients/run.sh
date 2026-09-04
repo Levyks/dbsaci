@@ -3,9 +3,10 @@
 #
 #   clients/run.sh <python|java|dotnet> [oracle-version]
 #
-# Starts a real PostgreSQL+orafce container and a real DbSaci proxy, seeds the
-# baseline schema, then runs the named client probe against it. `oracle-version`
-# is passed through as DBSACI_ORACLE_VERSION (default: unset = 19c).
+# Starts a backend container and a real DbSaci proxy, seeds the baseline
+# schema, then runs the named client probe against it. `oracle-version` is
+# passed through as DBSACI_ORACLE_VERSION (default: unset = 19c).
+# Set DBSACI_CLIENT_BACKEND=mariadb to probe MariaDB instead of PostgreSQL.
 #
 # Requires: docker, cargo, and the toolchain for the chosen client
 # (python + `pip install oracledb`; a JDK; or the .NET SDK).
@@ -13,6 +14,7 @@ set -euo pipefail
 
 client="${1:?usage: clients/run.sh <python|java|dotnet> [oracle-version]}"
 oracle_version="${2:-}"
+backend="${DBSACI_CLIENT_BACKEND:-postgres}"
 root="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$root"
 
@@ -29,6 +31,38 @@ cleanup() {
 }
 trap cleanup EXIT
 
+if [ "$backend" = "mariadb" ]; then
+  echo "== starting mariadb:11.4 =="
+  cid=$(docker run -d \
+    -e MARIADB_ALLOW_EMPTY_ROOT_PASSWORD=yes \
+    -e MARIADB_DATABASE=corpus \
+    -e MARIADB_USER=corpus \
+    -e MARIADB_PASSWORD=corpus \
+    -P mariadb:11.4 --lower-case-table-names=1)
+  db_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "3306/tcp") 0).HostPort}}' "$cid")
+  echo "== waiting for mariadb =="
+  ok=0
+  for _ in $(seq 1 120); do
+    if docker exec "$cid" mariadb -ucorpus -pcorpus corpus -e 'SELECT 1' >/dev/null 2>&1; then
+      ok=$((ok + 1))
+      [ "$ok" -ge 3 ] && break
+    else
+      ok=0
+    fi
+    sleep 1
+  done
+  echo "== seeding MariaDB baseline =="
+  docker exec -i "$cid" mariadb -ucorpus -pcorpus corpus <<'SQL'
+DROP TABLE IF EXISTS people, teams;
+CREATE TABLE teams  (id INTEGER PRIMARY KEY, name VARCHAR(64) NOT NULL);
+CREATE TABLE people (id INTEGER PRIMARY KEY, name VARCHAR(64) NOT NULL, team_id INTEGER);
+INSERT INTO teams  (id, name)          VALUES (1,'Engineering'),(2,'Sales'),(3,'Marketing');
+INSERT INTO people (id, name, team_id) VALUES (1,'Ada',1),(2,'Grace',1),(3,'Linus',2),(4,'Margaret',NULL);
+SQL
+  export DBSACI_BACKEND=mariadb
+  export DBSACI_DB_NAME=corpus
+  export DBSACI_DB_PORT="$db_port"
+else
 if ! docker image inspect "$pg_image" >/dev/null 2>&1; then
   echo "== building $pg_image (postgres:${pg_major} + orafce) =="
   docker build --build-arg "PG_VERSION=${pg_major}" -t "$pg_image" "$root/testcontainers"
@@ -36,7 +70,7 @@ fi
 
 echo "== starting postgres container =="
 cid=$(docker run -d -e POSTGRES_PASSWORD=postgres -e POSTGRES_DB=postgres -P "$pg_image")
-pg_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "5432/tcp") 0).HostPort}}' "$cid")
+db_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "5432/tcp") 0).HostPort}}' "$cid")
 
 echo "== waiting for postgres =="
 # The official postgres image runs a throwaway server for its init scripts, then
@@ -77,12 +111,16 @@ SQL
   sleep 2
 done
 [ "$seeded" = 1 ] || { echo "!! could not seed schema" >&2; exit 1; }
+  export DBSACI_DB_NAME=postgres
+  export DBSACI_DB_PORT="$db_port"
+fi
 
 echo "== building + starting dbsaci =="
 cargo build --quiet --bin dbsaci
+export DBSACI_CLIENT_BACKEND="$backend"
 export DBSACI_LISTEN="127.0.0.1:${listen_port}"
-export DBSACI_DB_HOST=127.0.0.1 DBSACI_DB_PORT="$pg_port"
-export DBSACI_DB_NAME=postgres DBSACI_DB_PASSWORD=corpus
+export DBSACI_DB_HOST=127.0.0.1
+export DBSACI_DB_PASSWORD=corpus
 export DBSACI_HEALTH_ADDR="127.0.0.1:${health_port}"
 # Mirror tests/corpus.rs: a 2 s per-statement cap so the corpus's
 # `statement_timeout_is_user_cancel` case surfaces ORA-01013.

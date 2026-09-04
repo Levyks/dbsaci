@@ -290,6 +290,7 @@ impl PostgresBackend {
         password: &str,
         db: &str,
         statement_timeout: Option<Duration>,
+        ssl: bool,
     ) -> Result<Self> {
         // Oracle client usernames are typically upper-case; PostgreSQL role names are
         // case-sensitive in the catalog, so normalize to lower-case for the backend.
@@ -300,26 +301,54 @@ impl PostgresBackend {
         conn_config.user(&pg_user);
         conn_config.password(password);
         conn_config.dbname(db);
+        if ssl {
+            conn_config.ssl_mode(tokio_postgres::config::SslMode::Require);
+        }
         tracing::debug!(
-            "postgres connecting to host={} port={} user={} db={}",
+            "postgres connecting to host={} port={} user={} db={} ssl={}",
             host,
             port,
             pg_user,
-            db
+            db,
+            ssl
         );
-        let (client, connection) = match conn_config.connect(NoTls).await {
-            Ok(c) => c,
-            Err(e) => {
-                let detail = pg_error_detail(&e);
-                tracing::error!("postgres connect failed: {}", detail);
-                return Err(Error::Postgres(detail));
-            }
+        let client = if ssl {
+            let mut roots = rustls::RootCertStore::empty();
+            roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+            let tls_cfg = rustls::ClientConfig::builder()
+                .with_root_certificates(roots)
+                .with_no_client_auth();
+            let tls = tokio_postgres_rustls::MakeRustlsConnect::new(tls_cfg);
+            let (client, connection) = match conn_config.connect(tls).await {
+                Ok(c) => c,
+                Err(e) => {
+                    let detail = pg_error_detail(&e);
+                    tracing::error!("postgres connect failed: {}", detail);
+                    return Err(Error::Postgres(detail));
+                }
+            };
+            tokio::spawn(async move {
+                if let Err(e) = connection.await {
+                    eprintln!("postgres connection error: {}", e);
+                }
+            });
+            client
+        } else {
+            let (client, connection) = match conn_config.connect(NoTls).await {
+                Ok(c) => c,
+                Err(e) => {
+                    let detail = pg_error_detail(&e);
+                    tracing::error!("postgres connect failed: {}", detail);
+                    return Err(Error::Postgres(detail));
+                }
+            };
+            tokio::spawn(async move {
+                if let Err(e) = connection.await {
+                    eprintln!("postgres connection error: {}", e);
+                }
+            });
+            client
         };
-        tokio::spawn(async move {
-            if let Err(e) = connection.await {
-                eprintln!("postgres connection error: {}", e);
-            }
-        });
 
         // Oracle's model is "schema == user": every user owns a schema of its
         // own name, unqualified DDL/DML lands there, and other schemas are
@@ -2172,9 +2201,8 @@ pub struct QueryResult {
 #[derive(Debug, Clone, Copy)]
 pub struct DescribeCaps {
     /// Report a declared `NUMBER(p, s)`'s real precision/scale instead of the
-    /// `(38, 0)` fallback. python-oracledb thin and oracle-rs handle it; the
-    /// ojdbc / ODP.NET column-metadata parser desyncs on a non-zero scale
-    /// field, so they don't.
+    /// `(38, 0)` fallback. Enabled for thin/jdbc/ODP.NET; ODP.NET receives
+    /// scale as a compact `sb1` on the jdbc describe path.
     pub report_number_scale: bool,
     /// Promote a `BINARY_FLOAT` / `BINARY_DOUBLE` column to the native Oracle
     /// type (100 / 101). Only python-oracledb thin decodes those from the wire
@@ -2194,22 +2222,9 @@ pub struct DescribeCaps {
     /// ODP.NET) wants the classic 13-byte form, so the two cannot share one
     /// encoding.
     pub oci: bool,
-    /// ojdbc thin / ODP.NET describe PG `timestamp` / `timestamptz` columns as
-    /// Oracle **DATE** (internal type 12), not the native `TIMESTAMP` (180) /
-    /// `TIMESTAMP WITH TIME ZONE` (181). Two reasons: (1) their column-metadata
-    /// parser desyncs on the native datetime descriptor (a non-zero scale field
-    /// shifts its reads and it overruns an 8-byte scratch buffer — an
-    /// `ArrayIndexOutOfBoundsException`); (2) the overwhelmingly common
-    /// real-Oracle case is a `DATE` column (which the DDL translator turns into
-    /// PG `timestamp(0)`), and ojdbc maps Oracle `DATE` straight to
-    /// `java.sql.Timestamp`, so `rs.getObject()` returns what apps expect —
-    /// native `TIMESTAMP` would return `oracle.sql.TIMESTAMP` and break a
-    /// `(java.sql.Timestamp)` cast (exactly as against real Oracle, but dbSaci
-    /// can't tell DATE-origin from TIMESTAMP-origin PG `timestamp` apart).
-    /// Known limitation: an Oracle `TIMESTAMP(n>0)` column queried over
-    /// ojdbc/ODP.NET comes back with second precision and
-    /// `getColumnTypeName() == "DATE"`. OCI thick and the thin drivers keep the
-    /// native types.
+    /// When true, emit TIMESTAMP describe with scale 0. ODP.NET desyncs on a
+    /// non-zero TIMESTAMP scale the same way it does on NUMBER scale.
+    pub timestamp_scale_zero: bool,
     pub datetime_as_date: bool,
 }
 
@@ -2221,6 +2236,7 @@ impl DescribeCaps {
         native_intervals: false,
         native_timestamps: false,
         oci: false,
+        timestamp_scale_zero: false,
         datetime_as_date: false,
     };
 
@@ -2228,21 +2244,64 @@ impl DescribeCaps {
     /// `oac_strict` marks the clients whose column-describe parser needs an
     /// exact column descriptor (the newer describe path); it is independent of
     /// the OCI dialect.
+    ///
+    /// From 0.2.0, ojdbc / ODP.NET receive real `NUMBER(p,s)` and native
+    /// `TIMESTAMP` describe (type 180), not the historical `(38,0)` / `DATE`
+    /// fallback. Values were always exact; metadata now matches.
     pub fn for_client(
         response_completion: bool,
         newer_describe_framing: bool,
         oci_dialect: bool,
-        oac_strict: bool,
+        na_without_version_list: bool,
     ) -> Self {
         let thin_strict = response_completion && !newer_describe_framing;
+        let _ = na_without_version_list; // scale compactness is a wire concern
         Self {
-            report_number_scale: !newer_describe_framing,
+            // ojdbc accepts raw ub1 scale; ODP.NET needs compact sb1 scale
+            // (see `write_describe_jdbc_ex` + live Oracle capture). Both get
+            // real NUMBER(p,s) / TIMESTAMP scale now.
+            report_number_scale: true,
             native_binary_floats: thin_strict,
             native_intervals: thin_strict,
             native_timestamps: true,
             oci: oci_dialect,
-            datetime_as_date: oac_strict,
+            timestamp_scale_zero: false,
+            datetime_as_date: false,
         }
+    }
+}
+
+#[cfg(test)]
+mod describe_caps_tests {
+    use super::DescribeCaps;
+
+    #[test]
+    fn jdbc_describe_number_scale_and_timestamp() {
+        // ojdbc: newer describe, non-empty version list.
+        let caps = DescribeCaps::for_client(true, true, false, false);
+        assert!(caps.report_number_scale);
+        assert!(caps.native_timestamps);
+        assert!(!caps.datetime_as_date);
+    }
+
+    #[test]
+    fn odpnet_reports_real_number_and_timestamp_scale() {
+        // na_without_version_list=true → compact sb1 scale on the wire, but
+        // ColumnMeta still carries the real (p,s) / TIMESTAMP scale.
+        let caps = DescribeCaps::for_client(true, true, false, true);
+        assert!(caps.report_number_scale);
+        assert!(caps.native_timestamps);
+        assert!(!caps.timestamp_scale_zero);
+        assert!(!caps.datetime_as_date);
+    }
+
+    #[test]
+    fn python_thin_describe_keeps_full_fidelity() {
+        let caps = DescribeCaps::for_client(true, false, false, false);
+        assert!(caps.report_number_scale);
+        assert!(caps.native_timestamps);
+        assert!(caps.native_binary_floats);
+        assert!(!caps.datetime_as_date);
     }
 }
 
@@ -2330,7 +2389,7 @@ fn warn_facade_install_error(what: &str, e: &tokio_postgres::Error) {
 /// The raw components of a PostgreSQL `interval` value (binary wire form:
 /// `i64` microseconds, `i32` days, `i32` months, all big-endian).
 #[derive(Clone, Copy, Debug)]
-struct PgInterval {
+pub(crate) struct PgInterval {
     months: i32,
     days: i32,
     micros: i64,
@@ -2362,7 +2421,7 @@ impl<'a> FromSql<'a> for PgInterval {
 impl PgInterval {
     /// Oracle INTERVAL YEAR TO MONTH wire form (5 bytes): `u32` years and a
     /// `u8` month, each biased (years by 2^31, month by 60).
-    fn encode_year_to_month(&self) -> Vec<u8> {
+    pub(crate) fn encode_year_to_month(&self) -> Vec<u8> {
         let years = self.months / 12;
         let rem_months = self.months % 12;
         let mut out = Vec::with_capacity(5);
@@ -2374,7 +2433,7 @@ impl PgInterval {
     /// Oracle INTERVAL DAY TO SECOND wire form (11 bytes): `u32` days (bias
     /// 2^31), `u8` hours/minutes/seconds (bias 60), `u32` fractional-second
     /// nanoseconds (bias 2^31). Months, if any, are folded in as 30-day units.
-    fn encode_day_to_second(&self) -> Vec<u8> {
+    pub(crate) fn encode_day_to_second(&self) -> Vec<u8> {
         let total_days = self.days as i64 + self.months as i64 * 30;
         let mut secs = self.micros / 1_000_000;
         let nanos = (self.micros % 1_000_000) * 1000;
@@ -2617,7 +2676,7 @@ fn pg_column_to_oracle_meta(
             // `scale` carries the fractional-second precision (6 = default); the
             // OCI thick client's value decoder desyncs when it is left 0.
             let mut m = scalar(180, 11);
-            m.scale = 6;
+            m.scale = if caps.timestamp_scale_zero { 0 } else { 6 };
             m
         }
     } else if *ty == Type::TIMESTAMPTZ {
@@ -2636,7 +2695,7 @@ fn pg_column_to_oracle_meta(
             } else {
                 scalar(181, 13)
             };
-            m.scale = 6;
+            m.scale = if caps.timestamp_scale_zero { 0 } else { 6 };
             m
         }
     } else if *ty == Type::INTERVAL {
@@ -2799,7 +2858,7 @@ fn encode_oracle_timestamp_tz(
 /// Oracle BINARY_FLOAT wire form: IEEE-754 big-endian with the sign bit
 /// manipulated so the byte order sorts numerically — positive values get the
 /// high bit set, negative values are bitwise-inverted.
-fn encode_binary_float(value: f32) -> [u8; 4] {
+pub(crate) fn encode_binary_float(value: f32) -> [u8; 4] {
     let mut b = value.to_bits().to_be_bytes();
     if b[0] & 0x80 == 0 {
         b[0] |= 0x80;
@@ -2812,7 +2871,7 @@ fn encode_binary_float(value: f32) -> [u8; 4] {
 }
 
 /// Oracle BINARY_DOUBLE wire form (same sign-adjusted big-endian scheme).
-fn encode_binary_double(value: f64) -> [u8; 8] {
+pub(crate) fn encode_binary_double(value: f64) -> [u8; 8] {
     let mut b = value.to_bits().to_be_bytes();
     if b[0] & 0x80 == 0 {
         b[0] |= 0x80;

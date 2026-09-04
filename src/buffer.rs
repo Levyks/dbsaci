@@ -369,6 +369,13 @@ impl WriteBuffer {
         }
     }
 
+    /// Compact signed byte (`sb1`): length-prefixed like [`write_sb2`] but only
+    /// for a single signed byte. Used by ODP.NET's jdbc-style describe scale
+    /// field (a raw `0x02` is read as "next 2 bytes", desyncing the parser).
+    pub fn write_sb1(&mut self, value: i8) {
+        self.write_sb2(value as i16);
+    }
+
     pub fn write_i16_be(&mut self, value: i16) {
         self.data.put_i16(value);
     }

@@ -5,7 +5,6 @@
 # rowcount-reporting case in particular cannot be a DO block), so this group is
 # skipped on older backends.
 # requires-pg: 15
-# skip: mariadb (MariaDB has no MERGE statement and no portable lowering)
 #
 # Cases that need to inspect the result run the MERGE in `-- setup:` and assert
 # the resulting table state in the body.

@@ -61,9 +61,32 @@ public class JdbcCompat {
                 // column-metadata parser desyncs on a non-zero scale field);
                 // the value is still exact.
                 check("number_ps_value", r.getBigDecimal(1).toPlainString(), "1234.56");
+                check("number_ps_precision", r.getMetaData().getPrecision(1), 10);
+                check("number_ps_scale", r.getMetaData().getScale(1), 2);
                 check("binary_double_value", r.getDouble(2), 3.5);
             }
             try (Statement s = c.createStatement()) { s.execute("DROP TABLE jdbc_types"); }
+            try (Statement s = c.createStatement(); ResultSet r = s.executeQuery(
+                    "SELECT CAST(TIMESTAMP '2024-02-29 13:14:15' AS TIMESTAMP) FROM DUAL")) {
+                r.next();
+                String tn = r.getMetaData().getColumnTypeName(1);
+                check("timestamp_type_name", tn != null && tn.toUpperCase().contains("TIMESTAMP"), true);
+            }
+            try (Statement s1 = c.createStatement(); Statement s2 = c.createStatement()) {
+                ResultSet r1 = s1.executeQuery("SELECT name FROM people WHERE id = 1");
+                ResultSet r2 = s2.executeQuery("SELECT name FROM people WHERE id = 2");
+                r1.next(); r2.next();
+                check("multi_cursor_first", r1.getString(1), "Ada");
+                check("multi_cursor_second", r2.getString(1), "Grace");
+            }
+            try (Statement s = c.createStatement()) {
+                try {
+                    s.execute("CREATE PROCEDURE open_emp (c OUT SYS_REFCURSOR) AS BEGIN OPEN c FOR SELECT 1 FROM dual; END;");
+                    check("refcursor_rejected", false, true);
+                } catch (SQLException e) {
+                    check("refcursor_ora_3001", e.getMessage() != null && e.getMessage().contains("03001"), true);
+                }
+            }
             c.commit();
         }
         System.out.printf("%n%d/%d checks passed%n", pass, pass + fail);

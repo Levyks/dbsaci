@@ -37,7 +37,11 @@ so dbSaci must already hold each user's backend password.
 | `--db-user <USER:PASSWORD>` | *(CLI only)* | One pair. **Repeatable.** Highest precedence. |
 | `--db-users <LIST>` | `DBSACI_DB_USERS` | Comma-separated `user:password,user:password`. |
 | `--db-users-file <PATH>` | `DBSACI_DB_USERS_FILE` | File of `user:password` lines (`#` comments and blank lines ignored). |
-| `--db-password <PASSWORD>` | `DBSACI_DB_PASSWORD` | Fallback password for any user not named above. Default fallback: `postgres`. |
+| `--db-password <PASSWORD>` | `DBSACI_DB_PASSWORD` | Fallback password for any user not named above. **No built-in default** — omit this and unnamed users get `ORA-01017`. |
+| `--health-token <TOKEN>` | `DBSACI_HEALTH_TOKEN` | Required for `GET`/`DELETE /sessions` when `--health-addr` is not loopback. |
+| `--tls-cert <PATH>` | `DBSACI_TLS_CERT` | PEM certificate to wrap the TNS listener in TLS (TCPS). |
+| `--tls-key <PATH>` | `DBSACI_TLS_KEY` | PEM private key pairing `--tls-cert`. |
+| `--db-ssl` | `DBSACI_DB_SSL` | Require TLS when connecting to the backend. |
 
 Sources layer **file &lt; `DBSACI_DB_USERS` &lt; `--db-user`**. The Oracle
 username is matched case-insensitively; the matched password drives both the

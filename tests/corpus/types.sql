@@ -212,14 +212,14 @@ SELECT POWER(2, 10) FROM DUAL
 # in Oracle but plain TIMESTAMP (offset ignored) in PostgreSQL; DbSaci has no
 # TSTZ wire encoding to carry the original offset back.
 -- case: timestamptz_keeps_offset
--- skip: mariadb (MariaDB has no zone-aware datetime type)
+# known-gap (mariadb): tracked in expected-failures.mariadb — MariaDB has no zone-aware datetime type
 SELECT TO_CHAR(TIMESTAMP '2024-06-01 12:00:00 +05:00', 'HH24:MI TZH:TZM') FROM DUAL
 -- expect:
 12:00 +05:00
 -- end
 
 -- case: timestamptz_value_not_shifted_to_utc
--- skip: mariadb (MariaDB has no zone-aware datetime type)
+# known-gap (mariadb): tracked in expected-failures.mariadb — MariaDB has no zone-aware datetime type
 SELECT TO_CHAR(CAST(TIMESTAMP '2024-06-01 12:00:00 +05:00' AS TIMESTAMP), 'HH24:MI') FROM DUAL
 -- expect:
 12:00
@@ -246,14 +246,14 @@ SELECT TO_CHAR(DATE '0042-01-01', 'YYYY-MM-DD') FROM DUAL
 -- end
 
 -- case: rowid_pseudocolumn_is_stable_within_query
--- skip: mariadb (MariaDB has no ROWID pseudo-column)
+# known-gap (mariadb): expected-failures.mariadb — no ROWID (no id-column shim)
 SELECT COUNT(DISTINCT ROWID) FROM people WHERE id <= 4
 -- expect:
 4
 -- end
 
 -- case: rowid_round_trips_for_refetch
--- skip: mariadb (MariaDB has no ROWID pseudo-column)
+# known-gap (mariadb): expected-failures.mariadb — no ROWID (no id-column shim)
 SELECT name FROM people WHERE ROWID = (SELECT ROWID FROM people WHERE id = 3)
 -- expect:
 Linus

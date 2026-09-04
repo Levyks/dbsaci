@@ -4,7 +4,7 @@ use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
 use socket2::SockRef;
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::TcpListener;
 use tokio::task::AbortHandle;
 use tracing::{Instrument, debug, info, info_span, warn};
 
@@ -14,9 +14,7 @@ use crate::credentials::Credentials;
 use crate::error::{Error, Result};
 use crate::mariadb::MariaDbBackend;
 use crate::tns::{PacketType, SduMode, TnsStream, build_accept_response};
-use crate::wire::{
-    self, build_dml_response, build_error_response, build_error_response_at, build_query_response,
-};
+use crate::wire::{self, build_dml_response, build_error_response, build_error_response_at};
 
 static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(1);
 /// Process-wide counters exposed on `/metrics` (Prometheus text format).
@@ -175,6 +173,15 @@ pub struct Config {
     /// Which Oracle release DbSaci presents itself as (banner, `v$version`,
     /// `AUTH_VERSION_*`, and the auth verifier family).
     pub oracle_version: OracleVersion,
+    /// Shared secret for `/sessions` list/kill. Required when `health_addr` is
+    /// not loopback.
+    pub health_token: Option<String>,
+    /// PEM certificate for TCPS on the TNS listener.
+    pub tls_cert: Option<std::path::PathBuf>,
+    /// PEM private key for TCPS on the TNS listener.
+    pub tls_key: Option<std::path::PathBuf>,
+    /// Require TLS when opening the backend connection.
+    pub db_ssl: bool,
 }
 
 /// The Oracle release DbSaci impersonates on the wire.
@@ -236,6 +243,10 @@ impl Default for Config {
             health_addr: None,
             shutdown_grace: Duration::from_secs(30),
             oracle_version: OracleVersion::default(),
+            health_token: None,
+            tls_cert: None,
+            tls_key: None,
+            db_ssl: false,
         }
     }
 }
@@ -262,10 +273,22 @@ impl Server {
         }
 
         if let Some(addr) = self.config.health_addr.clone() {
+            let auth = crate::ops::HealthAuth {
+                bind: addr.clone(),
+                token: self.config.health_token.clone(),
+            };
+            if auth.sessions_require_token() && auth.token.is_none() {
+                warn!(
+                    %addr,
+                    "health bind is not loopback and DBSACI_HEALTH_TOKEN is unset; \
+                     GET/DELETE /sessions will return 401"
+                );
+            }
             let probe = HealthProbe {
                 db_host: self.config.db_host.clone(),
                 db_port: self.config.db_port,
                 db_name: self.config.db_name.clone(),
+                auth,
             };
             match TcpListener::bind(&addr).await {
                 Ok(l) => {
@@ -278,6 +301,22 @@ impl Server {
                 Err(e) => warn!(%addr, %e, "could not bind health endpoint"),
             }
         }
+
+        let tls_acceptor = match (&self.config.tls_cert, &self.config.tls_key) {
+            (Some(cert), Some(key)) => match crate::tls::load_tls_acceptor(cert, key) {
+                Ok(a) => {
+                    info!("TCPS enabled (cert {})", cert.display());
+                    Some(a)
+                }
+                Err(e) => return Err(e),
+            },
+            (None, None) => None,
+            _ => {
+                return Err(Error::Protocol(
+                    "TLS requires both --tls-cert and --tls-key".into(),
+                ));
+            }
+        };
 
         let grace = self.config.shutdown_grace;
         loop {
@@ -295,11 +334,31 @@ impl Server {
             }
             info!(session_id, %addr, "new connection");
             let config = self.config.clone();
+            let acceptor = tls_acceptor.clone();
             let handle = tokio::spawn(
                 async move {
                     let _guard = SessionGuard::enter();
                     let _reg = SessionRegistration(session_id);
-                    if let Err(e) = handle_connection(stream, session_id, config).await {
+                    let outcome = if let Some(acceptor) = acceptor {
+                        match acceptor.accept(stream).await {
+                            Ok(tls) => {
+                                handle_connection(
+                                    crate::tns::TnsStream::new_tls(tls),
+                                    session_id,
+                                    config,
+                                )
+                                .await
+                            }
+                            Err(e) => {
+                                warn!(session_id, %e, "TLS handshake failed");
+                                Ok(())
+                            }
+                        }
+                    } else {
+                        handle_connection(crate::tns::TnsStream::new(stream), session_id, config)
+                            .await
+                    };
+                    if let Err(e) = outcome {
                         warn!("connection handler error: {}", e);
                     }
                 }
@@ -351,6 +410,7 @@ struct HealthProbe {
     db_host: String,
     db_port: u16,
     db_name: String,
+    auth: crate::ops::HealthAuth,
 }
 
 /// Minimal HTTP/1.1 health server. `/healthz` = process/listener up;
@@ -367,22 +427,40 @@ async fn serve_health(listener: TcpListener, probe: HealthProbe) {
         let probe_host = probe.db_host.clone();
         let probe_port = probe.db_port;
         let _db = probe.db_name.clone();
+        let auth = probe.auth.clone();
         tokio::spawn(async move {
             use tokio::io::{AsyncReadExt, AsyncWriteExt};
             let mut buf = [0u8; 1024];
             let n = stream.read(&mut buf).await.unwrap_or(0);
             let head = String::from_utf8_lossy(&buf[..n]);
             let request_line = head.lines().next().unwrap_or("");
+            let auth_header = head.lines().find(|l| {
+                let l = l.to_ascii_lowercase();
+                l.starts_with("authorization:") || l.starts_with("x-dbsaci-token:")
+            });
+            let sessions_ok = auth.authorize_sessions(auth_header);
             let mut parts = request_line.split_whitespace();
             let method = parts.next().unwrap_or("GET");
             let path = parts.next().unwrap_or("/");
             let (status, body): (&str, String) = if path == "/sessions" || path == "/sessions/" {
-                ("200 OK", render_sessions_json())
+                if sessions_ok {
+                    ("200 OK", render_sessions_json())
+                } else {
+                    (
+                        "401 Unauthorized",
+                        "session list requires Authorization: Bearer <token>".into(),
+                    )
+                }
             } else if let Some(rest) = path.strip_prefix("/sessions/") {
                 let id_str = rest.split(['/', '?']).next().unwrap_or("");
                 match id_str.parse::<u64>() {
                     Ok(id) if method == "DELETE" || method == "POST" => {
-                        if sessions_kill(id) {
+                        if !sessions_ok {
+                            (
+                                "401 Unauthorized",
+                                "session kill requires Authorization: Bearer <token>".into(),
+                            )
+                        } else if sessions_kill(id) {
                             ("200 OK", format!("killed session {id}"))
                         } else {
                             ("404 Not Found", format!("no session {id}"))
@@ -428,8 +506,7 @@ async fn serve_health(listener: TcpListener, probe: HealthProbe) {
     }
 }
 
-async fn handle_connection(stream: TcpStream, session_id: u64, config: Config) -> Result<()> {
-    let mut tns = TnsStream::new(stream);
+async fn handle_connection(mut tns: TnsStream, session_id: u64, config: Config) -> Result<()> {
     tns.set_idle_timeout(config.idle_timeout);
 
     // 1. Read CONNECT. A real Oracle listener answers the first CONNECT with a
@@ -829,6 +906,7 @@ async fn handle_connection(stream: TcpStream, session_id: u64, config: Config) -
             &db_password,
             &config.db_name,
             config.statement_timeout,
+            config.db_ssl,
         )
         .await
         {
@@ -850,6 +928,8 @@ async fn handle_connection(stream: TcpStream, session_id: u64, config: Config) -
             &username,
             &db_password,
             &config.db_name,
+            config.statement_timeout,
+            config.db_ssl,
         )
         .await
         {
@@ -866,10 +946,15 @@ async fn handle_connection(stream: TcpStream, session_id: u64, config: Config) -
             }
         },
     };
-    // 9. Main command loop. At most one streamed cursor is active at a time,
-    // matching the way OCI/thin clients drive a single statement through
-    // Execute + repeated Fetch.
-    let mut cursor: Option<Box<dyn OracleCursor>> = None;
+    // 9. Main command loop. Multiple server cursors may be live at once so a
+    // JDBC/ODP.NET statement-cache re-execute can name a cursor that still
+    // holds SQL (and, while fetching, a streamed result).
+    let mut cursors: std::collections::HashMap<u16, Box<dyn OracleCursor>> =
+        std::collections::HashMap::new();
+    let bind_style = match config.backend {
+        BackendKind::Postgres => wire::BindStyle::Postgres,
+        BackendKind::MariaDb => wire::BindStyle::MariaDb,
+    };
     // The Oracle SQL text + bind datatype list of the statement last prepared on
     // this session's cursor. `REEXECUTE` / `REEXECUTE_AND_FETCH` re-run it
     // without re-sending either, so DbSaci has to remember them.
@@ -884,7 +969,7 @@ async fn handle_connection(stream: TcpStream, session_id: u64, config: Config) -
     // re-execute mismatches its cache and it breaks the call. Map SQL -> id.
     let mut oci_cursor_ids: std::collections::HashMap<String, u16> =
         std::collections::HashMap::new();
-    let mut oci_next_cursor_id: u16 = 3;
+    let mut oci_next_cursor_id: u16 = if oci_dialect { 3 } else { 1 };
     // OCI `REEXECUTE` (0x04) / `REEXECUTE_AND_FETCH` (0x4e) carry no SQL: the
     // client re-runs a statement it prepared earlier, identified by the request
     // sequence byte it also used on that statement's original `0x5E` Execute.
@@ -965,7 +1050,21 @@ async fn handle_connection(stream: TcpStream, session_id: u64, config: Config) -
                             }
                         })
                     } else if func_code == 0x5E {
-                        wire::parse_execute_request(&payload)
+                        match wire::parse_execute_request(&payload) {
+                            Ok(req) if !req.sql.is_empty() => Ok(req),
+                            Ok(_) | Err(_) if wire::execute_frame_has_no_sql(&payload) => {
+                                let hint = wire::parse_execute_cursor_id(&payload)
+                                    .and_then(|id| oci_id_to_sql.get(&id))
+                                    .or(last_execute.as_ref());
+                                match hint {
+                                    Some((sql, types)) => {
+                                        wire::parse_reexecute_request(&payload, sql, types)
+                                    }
+                                    None => wire::parse_execute_request(&payload),
+                                }
+                            }
+                            other => other,
+                        }
                     } else {
                         // Resolve the statement a bare REEXECUTE re-runs.
                         //
@@ -1081,7 +1180,7 @@ async fn handle_connection(stream: TcpStream, session_id: u64, config: Config) -
                             continue;
                         }
                     };
-                    if oci_dialect && func_code != 0x5E {
+                    if (oci_dialect || newer_describe_framing) && func_code != 0x5E {
                         // Re-execute: reuse the cursor id assigned to this SQL.
                         if let Some(id) = oci_cursor_ids.get(&execute.sql) {
                             cursor_id = *id;
@@ -1091,7 +1190,7 @@ async fn handle_connection(stream: TcpStream, session_id: u64, config: Config) -
                         last_execute = Some((execute.sql.clone(), execute.bind_types.clone()));
                         oci_seq_to_sql
                             .insert(req_seq, (execute.sql.clone(), execute.bind_types.clone()));
-                        if oci_dialect {
+                        if oci_dialect || newer_describe_framing {
                             cursor_id =
                                 *oci_cursor_ids
                                     .entry(execute.sql.clone())
@@ -1101,6 +1200,11 @@ async fn handle_connection(stream: TcpStream, session_id: u64, config: Config) -
                                             oci_next_cursor_id.wrapping_add(1).max(3);
                                         id
                                     });
+                            oci_id_to_sql.insert(
+                                cursor_id,
+                                (execute.sql.clone(), execute.bind_types.clone()),
+                            );
+                        } else {
                             oci_id_to_sql.insert(
                                 cursor_id,
                                 (execute.sql.clone(), execute.bind_types.clone()),
@@ -1128,9 +1232,10 @@ async fn handle_connection(stream: TcpStream, session_id: u64, config: Config) -
                             .await?;
                             continue;
                         }
-                        let bound = match wire::bind_postgres_parameters(
+                        let bound = match wire::bind_parameters(
                             &ri.sql_without_into,
                             &execute.binds,
+                            bind_style,
                         ) {
                             Ok(b) => b,
                             Err(e) => {
@@ -1209,23 +1314,40 @@ async fn handle_connection(stream: TcpStream, session_id: u64, config: Config) -
                         continue;
                     }
 
-                    let bound = match wire::bind_postgres_parameters(&execute.sql, &execute.binds) {
-                        Ok(bound) => bound,
-                        Err(e) => {
-                            write_error_response(
-                                &mut tns,
-                                oci_dialect,
-                                response_completion,
-                                newer_describe_framing,
-                                1008,
-                                &e.to_string(),
-                                0,
-                                req_seq,
-                            )
-                            .await?;
-                            continue;
-                        }
-                    };
+                    if let Some((ora, detail)) =
+                        crate::ttc::reject_unsupported_sql(&execute.sql, config.backend)
+                    {
+                        write_error_response(
+                            &mut tns,
+                            oci_dialect,
+                            response_completion,
+                            newer_describe_framing,
+                            ora,
+                            detail,
+                            0,
+                            req_seq,
+                        )
+                        .await?;
+                        continue;
+                    }
+                    let bound =
+                        match wire::bind_parameters(&execute.sql, &execute.binds, bind_style) {
+                            Ok(bound) => bound,
+                            Err(e) => {
+                                write_error_response(
+                                    &mut tns,
+                                    oci_dialect,
+                                    response_completion,
+                                    newer_describe_framing,
+                                    1008,
+                                    &e.to_string(),
+                                    0,
+                                    req_seq,
+                                )
+                                .await?;
+                                continue;
+                            }
+                        };
                     debug!(bind_count = execute.binds.len(), "executing statement");
 
                     // Translate Oracle-specific structural syntax before executing it.
@@ -1273,14 +1395,14 @@ async fn handle_connection(stream: TcpStream, session_id: u64, config: Config) -
                         let mut total: u64 = 0;
                         let mut failed: Option<Error> = None;
                         for row in &execute.bind_rows {
-                            let row_bound = match wire::bind_postgres_parameters(&execute.sql, row)
-                            {
-                                Ok(b) => b,
-                                Err(e) => {
-                                    failed = Some(e);
-                                    break;
-                                }
-                            };
+                            let row_bound =
+                                match wire::bind_parameters(&execute.sql, row, bind_style) {
+                                    Ok(b) => b,
+                                    Err(e) => {
+                                        failed = Some(e);
+                                        break;
+                                    }
+                                };
                             let res = if is_ddl {
                                 backend.execute_ddl(&pg_sql, &row_bound.binds).await
                             } else {
@@ -1336,8 +1458,8 @@ async fn handle_connection(stream: TcpStream, session_id: u64, config: Config) -
                         continue;
                     }
                     if is_query_statement(&pg_sql) {
-                        // Abandon any half-consumed prior cursor.
-                        if let Some(mut old) = cursor.take() {
+                        // Replace this cursor id only; other open cursors stay live.
+                        if let Some(mut old) = cursors.remove(&cursor_id) {
                             old.finish().await;
                         }
                         // Rows are pulled from PostgreSQL incrementally and
@@ -1363,7 +1485,7 @@ async fn handle_connection(stream: TcpStream, session_id: u64, config: Config) -
                                     response_completion,
                                     newer_describe_framing,
                                     oci_dialect,
-                                    profile.newer_describe_framing(),
+                                    na_without_version_list,
                                 ),
                             ),
                         )
@@ -1387,7 +1509,7 @@ async fn handle_connection(stream: TcpStream, session_id: u64, config: Config) -
                                                 func_code == 0x5E,
                                             )
                                         } else {
-                                            build_query_response(
+                                            wire::build_query_response_ex(
                                                 cur.columns(),
                                                 &rows,
                                                 cursor_id,
@@ -1395,11 +1517,12 @@ async fn handle_connection(stream: TcpStream, session_id: u64, config: Config) -
                                                 response_completion,
                                                 newer_describe_framing,
                                                 req_seq,
+                                                na_without_version_list,
                                             )
                                         };
                                         tns.write_packet(PacketType::Data, &response).await?;
                                         if more {
-                                            cursor = Some(cur);
+                                            cursors.insert(cursor_id, cur);
                                         } else {
                                             cur.finish().await;
                                         }
@@ -1490,17 +1613,18 @@ async fn handle_connection(stream: TcpStream, session_id: u64, config: Config) -
                     }
                 } else if msg_type == 0x03 && func_code == 0x05 {
                     // Fetch: next batch from the open cursor.
-                    let (_cid, req_rows) = if oci_dialect {
+                    let (fetch_cid, req_rows) = if oci_dialect {
                         wire::parse_fetch_request_oci(&payload).unwrap_or((cursor_id, 100))
                     } else {
                         wire::parse_fetch_request(&payload).unwrap_or((cursor_id, 100))
                     };
+                    let fetch_cid = if fetch_cid == 0 { cursor_id } else { fetch_cid };
                     let batch = if oci_dialect {
                         (req_rows.clamp(1, 500)) as usize
                     } else {
                         (req_rows.clamp(1, 50_000)) as usize
                     };
-                    match cursor.as_mut() {
+                    match cursors.get_mut(&fetch_cid) {
                         Some(cur) => {
                             match race_break(&mut tns, backend.as_ref(), cur.next_batch(batch))
                                 .await?
@@ -1513,29 +1637,29 @@ async fn handle_connection(stream: TcpStream, session_id: u64, config: Config) -
                                             cur.columns(),
                                             &rows,
                                             req_rows,
-                                            cursor_id,
+                                            fetch_cid,
                                             more,
                                             oci_rows_sent,
                                         )
                                     } else if newer_describe_framing {
                                         wire::build_fetch_response_jdbc(
-                                            &rows, cursor_id, more, req_seq,
+                                            &rows, fetch_cid, more, req_seq,
                                         )
                                     } else {
                                         wire::build_fetch_response(
                                             &rows,
-                                            cursor_id,
+                                            fetch_cid,
                                             more,
                                             response_completion,
                                         )
                                     };
                                     tns.write_packet(PacketType::Data, &response).await?;
-                                    if !more && let Some(mut done) = cursor.take() {
+                                    if !more && let Some(mut done) = cursors.remove(&fetch_cid) {
                                         done.finish().await;
                                     }
                                 }
                                 Err(e) => {
-                                    if let Some(mut done) = cursor.take() {
+                                    if let Some(mut done) = cursors.remove(&fetch_cid) {
                                         done.finish().await;
                                     }
                                     let (code, message, error_pos) = oracle_error_for_pos(&e);
@@ -1577,7 +1701,7 @@ async fn handle_connection(stream: TcpStream, session_id: u64, config: Config) -
                     // Logoff. ojdbc thin does a synchronous LOGOFF RPC and waits
                     // for the end-of-call reply before closing the socket;
                     // dropping it straight away surfaces as ORA-03113 client-side.
-                    if let Some(mut cur) = cursor.take() {
+                    for (_, mut cur) in cursors.drain() {
                         cur.finish().await;
                     }
                     if oci_dialect {
@@ -1601,7 +1725,7 @@ async fn handle_connection(stream: TcpStream, session_id: u64, config: Config) -
                     } else {
                         "ROLLBACK"
                     };
-                    if let Some(mut cur) = cursor.take() {
+                    for (_, mut cur) in cursors.drain() {
                         cur.finish().await;
                     }
                     match backend.execute_simple(verb, &[]).await {
@@ -1643,16 +1767,43 @@ async fn handle_connection(stream: TcpStream, session_id: u64, config: Config) -
                         )
                     };
                     tns.write_packet(PacketType::Data, &resp).await?;
-                } else {
-                    // Any other TTC function (PING 147, CLOSE_CURSORS 105,
-                    // SET_SCHEMA 152, SET_END_TO_END 135, …): acknowledge with a
-                    // bare, error-free end-of-call rather than a query shape.
-                    let resp = if newer_describe_framing {
-                        wire::build_dml_response_jdbc(0, req_seq)
-                    } else {
-                        wire::build_dml_response(0)
-                    };
-                    tns.write_packet(PacketType::Data, &resp).await?;
+                } else if msg_type == 0x03 {
+                    match crate::ttc::FunctionCode::from_u8(func_code).dispatch() {
+                        crate::ttc::Dispatch::NoOp => {
+                            let resp = if newer_describe_framing {
+                                wire::build_dml_response_jdbc(0, req_seq)
+                            } else {
+                                wire::build_dml_response(0)
+                            };
+                            tns.write_packet(PacketType::Data, &resp).await?;
+                        }
+                        crate::ttc::Dispatch::Unimplemented { ora, detail } => {
+                            write_error_response(
+                                &mut tns,
+                                oci_dialect,
+                                response_completion,
+                                newer_describe_framing,
+                                ora,
+                                detail,
+                                0,
+                                req_seq,
+                            )
+                            .await?;
+                        }
+                        _ => {
+                            write_error_response(
+                                &mut tns,
+                                oci_dialect,
+                                response_completion,
+                                newer_describe_framing,
+                                3001,
+                                "feature not implemented",
+                                0,
+                                req_seq,
+                            )
+                            .await?;
+                        }
+                    }
                 }
             }
             PacketType::Marker => {
@@ -1941,9 +2092,19 @@ fn oracle_error_for_pos(error: &Error) -> (u32, String, u16) {
         _ if lower.contains("truncated incorrect")
             || lower.contains("incorrect decimal value")
             || lower.contains("incorrect double value")
-            || lower.contains("incorrect integer value") =>
+            || lower.contains("incorrect integer value")
+            || lower.contains("invalid number") =>
         {
             1722
+        }
+        _ if lower.contains("divisor is equal to zero") || lower.contains("division by zero") => {
+            1476
+        }
+        _ if lower.contains("max_statement_time")
+            || lower.contains("query execution was interrupted")
+            || lower.contains("statement timeout") =>
+        {
+            1013
         }
         _ if lower.contains("out of range value") => 1438,
         _ if lower.contains("data too long") => 12899,
@@ -1962,19 +2123,19 @@ fn oracle_error_for_pos(error: &Error) -> (u32, String, u16) {
         "22001" => 12899,                            // value too large for column
         "22003" => 1438,                             // value larger than specified precision
         "22012" => 1476,                             // divisor is equal to zero
-        "22P02" => 1722,                             // invalid number
+        "22P02" | "22018" => 1722,                   // invalid number (PG / MariaDB SIGNAL)
         "22007" | "22008" | "22P03" => 1858,         // not a valid <datetime> / conversion
-        "21000" => 1427, // single-row subquery returns more than one row
-        "40001" => 8177, // can't serialize access for this transaction
-        "40P01" => 60,   // deadlock detected
-        "55P03" => 54,   // resource busy (NOWAIT)
-        "57014" => 1013, // user requested cancel of current operation
+        "21000" => 1427,           // single-row subquery returns more than one row
+        "40001" => 8177,           // can't serialize access for this transaction
+        "40P01" => 60,             // deadlock detected
+        "55P03" => 54,             // resource busy (NOWAIT)
+        "57014" | "70100" => 1013, // cancel / max_statement_time exceeded
         "53300" | "53400" | "08004" | "08001" => 18, // maximum number of sessions
         "57P01" | "57P02" | "57P03" => 3113, // backend terminated/restarting
-        "08006" => 3135, // connection failure during operation
-        "55000" => 8002, // CURRVAL before NEXTVAL
+        "08006" => 3135,           // connection failure during operation
+        "55000" => 8002,           // CURRVAL before NEXTVAL
         "42601" if lower.contains("target columns") => 947, // not enough values
-        "42601" => 900,  // generic syntax error
+        "42601" => 900,            // generic syntax error
         _ if lower.contains("currval of sequence") => 8002,
         _ if lower.contains("connection closed")
             || lower.contains("broken pipe")
@@ -2051,6 +2212,10 @@ mod tests {
                 db_host: "127.0.0.1".into(),
                 db_port,
                 db_name: "postgres".into(),
+                auth: crate::ops::HealthAuth {
+                    bind: format!("127.0.0.1:{health_port}"),
+                    token: None,
+                },
             },
         ));
 

@@ -9,7 +9,11 @@
 //! | `--db-host`           | `DBSACI_DB_HOST`       | `localhost`   | backend host (PostgreSQL or MariaDB) |
 //! | `--db-port`           | `DBSACI_DB_PORT`       | `5432`/`3306` | backend port |
 //! | `--db-name`             | `DBSACI_DB_NAME`         | `postgres`    | backend database/schema |
-//! | `--db-password`       | `DBSACI_DB_PASSWORD`   | `postgres`    | fallback password for users not in the list |
+//! | `--db-password`       | `DBSACI_DB_PASSWORD`   | unset         | fallback password for users not in the list (no built-in default) |
+//! | `--health-token`      | `DBSACI_HEALTH_TOKEN`  | unset         | required for `/sessions` when health bind is not loopback |
+//! | `--tls-cert`          | `DBSACI_TLS_CERT`      | unset         | PEM cert for TCPS on the TNS listener |
+//! | `--tls-key`           | `DBSACI_TLS_KEY`       | unset         | PEM key for TCPS |
+//! | `--db-ssl`            | `DBSACI_DB_SSL`        | false         | require TLS to the backend |
 //! | `--db-user u:p`       | —                     | —             | one `user:password` pair; repeatable |
 //! | `--db-users`          | `DBSACI_DB_USERS`     | —             | comma-separated `user:password,user:password` |
 //! | `--db-users-file`     | `DBSACI_DB_USERS_FILE`| —             | file of `user:password` lines (`#` comments ok) |
@@ -101,6 +105,23 @@ struct Cli {
     /// PostgreSQL backend, which folds unquoted identifiers itself.
     #[arg(long, env = "DBSACI_IDENTIFIER_CASE", value_enum)]
     identifier_case: Option<CliIdentifierCase>,
+
+    /// Shared token for GET/DELETE `/sessions`. Required when `--health-addr`
+    /// is not loopback.
+    #[arg(long, env = "DBSACI_HEALTH_TOKEN")]
+    health_token: Option<String>,
+
+    /// PEM certificate for TCPS on the TNS listener.
+    #[arg(long, env = "DBSACI_TLS_CERT")]
+    tls_cert: Option<PathBuf>,
+
+    /// PEM private key for TCPS on the TNS listener.
+    #[arg(long, env = "DBSACI_TLS_KEY")]
+    tls_key: Option<PathBuf>,
+
+    /// Require TLS when connecting to the backend database.
+    #[arg(long, env = "DBSACI_DB_SSL", default_value_t = false)]
+    db_ssl: bool,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -144,7 +165,9 @@ fn build_credentials(cli: &Cli) -> Result<Credentials, String> {
         creds.extend_comma_list(list)?;
     }
     creds.extend_pairs(cli.db_users.iter().map(String::as_str))?;
-    creds.set_fallback(cli.db_password.clone().or_else(|| Some("postgres".into())));
+    // No built-in shared password. Unknown users are ORA-01017 unless
+    // `--db-password` / `DBSACI_DB_PASSWORD` is set explicitly.
+    creds.set_fallback(cli.db_password.clone());
     Ok(creds)
 }
 
@@ -194,6 +217,10 @@ async fn main() {
             .map(Duration::from_millis)
             .unwrap_or(default.shutdown_grace),
         oracle_version: parse_oracle_version(cli.oracle_version.as_deref()),
+        health_token: cli.health_token,
+        tls_cert: cli.tls_cert,
+        tls_key: cli.tls_key,
+        db_ssl: cli.db_ssl,
     };
 
     if let Err(e) = Server::new(config).run().await {

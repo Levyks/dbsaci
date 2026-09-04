@@ -82,9 +82,10 @@ Your PostgreSQL must have `orafce` installed in the target database
 ## Option C — MariaDB backend
 
 MariaDB 11.4+ supplies an Oracle compatibility mode. dbSaci enables it on each
-backend session (no server `sql-mode` needed), folds table identifiers to lower
-case, and adds rewrites for the Oracle constructs MariaDB does not implement
-itself:
+backend session (no server `sql-mode` needed), folds table identifiers to
+**upper** case by default (`DBSACI_IDENTIFIER_CASE=upper`; pass `lower` to match
+a lower-case schema), and adds rewrites for the Oracle constructs MariaDB does
+not implement itself:
 
 ```bash
 docker run -d --name dbsaci-mariadb \
@@ -250,7 +251,7 @@ With `DBSACI_HEALTH_ADDR` set, dbSaci serves these dependency-free endpoints:
 | `GET /readyz` | backend PostgreSQL reachable |
 | `GET /metrics` | Prometheus text format |
 | `GET /sessions` | JSON list of live Oracle sessions — `id`, `addr`, `user`, `age_seconds` |
-| `DELETE /sessions/<id>` | abort one session (drops its backend PostgreSQL connection, releasing any locks it held) |
+| `DELETE /sessions/<id>` | abort one session (drops its backend connection, releasing any locks it held). Requires `Authorization: Bearer <token>` when the health port is not loopback. |
 
 Idle clients are reaped after `--idle-timeout-ms` (`DBSACI_IDLE_TIMEOUT_MS`,
 default 15 min; `0` disables). The effective value is logged at startup.

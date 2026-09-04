@@ -63,18 +63,19 @@ feature.
 | `INSTEAD OF` triggers | ✓ | ✗ | PostgreSQL views can express the common path; MariaDB has no equivalent view-trigger mechanism. |
 | Explicit transactions and savepoints | ✓ | ✓ | Includes statement recovery and Oracle-style DDL commit behavior. |
 | `SET TRANSACTION` and locking clauses | ✓ | ✓ | `READ ONLY`, isolation, `WAIT`, `NOWAIT`, and `SKIP LOCKED` common forms. |
-| `WHERE CURRENT OF` | ✓ | ✗ | PostgreSQL PL/pgSQL cursor support; no MariaDB equivalent in the current lowering. |
-| Autonomous transactions | ✗ | ✗ | Requires independent transaction context inside a routine. |
+| `WHERE CURRENT OF` | ✓ | ✗ | PostgreSQL PL/pgSQL cursor support. MariaDB leaves the clause as-is (no PK-guess rewrite). |
+| Autonomous transactions | ✗ | ✗ | Requires an independent transaction context; MariaDB does not strip the pragma to fake success. |
+| `PRAGMA EXCEPTION_INIT` | ✓ | ✗ | PostgreSQL maps user exceptions; MariaDB does not rewrite `WHEN e` → `WHEN OTHERS`. |
 | `ALTER SESSION` and selected NLS settings | ✓ | ✓ | Selected session state is emulated; full Oracle NLS behavior is not. |
 | Session time zones | ✓ | ✓ | Common named-region and fixed-offset forms; MariaDB has reduced Oracle time-zone semantics. |
 | Oracle error mapping | ✓ | ✓ | Backend errors are mapped to Oracle error numbers where identifiable. |
 | `NUMBER` values | ✓ | ✓ | Value-exact common arithmetic and wire encoding. |
 | `DATE` and `TIMESTAMP` | ✓ | ✓ | Oracle-compatible wire encodings; MariaDB temporal text is normalized before encoding. |
 | `TIMESTAMP WITH TIME ZONE` | ✓ | ✗ | PostgreSQL has the stronger native/session-zone path; MariaDB zone-aware semantics are incomplete. |
-| `INTERVAL YEAR TO MONTH` | ✓ | ✗ | No MariaDB equivalent with Oracle's interval type semantics. |
-| `INTERVAL DAY TO SECOND` | ✓ | ✗ | Common MariaDB date arithmetic is translated, but the Oracle interval type is not. |
-| `BINARY_FLOAT` / `BINARY_DOUBLE` | ✓ | ✓ | MariaDB uses compatibility domains/functions rather than native Oracle types. |
-| `ROWID` | ✓ | ✗ | PostgreSQL maps it to `ctid`; MariaDB has no stable physical-row identifier equivalent. |
+| `INTERVAL YEAR TO MONTH` | ✓ | ✗ | MariaDB date arithmetic is translated; result columns are not promoted to Oracle interval wire types 182/183. |
+| `INTERVAL DAY TO SECOND` | ✓ | ✗ | Same: arithmetic works; native interval describe/value for thin clients is PostgreSQL-only today. |
+| `BINARY_FLOAT` / `BINARY_DOUBLE` | ✓ | ✓ | Declared columns use domains (PG) / COMMENT markers (MariaDB); python-oracledb thin gets native wire types. |
+| `ROWID` | ✓ | ✗ | PostgreSQL maps to `ctid`. MariaDB does not invent a fake ROWID from a column named `id`. |
 | `CLOB` / `BLOB` inline values | ✓ | ✓ | Inline delivery only; no TTC locator streaming. |
 | PL/SQL anonymous blocks | ✓ | ✓ | Basic declarations, control flow, cursors, exceptions, and `SELECT … INTO`. |
 | Standalone PL/SQL routines | ✓ | ✓ | Common function/procedure bodies. |
@@ -87,13 +88,13 @@ feature.
 ## Test evidence
 
 The PostgreSQL and MariaDB lanes use the same corpus harness and Oracle-correct
-expected results. MariaDB-specific positive cases live in
-`tests/corpus/mariadb_oracle_mode.sql`; cases with no reasonable MariaDB
-equivalent remain explicitly marked as MariaDB skips rather than being treated
-as passing. The MariaDB implementation is not merely relying on
-`SQL_MODE=ORACLE`: that mode supplies useful lexical and basic semantic
-compatibility, while dbSaci handles structural SQL differences, result
-metadata, Oracle wire encodings, facade objects, and backend-specific gaps.
+expected results. Known-red cases are listed in
+`tests/corpus/expected-failures.<backend>` (ledger mode requires an exact
+match). MariaDB-specific positive cases live in
+`tests/corpus/mariadb_oracle_mode.sql`. The MariaDB lane is not merely
+`SQL_MODE=ORACLE`: that mode supplies useful lexical/basic semantics, while
+dbSaci handles structural SQL differences, result metadata, Oracle wire
+encodings, facade objects, and backend-specific gaps.
 
 See [What works](/dbsaci/what-works/) for the narrative view and
 [Limitations](/dbsaci/limitations/) for details on unsupported Oracle surface

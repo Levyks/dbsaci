@@ -146,7 +146,6 @@ SELECT COUNT(*) OVER (PARTITION BY team_id ORDER BY id) FROM people ORDER BY id
 -- end
 
 -- case: listagg_as_analytic
--- skip: mariadb (MariaDB GROUP_CONCAT cannot be a window function)
 SELECT id, LISTAGG(name, ',') WITHIN GROUP (ORDER BY id) OVER (PARTITION BY team_id) FROM people WHERE team_id = 1 ORDER BY id
 -- expect:
 1 | Ada,Grace

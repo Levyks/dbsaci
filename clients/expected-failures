@@ -1,0 +1,9 @@
+# Expected Oracle-compatibility failures for third-party client probes.
+# Format: <backend> <driver> <check_name>
+# With DBSACI_CLIENT_LEDGER=1 the probe exits 0 iff its failed checks match
+# this file for the current backend+driver. Remove a line when it goes green.
+#
+# MariaDB has no native Oracle INTERVAL wire types yet; result columns stay text.
+mariadb python interval_ds_value
+mariadb python interval_ds_negative
+mariadb python interval_ym_value

@@ -28,19 +28,16 @@ Expressible on PostgreSQL, but the wire framing or translation is not written.
 
 ### Type-metadata gaps
 
-- **Declared `NUMBER` precision/scale in result metadata.** Reported for
-  `python-oracledb` thin and `oracle-rs`; **ojdbc and ODP.NET** keep `(38,0)`
-  (their column-metadata parser desyncs on a non-zero scale field). Values are
-  always exact.
-- **Native `TIMESTAMP` / `TIMESTAMP WITH TIME ZONE` describe for ojdbc and
-  ODP.NET.** Those two drivers see PostgreSQL `timestamp` / `timestamptz`
-  described as Oracle `DATE` (second precision) — exact for an Oracle `DATE`
-  column (the common case), but an Oracle `TIMESTAMP(n>0)` loses its sub-second
-  digits. `python-oracledb` thin keeps the native types with sub-second
-  precision.
-- **Native TTC encodings for `INTERVAL`, `BINARY_FLOAT` / `BINARY_DOUBLE`.**
-  Complete for `python-oracledb` thin; other drivers get `NUMBER` / an
-  Oracle-style interval text rendering.
+- **Native `BINARY_FLOAT` / `BINARY_DOUBLE` / `INTERVAL` describe for ojdbc and
+  ODP.NET.** Those drivers still see NUMBER / text for those types.
+- **MariaDB native `INTERVAL` wire types (182/183).** Result columns stay text
+  (python-oracledb thin against PostgreSQL gets native intervals; against
+  MariaDB the probe expects text until a real type path exists).
+- **MariaDB `ROWID`, autonomous transactions, `WHERE CURRENT OF`,
+  `PRAGMA EXCEPTION_INIT`.** Not implemented; earlier shims that guessed a
+  column named `id` or silently dropped pragma semantics were removed.
+- **Native TTC encodings for `BINARY_FLOAT` / `BINARY_DOUBLE`.** Complete for
+  `python-oracledb` thin on both backends; ojdbc / ODP.NET get `NUMBER`.
 
 ### Other planned items
 

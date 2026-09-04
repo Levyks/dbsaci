@@ -14,7 +14,9 @@ Everything below has golden-corpus coverage. See the
   (12c PBKDF2 with mutual server proof), metadata, parametrised `SELECT`,
   `INSERT` with row counts, `ROLLBACK`, a 2 500-row fetch loop, and array-bind
   batch DML (`executemany` / JDBC batch / ODP.NET `ArrayBindCount`) — against
-  both the 19c and 11g personas.
+  both the 19c and 11g personas, against **PostgreSQL and MariaDB**.
+  `NUMBER(p,s)` precision/scale is reported for python-oracledb thin and
+  ojdbc and ODP.NET (real precision/scale; TIMESTAMP scale included).
 - The **OCI thick client** (Instant Client, via `python-oracledb` thick mode)
   runs the golden corpus too: 634 / 637, the 3 skips being cases Oracle itself
   rejects over that transport (`ORA-01036` ×2, `ORA-00925`). It uses its own TTC
@@ -86,12 +88,16 @@ PostgreSQL trigger function.
 
 ## PL/SQL (the smaller end)
 
-Anonymous blocks and standalone function/procedure bodies translate — including
-`%TYPE` / `%ROWTYPE`, explicit named cursors, `WHERE CURRENT OF`, expression and
-statement `CASE`, `WHILE` / `LOOP`, `EXECUTE IMMEDIATE`, `EXCEPTION WHEN …`
-handlers (Oracle predefined names mapped), user exceptions via
-`PRAGMA EXCEPTION_INIT`, and `SELECT … INTO` (single-row `INTO STRICT`
-semantics). `DBMS_OUTPUT.PUT_LINE` → `RAISE NOTICE`.
+Anonymous blocks and standalone function/procedure bodies translate on
+**PostgreSQL** — including `%TYPE` / `%ROWTYPE`, explicit named cursors,
+`WHERE CURRENT OF`, expression and statement `CASE`, `WHILE` / `LOOP`,
+`EXECUTE IMMEDIATE`, `EXCEPTION WHEN …` handlers (Oracle predefined names
+mapped), user exceptions via `PRAGMA EXCEPTION_INIT`, and `SELECT … INTO`
+(single-row `INTO STRICT` semantics). `DBMS_OUTPUT.PUT_LINE` → `RAISE NOTICE`.
+On **MariaDB**, anonymous blocks and simple routines run where Oracle mode
+accepts them; `ROWID`, `WHERE CURRENT OF`, autonomous transactions, and
+`EXCEPTION_INIT` are not emulated (no column-named-`id` or drop-the-pragma
+shims). Interval result columns stay text on MariaDB (no type 182/183).
 
 ## Errors
 

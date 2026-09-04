@@ -96,6 +96,11 @@ impl Credentials {
     pub fn has_fallback(&self) -> bool {
         self.fallback.is_some()
     }
+
+    /// True when an unknown Oracle user would be rejected (no fallback password).
+    pub fn rejects_unknown_users(&self) -> bool {
+        self.fallback.is_none()
+    }
 }
 
 #[cfg(test)]
@@ -124,5 +129,13 @@ mod tests {
         assert!(c.extend_comma_list(":emptyuser").is_err());
         c.extend_comma_list("u:p:w").unwrap();
         assert_eq!(c.password_for("u"), Some("p:w"));
+    }
+
+    #[test]
+    fn default_store_has_no_shared_password_for_unknown_users() {
+        let c = Credentials::default();
+        assert!(c.rejects_unknown_users());
+        assert_eq!(c.password_for("scott"), None);
+        assert_eq!(c.password_for("postgres"), None);
     }
 }

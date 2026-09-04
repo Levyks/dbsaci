@@ -39,14 +39,14 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: build postgres ${{ matrix.pg }} + orafce image
         run: docker build --build-arg PG_VERSION=${{ matrix.pg }} -t dbsaci-test-pg:${{ matrix.pg }} testcontainers
-      - name: corpus
+      - name: corpus (ledger — failures must match expected-failures.postgres)
         env:
           DBSACI_TEST_PG_IMAGE: dbsaci-test-pg:${{ matrix.pg }}
+          DBSACI_CORPUS_LEDGER: "1"
         run: cargo test --test corpus -- --test-threads=1
 
-  # The same end-to-end corpus, run against a MariaDB backend in
-  # `SQL_MODE=ORACLE`. The pass count is the Oracle-compatibility backlog for
-  # that engine (cases with no MariaDB equivalent carry a `-- skip: mariadb`).
+  # The same end-to-end corpus against MariaDB. Failures must match
+  # tests/corpus/expected-failures.mariadb exactly (ledger mode).
   corpus-mariadb:
     name: rust — corpus (MariaDB)
     runs-on: ubuntu-latest
@@ -54,16 +54,21 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: corpus (mariadb)
+      - name: corpus (mariadb ledger)
         env:
           DBSACI_CORPUS_BACKEND: mariadb
+          DBSACI_CORPUS_LEDGER: "1"
         run: cargo test --test corpus -- --test-threads=1
 
-  # Real third-party Oracle drivers, end to end, against PG 18. Each probe runs
-  # against both the 19c and the 11g persona.
+  # Real third-party Oracle drivers. Assertions are Oracle-correct; with
+  # DBSACI_CLIENT_LEDGER=1, failed checks must match clients/expected-failures.
   client-python:
-    name: client — python-oracledb (thin)
+    name: client — python-oracledb (${{ matrix.backend }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        backend: [postgres, mariadb]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -72,13 +77,24 @@ jobs:
         with:
           python-version: "3.12"
       - run: pip install oracledb
-      - run: docker build -t dbsaci-test-pg:18 testcontainers
+      - if: matrix.backend == 'postgres'
+        run: docker build -t dbsaci-test-pg:18 testcontainers
       - run: bash clients/run.sh python
+        env:
+          DBSACI_CLIENT_BACKEND: ${{ matrix.backend }}
+          DBSACI_CLIENT_LEDGER: "1"
       - run: bash clients/run.sh python 11
+        env:
+          DBSACI_CLIENT_BACKEND: ${{ matrix.backend }}
+          DBSACI_CLIENT_LEDGER: "1"
 
   client-java:
-    name: client — ojdbc11 (thin)
+    name: client — ojdbc11 (${{ matrix.backend }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        backend: [postgres, mariadb]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -87,13 +103,24 @@ jobs:
         with:
           distribution: temurin
           java-version: "21"
-      - run: docker build -t dbsaci-test-pg:18 testcontainers
+      - if: matrix.backend == 'postgres'
+        run: docker build -t dbsaci-test-pg:18 testcontainers
       - run: bash clients/run.sh java
+        env:
+          DBSACI_CLIENT_BACKEND: ${{ matrix.backend }}
+          DBSACI_CLIENT_LEDGER: "1"
       - run: bash clients/run.sh java 11
+        env:
+          DBSACI_CLIENT_BACKEND: ${{ matrix.backend }}
+          DBSACI_CLIENT_LEDGER: "1"
 
   client-dotnet:
-    name: client — ODP.NET Core (managed)
+    name: client — ODP.NET Core (${{ matrix.backend }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        backend: [postgres, mariadb]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -101,6 +128,13 @@ jobs:
       - uses: actions/setup-dotnet@v4
         with:
           dotnet-version: "10.0.x"
-      - run: docker build -t dbsaci-test-pg:18 testcontainers
+      - if: matrix.backend == 'postgres'
+        run: docker build -t dbsaci-test-pg:18 testcontainers
       - run: bash clients/run.sh dotnet
+        env:
+          DBSACI_CLIENT_BACKEND: ${{ matrix.backend }}
+          DBSACI_CLIENT_LEDGER: "1"
       - run: bash clients/run.sh dotnet 11
+        env:
+          DBSACI_CLIENT_BACKEND: ${{ matrix.backend }}
+          DBSACI_CLIENT_LEDGER: "1"

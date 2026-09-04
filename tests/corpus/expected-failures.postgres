@@ -1,0 +1,5 @@
+# Expected Oracle-compatibility failures for the PostgreSQL corpus.
+# Add group::case lines for known-red backlog; DBSACI_CORPUS_LEDGER=1 requires
+# an exact match against failures. Remove a line when the case goes green.
+#
+mariadb_oracle_mode::oracle_package_function

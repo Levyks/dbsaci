@@ -46,7 +46,7 @@ DECLARE n NUMBER; BEGIN SELECT COUNT(*) INTO n FROM people; END;
 -- end
 
 -- case: pragma_autonomous_transaction_block
--- skip: mariadb (MariaDB has no autonomous transactions)
+# known-gap (mariadb): expected-failures.mariadb — autonomous tx not faked by dropping pragma
 DECLARE PRAGMA AUTONOMOUS_TRANSACTION; BEGIN NULL; END;
 -- ok
 -- end
@@ -119,7 +119,7 @@ Ada
 -- end
 
 -- case: block_cursor_where_current_of
--- skip: mariadb (MariaDB has no WHERE CURRENT OF)
+# known-gap (mariadb): expected-failures.mariadb — WHERE CURRENT OF not rewritten to id=
 -- setup: CREATE TABLE plq_wco (id INT, name TEXT)
 -- setup: INSERT INTO plq_wco VALUES (1, 'a'), (2, 'b'), (3, 'c')
 -- setup: DECLARE CURSOR c IS SELECT id FROM plq_wco FOR UPDATE; BEGIN FOR rec IN c LOOP UPDATE plq_wco SET name = 'x' WHERE CURRENT OF c; END LOOP; END;
@@ -130,7 +130,7 @@ x
 -- end
 
 -- case: pragma_exception_init_custom_error
--- skip: mariadb (MariaDB has no PRAGMA EXCEPTION_INIT)
+# known-gap (mariadb): expected-failures.mariadb — EXCEPTION_INIT not rewritten to WHEN OTHERS
 -- setup: CREATE TABLE plq_ei (msg TEXT)
 -- setup: DECLARE e_custom EXCEPTION; PRAGMA EXCEPTION_INIT(e_custom, -20055); BEGIN BEGIN RAISE_APPLICATION_ERROR(-20055, 'boom'); EXCEPTION WHEN e_custom THEN INSERT INTO plq_ei VALUES ('caught'); END; END;
 -- teardown: DROP TABLE plq_ei

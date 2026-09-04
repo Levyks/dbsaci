@@ -8,16 +8,20 @@
 
 use std::path::Path;
 
-use dbsaci::translate::oracle_to_postgres;
+use dbsaci::translate::{oracle_to_mariadb, oracle_to_postgres};
 
 const DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/corpus/translate");
+const MARIADB_DIR: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/corpus/translate/mariadb"
+);
 
 #[test]
 fn translate_goldens() {
     let mut files: Vec<_> = std::fs::read_dir(DIR)
         .unwrap_or_else(|e| panic!("read {DIR}: {e}"))
         .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| p.extension().is_some_and(|x| x == "txt"))
+        .filter(|p| p.extension().is_some_and(|x| x == "txt") && p.is_file())
         .collect();
     files.sort();
     assert!(!files.is_empty(), "no translate goldens in {DIR}");
@@ -77,6 +81,77 @@ fn translate_goldens() {
     }
     eprintln!(
         "translate goldens: {count} cases across {} files",
+        files.len()
+    );
+}
+
+#[test]
+fn translate_goldens_mariadb() {
+    let mut files: Vec<_> = std::fs::read_dir(MARIADB_DIR)
+        .unwrap_or_else(|e| panic!("read {MARIADB_DIR}: {e}"))
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().is_some_and(|x| x == "txt"))
+        .collect();
+    files.sort();
+    assert!(
+        !files.is_empty(),
+        "no MariaDB translate goldens in {MARIADB_DIR}"
+    );
+
+    let mut failures = Vec::new();
+    let mut count = 0usize;
+
+    for path in &files {
+        let text = std::fs::read_to_string(path).unwrap();
+        for (lineno, raw) in text.lines().enumerate() {
+            let line = raw.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let Some((input, expected)) = line.split_once("=>") else {
+                failures.push(format!(
+                    "{}:{}: no `=>` separator",
+                    file_name(path),
+                    lineno + 1
+                ));
+                continue;
+            };
+            let input = input.trim();
+            let expected = expected.trim();
+            count += 1;
+            let got = oracle_to_mariadb(input);
+            match (expected, got) {
+                ("!", Ok(out)) => failures.push(format!(
+                    "{}:{}: expected rejection, translated to `{out}`\n    input: {input}",
+                    file_name(path),
+                    lineno + 1
+                )),
+                ("!", Err(_)) => {}
+                (_, Err(e)) => failures.push(format!(
+                    "{}:{}: translation failed: {e}\n    input:    {input}\n    expected: {expected}",
+                    file_name(path),
+                    lineno + 1
+                )),
+                (_, Ok(out)) if out != expected => failures.push(format!(
+                    "{}:{}: mismatch\n    input:    {input}\n    expected: {expected}\n    actual:   {out}",
+                    file_name(path),
+                    lineno + 1
+                )),
+                (_, Ok(_)) => {}
+            }
+        }
+    }
+
+    if !failures.is_empty() {
+        panic!(
+            "{}/{} MariaDB translate goldens failed:\n\n{}",
+            failures.len(),
+            count,
+            failures.join("\n\n")
+        );
+    }
+    eprintln!(
+        "MariaDB translate goldens: {count} cases across {} files",
         files.len()
     );
 }

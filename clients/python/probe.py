@@ -1,10 +1,15 @@
 """python-oracledb (thin mode) compatibility probe against a running DbSaci.
 
 Env: DBSACI_HOST, DBSACI_PORT, DBSACI_USER, DBSACI_PASSWORD, DBSACI_SERVICE.
-Exits non-zero on the first failed assertion.
+Assertions are always Oracle-correct. With DBSACI_CLIENT_LEDGER=1, the process
+exits 0 iff the failed check names match clients/expected-failures for this
+backend + driver; unexpected failures or unexpected passes fail the job.
+Exits non-zero on the first unexpected failure set otherwise.
 """
 import os
 import sys
+from pathlib import Path
+
 import oracledb
 
 host = os.environ.get("DBSACI_HOST", "127.0.0.1")
@@ -12,6 +17,8 @@ port = int(os.environ.get("DBSACI_PORT", "1521"))
 user = os.environ.get("DBSACI_USER", "corpus")
 password = os.environ.get("DBSACI_PASSWORD", "corpus")
 service = os.environ.get("DBSACI_SERVICE", "FREEPDB1")
+backend = os.environ.get("DBSACI_CLIENT_BACKEND", "postgres")
+ledger = os.environ.get("DBSACI_CLIENT_LEDGER") is not None
 
 dsn = oracledb.makedsn(host, port, service_name=service)
 print(f"connecting thin mode to {dsn} as {user}")
@@ -24,6 +31,25 @@ def check(name, got, want):
     ok = got == want
     checks.append((name, ok, got, want))
     print(("PASS " if ok else "FAIL "), name, "->", repr(got), "" if ok else f"(want {want!r})")
+
+def load_expected_failures():
+    """Lines: `<backend> python <check_name>` from clients/expected-failures."""
+    root = Path(__file__).resolve().parents[1]
+    path = root / "expected-failures"
+    if not path.exists():
+        return set()
+    out = set()
+    for raw in path.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split()
+        if len(parts) != 3:
+            raise SystemExit(f"{path}: bad line `{line}` (want: backend driver check)")
+        b, driver, name = parts
+        if b == backend and driver == "python":
+            out.add(name)
+    return out
 
 cur = conn.cursor()
 
@@ -84,17 +110,33 @@ check("number_ps_scale", d[5], 2)
 check("number_ps_value", cur.fetchone()[0], 1234.56)
 cur.execute("DROP TABLE numps_demo")
 
-# 8d-i. INTERVAL result columns decode natively (types 182 / 183)
+# 8c2. two live cursors (statement cache / multi-cursor)
+c1 = conn.cursor()
+c2 = conn.cursor()
+c1.execute("SELECT name FROM people WHERE id = 1")
+c2.execute("SELECT name FROM people WHERE id = 2")
+check("multi_cursor_first", c1.fetchone(), ("Ada",))
+check("multi_cursor_second", c2.fetchone(), ("Grace",))
+c1.close()
+c2.close()
+
+# 8c3. TIMESTAMP describe is TIMESTAMP, not DATE
+cur.execute("SELECT CAST(TIMESTAMP '2024-02-29 13:14:15.123456' AS TIMESTAMP) FROM DUAL")
+check("timestamp_type", str(cur.description[0][1]), str(oracledb.DB_TYPE_TIMESTAMP))
+
+# 8d-i. INTERVAL result columns decode natively (types 182 / 183).
 import datetime as _dt
 cur.execute("SELECT CAST('9 06:30:00' AS INTERVAL DAY TO SECOND) FROM DUAL")
-check("interval_ds_value", cur.fetchone()[0], _dt.timedelta(days=9, hours=6, minutes=30))
+ds = cur.fetchone()[0]
+check("interval_ds_value", ds, _dt.timedelta(days=9, hours=6, minutes=30))
 cur.execute("SELECT NUMTODSINTERVAL(-2.5, 'DAY') FROM DUAL")
-check("interval_ds_negative", cur.fetchone()[0], _dt.timedelta(days=-2, hours=-12))
+ds_neg = cur.fetchone()[0]
+check("interval_ds_negative", ds_neg, _dt.timedelta(days=-2, hours=-12))
 cur.execute("SELECT CAST('1-6' AS INTERVAL YEAR TO MONTH) FROM DUAL")
 ym = cur.fetchone()[0]
-check("interval_ym_value", (ym.years, ym.months), (1, 6))
+check("interval_ym_value", (ym.years, ym.months) if hasattr(ym, "years") else ym, (1, 6))
 
-# 8d. declared BINARY_DOUBLE column comes back as a native float
+# 8d. declared BINARY_DOUBLE column comes back as a native float.
 cur.execute("BEGIN EXECUTE IMMEDIATE 'DROP TABLE bd_demo'; EXCEPTION WHEN OTHERS THEN NULL; END;")
 cur.execute("CREATE TABLE bd_demo (v BINARY_DOUBLE)")
 cur.execute("INSERT INTO bd_demo (v) VALUES (3.5)")
@@ -103,10 +145,10 @@ check("binary_double_value", cur.fetchone()[0], 3.5)
 check("binary_double_type", cur.description[0][1], oracledb.DB_TYPE_BINARY_DOUBLE)
 cur.execute("DROP TABLE bd_demo")
 
-# 8e. PostgreSQL statement error position is surfaced in the ORA error offset
+# 8e. statement error position is surfaced in the ORA error offset.
 try:
     cur.execute("SELECT 1 FROM people WHERE nonexistent_col_xyz = 1")
-    check("error_position_raised", False, True)
+    check("error_position_nonzero", False, True)
 except oracledb.DatabaseError as e:
     (err,) = e.args
     check("error_position_nonzero", err.offset > 0, True)
@@ -186,6 +228,26 @@ cur.execute("DROP TABLE reexec_seed")
 cur.close()
 conn.close()
 
-failed = [c for c in checks if not c[1]]
+failed = {c[0] for c in checks if not c[1]}
+passed = {c[0] for c in checks if c[1]}
 print(f"\n{len(checks) - len(failed)}/{len(checks)} checks passed")
+
+if ledger:
+    expected = load_expected_failures()
+    unexpected = sorted(failed - expected)
+    xpass = sorted(expected & passed)
+    stale = sorted(expected - failed - passed)
+    print(
+        f"client ledger ({backend}/python): "
+        f"{len(failed)} failed, {len(expected)} expected, "
+        f"{len(unexpected)} unexpected, {len(xpass)} unexpected-pass"
+    )
+    if stale:
+        print("stale ledger entries (check not run):\n ", "\n  ".join(stale))
+    if unexpected:
+        print("unexpected failures:\n ", "\n  ".join(unexpected))
+    if xpass:
+        print("unexpected passes (remove from clients/expected-failures):\n ", "\n  ".join(xpass))
+    sys.exit(0 if not unexpected and not xpass and not stale else 1)
+
 sys.exit(1 if failed else 0)

@@ -75,19 +75,23 @@ Agents must validate DbSaci's logic against the following open-source test corpo
   ignored below a hard version floor (`MERGE` needs PG 15).
   `DBSACI_CORPUS_BACKEND=mariadb` runs the **same** corpus against a
   `mariadb:11.4` container in `SQL_MODE=ORACLE` (started with
-  `--lower-case-table-names=1`). Cases with no MariaDB equivalent carry a
-  per-case `-- skip: mariadb (reason)` (runs as ignored, not red) — the MariaDB
-  pass count is that engine's Oracle-compat backlog, same rule as PG: never
-  soften a genuine red to green. MariaDB translation lives in
-  `oracle_to_mariadb` (`src/translate/mod.rs`) + the backend adapter and
-  `information_schema` facade in `src/mariadb.rs`.
+  `--lower-case-table-names=1`). Backend gaps are **red**, not ignored; known
+  reds are listed in `tests/corpus/expected-failures.<backend>`. With
+  `DBSACI_CORPUS_LEDGER=1` (CI), the job exits 0 iff the failure set matches
+  that file exactly (unexpected fail or unexpected pass → red). MariaDB
+  translation lives in `oracle_to_mariadb` (`src/translate/mod.rs`) + the
+  backend adapter and `information_schema` facade in `src/mariadb.rs`.
 * Porting more of the suites above means adding `tests/corpus/*.sql` groups
   (values authored to the Oracle-correct answer), not new bespoke test binaries.
 * `clients/run.sh <python|java|dotnet> [oracle-version]` — real third-party
   Oracle driver against a real container + real DbSaci. Probes live under
-  `clients/{python,java,dotnet}/` (the .NET probe targets `net10.0`).
-  ODP.NET dialect quirks live behind `is_odpnet` in `src/server.rs` + the
-  `*_odpnet` builders in `src/wire.rs`.
+  `clients/{python,java,dotnet}/` (the .NET probe targets `net10.0`). Probes
+  always send Oracle SQL and assert Oracle behaviour; `DBSACI_CLIENT_BACKEND`
+  only selects the container. Known reds live in `clients/expected-failures`
+  (`<backend> <driver> <check>`); `DBSACI_CLIENT_LEDGER=1` (CI) requires an
+  exact match. ODP.NET dialect quirks are selected from `WireProfile`
+  capability predicates (`newer_describe_framing`, `na_without_version_list`)
+  in `src/profile.rs`, not from a driver-name flag.
 * `bench/run.sh` — latency microbenchmark, real Oracle XE 21c
   (`gvenzl/oracle-xe`) vs PostgreSQL-via-DbSaci; feeds the README's *How slow is
   this?* table. `bench/workload.py` + `bench/README.md`.

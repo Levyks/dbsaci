@@ -1,0 +1,4 @@
+# ROWNUM is native in MariaDB SQL_MODE=ORACLE; do not rewrite to LIMIT.
+# Unquoted table names fold to UPPER.
+SELECT name FROM people WHERE ROWNUM <= 2 => SELECT name FROM PEOPLE WHERE ROWNUM <= 2
+SELECT name FROM people WHERE team_id = 1 AND ROWNUM <= 2 => SELECT name FROM PEOPLE WHERE team_id = 1 AND ROWNUM <= 2

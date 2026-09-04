@@ -93,7 +93,7 @@ SELECT NANVL(12345, 1) FROM DUAL
 -- end
 
 -- case: nanvl_replaces_nan
--- skip: mariadb (MariaDB has no NaN value in DOUBLE arithmetic)
+# known-gap (mariadb): tracked in expected-failures.mariadb — MariaDB has no NaN value in DOUBLE arithmetic
 SELECT NANVL(CAST('NaN' AS DOUBLE PRECISION), 1) FROM DUAL
 -- expect:
 1

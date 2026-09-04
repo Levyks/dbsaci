@@ -1,0 +1,22 @@
+# Expected Oracle-compatibility failures for DBSACI_CORPUS_BACKEND=mariadb.
+# One group::case per line. Ledger mode (DBSACI_CORPUS_LEDGER=1) exits 0 iff
+# the set of failed cases matches this file exactly among executed cases.
+# Remove a line when the case goes green; never soften the Oracle expectation.
+#
+# Hard / fidelity-capped: no IEEE NaN; no TIMESTAMP WITH TIME ZONE.
+oracle_nvl_decode::nanvl_replaces_nan
+time_zones::timestamptz_rendered_in_session_zone
+time_zones::timestamptz_binary_value_follows_session_zone
+time_zones::timestamptz_offset_zone
+time_zones::raw_timestamptz_carries_session_offset_region
+time_zones::raw_timestamptz_carries_session_offset_fixed
+types::timestamptz_keeps_offset
+types::timestamptz_value_not_shifted_to_utc
+# No honest ROWID / autonomous tx / WHERE CURRENT OF / EXCEPTION_INIT on MariaDB
+# (removed corpus-shaped shims that hardcoded `id` or silently dropped semantics).
+pseudocolumns_session::rowid_pseudocolumn
+types::rowid_pseudocolumn_is_stable_within_query
+types::rowid_round_trips_for_refetch
+plsql::pragma_autonomous_transaction_block
+plsql::block_cursor_where_current_of
+plsql::pragma_exception_init_custom_error

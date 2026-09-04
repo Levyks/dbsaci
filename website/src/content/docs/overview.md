@@ -55,15 +55,16 @@ to stay exactly as they are.
 - A login role on the selected backend for the proxy to connect as. **One
   Oracle session maps to one dedicated backend connection**, so size the
   backend connection capacity accordingly.
-- Transport is **plaintext on both sides** today. Run dbSaci behind a
-  TLS-terminating boundary if you need encryption in transit.
+- Transport defaults to plaintext. Enable TCPS with `--tls-cert` / `--tls-key`
+  and backend TLS with `--db-ssl`. A TLS-terminating boundary in front of a
+  plaintext listener is still valid.
 - To build from source: **Rust** (stable, 2024 edition).
 
 ## Which clients
 
 Verified end to end (connect, auth, metadata, parametrised `SELECT`/DML, array
 binds, rollback, multi-thousand-row fetch loop) against both the 19c and 11g
-personas:
+personas, on **PostgreSQL and MariaDB** (CI matrix: client × backend × persona):
 
 | Client | Mode | Status |
 | --- | --- | --- |

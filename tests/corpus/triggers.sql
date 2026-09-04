@@ -70,7 +70,7 @@ SELECT team_id FROM trg_people WHERE id = 6
 -- end
 
 -- case: instead_of_trigger_on_view_redirects_insert
--- skip: mariadb (MariaDB has no INSTEAD OF triggers)
+# known-gap (mariadb): tracked in expected-failures.mariadb — MariaDB has no INSTEAD OF triggers
 -- setup: CREATE TABLE trg_base (id INT, name TEXT)
 -- setup: CREATE VIEW trg_v AS SELECT id, name FROM trg_base
 -- setup: CREATE OR REPLACE TRIGGER trg_io INSTEAD OF INSERT ON trg_v FOR EACH ROW BEGIN INSERT INTO trg_base (id, name) VALUES (:NEW.id, UPPER(:NEW.name)); END;

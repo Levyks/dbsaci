@@ -68,7 +68,7 @@ prod
 -- end
 
 -- case: public_reachable_when_explicitly_qualified
--- skip: mariadb (MariaDB has no shared PUBLIC schema for cross-schema refs)
+# known-gap (mariadb): tracked in expected-failures.mariadb — MariaDB has no shared PUBLIC schema for cross-schema refs
 SELECT v FROM public.corpus_shared_ref WHERE k = 'region'
 -- expect:
 eu
@@ -82,7 +82,7 @@ SELECT COUNT(*) FROM regions
 -- end
 
 -- case: get_ddl_resolves_in_the_user_schema
--- skip: mariadb (no dbms_metadata.get_ddl on MariaDB)
+# known-gap (mariadb): tracked in expected-failures.mariadb — no dbms_metadata.get_ddl on MariaDB
 -- setup: CREATE TABLE ddl_probe (id NUMBER PRIMARY KEY, label VARCHAR2(20))
 SELECT CASE WHEN dbms_metadata.get_ddl('TABLE', 'DDL_PROBE', 'CORPUS') LIKE '%corpus.ddl_probe%'
             THEN 'ok' ELSE 'miss' END FROM dual
