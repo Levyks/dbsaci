@@ -63,6 +63,27 @@ pub trait OracleBackend: Send + Sync {
     fn cursors_survive_commit(&self) -> bool {
         false
     }
+
+    /// The backend connection is gone with uncommitted work; the session
+    /// loop closes the client connection (the client sees ORA-03113).
+    fn session_lost(&self) -> bool {
+        false
+    }
+
+    /// Statements the backend handles itself, before translation (session
+    /// settings, transaction control). `None`: translate and execute as usual.
+    async fn session_statement(&self, _oracle_sql: &str) -> Option<Result<u64>> {
+        None
+    }
+
+    /// Translate client SQL (binds already replaced by placeholders).
+    fn translate(&self, oracle_sql: &str, _binds: &[BindValue]) -> Result<String> {
+        crate::translate::oracle_to_backend(
+            oracle_sql,
+            BackendKind::Postgres,
+            crate::translate::IdentifierCase::default(),
+        )
+    }
 }
 
 /// Cursor contract exposed to the wire layer. Values are already encoded in

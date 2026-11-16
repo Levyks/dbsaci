@@ -2259,6 +2259,12 @@ pub fn bind_parameters(sql: &str, binds: &[BindValue], style: BindStyle) -> Resu
         });
     }
 
+    // MariaDB: a parameter in a query's select list needs a type the server
+    // can describe; DML parameters take the type of their target column.
+    let mariadb_query = matches!(
+        upper_words.first().map(String::as_str),
+        Some("SELECT") | Some("WITH") | Some("(")
+    );
     let mut oracle_names = HashMap::<String, usize>::new();
     let mut parameter_for_bind = HashMap::<usize, usize>::new();
     let mut next_named = 0usize;
@@ -2341,7 +2347,7 @@ pub fn bind_parameters(sql: &str, binds: &[BindValue], style: BindStyle) -> Resu
                         // MariaDB `?` is strictly positional and cannot reuse a
                         // parameter number; repeat the value for every occurrence.
                         ordered.push(value.clone());
-                        out.push_str(mariadb_placeholder(value));
+                        out.push_str(mariadb_placeholder(value, mariadb_query));
                     }
                     BindStyle::Postgres => {
                         let parameter = match parameter_for_bind.get(&bind_index) {
@@ -2375,10 +2381,13 @@ pub fn bind_parameters(sql: &str, binds: &[BindValue], style: BindStyle) -> Resu
 
 /// Text values are cast on the server side. This preserves typed parameter
 /// semantics without interpolating Oracle NUMBER's arbitrary precision text.
-fn mariadb_placeholder(value: &BindValue) -> &'static str {
+fn mariadb_placeholder(value: &BindValue, query: bool) -> &'static str {
     match value {
+        // Keep binary data binary (no character-set conversion), and RAW in a
+        // select list.
         BindValue::Bytes(_) => "CAST(? AS BINARY)",
-        BindValue::Null | BindValue::String(_) => "CAST(? AS CHAR(4000))",
+        // A VARCHAR2 bind can be up to 32767 bytes.
+        BindValue::Null | BindValue::String(_) if query => "CAST(? AS CHAR(32767))",
         _ => "?",
     }
 }

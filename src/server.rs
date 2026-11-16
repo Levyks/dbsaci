@@ -14,7 +14,9 @@ use crate::credentials::Credentials;
 use crate::error::{Error, Result};
 use crate::mariadb::MariaDbBackend;
 use crate::tns::{PacketType, SduMode, TnsStream, build_accept_response};
-use crate::wire::{self, build_dml_response, build_error_response, build_error_response_at};
+use crate::wire::{
+    self, BindValue, build_dml_response, build_error_response, build_error_response_at,
+};
 
 static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(1);
 /// Process-wide counters exposed on `/metrics` (Prometheus text format).
@@ -923,13 +925,16 @@ async fn handle_connection(mut tns: TnsStream, session_id: u64, config: Config) 
             }
         },
         BackendKind::MariaDb => match MariaDbBackend::connect(
-            &config.db_host,
-            config.db_port,
+            &crate::mariadb::MariaDbConfig {
+                host: config.db_host.clone(),
+                port: config.db_port,
+                default_db: config.db_name.clone(),
+                statement_timeout: config.statement_timeout,
+                ssl: config.db_ssl,
+                case: config.identifier_case,
+            },
             &username,
             &db_password,
-            &config.db_name,
-            config.statement_timeout,
-            config.db_ssl,
         )
         .await
         {
@@ -994,6 +999,10 @@ async fn handle_connection(mut tns: TnsStream, session_id: u64, config: Config) 
     // "no more rows".
     let mut closed_by_commit: std::collections::HashSet<u16> = std::collections::HashSet::new();
     loop {
+        if backend.session_lost() {
+            warn!("backend session lost with uncommitted work; closing the client connection");
+            break;
+        }
         let req = tns.read_message().await?;
         match req.packet_type {
             PacketType::Data => {
@@ -1262,11 +1271,7 @@ async fn handle_connection(mut tns: TnsStream, session_id: u64, config: Config) 
                                 continue;
                             }
                         };
-                        let pg_sql = match crate::translate::oracle_to_backend(
-                            &bound.sql,
-                            config.backend,
-                            config.identifier_case,
-                        ) {
+                        let pg_sql = match backend.translate(&bound.sql, &bound.binds) {
                             Ok(s) => s,
                             Err(e) => {
                                 write_error_response(
@@ -1339,6 +1344,46 @@ async fn handle_connection(mut tns: TnsStream, session_id: u64, config: Config) 
                         continue;
                     }
 
+                    if let Some(result) = backend.session_statement(&execute.sql).await {
+                        let result = match result {
+                            Ok(n) => autocommit_after(backend.as_ref(), autocommit)
+                                .await
+                                .map(|()| n),
+                            err => err,
+                        };
+                        match result {
+                            Ok(n) => {
+                                let resp = if oci_dialect {
+                                    wire::build_dml_response_oci(
+                                        n,
+                                        cursor_id,
+                                        req_seq,
+                                        wire::DmlKind::of(&execute.sql),
+                                    )
+                                } else if newer_describe_framing {
+                                    wire::build_dml_response_jdbc(n, req_seq)
+                                } else {
+                                    build_dml_response(n)
+                                };
+                                tns.write_packet(PacketType::Data, &resp).await?;
+                            }
+                            Err(e) => {
+                                let (code, message, error_pos) = oracle_error_for_pos(&e);
+                                write_error_response(
+                                    &mut tns,
+                                    oci_dialect,
+                                    response_completion,
+                                    newer_describe_framing,
+                                    code,
+                                    &message,
+                                    error_pos,
+                                    req_seq,
+                                )
+                                .await?;
+                            }
+                        }
+                        continue;
+                    }
                     if let Some((ora, detail)) =
                         crate::ttc::reject_unsupported_sql(&execute.sql, config.backend)
                     {
@@ -1355,32 +1400,49 @@ async fn handle_connection(mut tns: TnsStream, session_id: u64, config: Config) 
                         .await?;
                         continue;
                     }
-                    let bound =
-                        match wire::bind_parameters(&execute.sql, &execute.binds, bind_style) {
-                            Ok(bound) => bound,
-                            Err(e) => {
-                                write_error_response(
-                                    &mut tns,
-                                    oci_dialect,
-                                    response_completion,
-                                    newer_describe_framing,
-                                    1008,
-                                    &e.to_string(),
-                                    0,
-                                    req_seq,
-                                )
-                                .await?;
-                                continue;
-                            }
-                        };
+                    // For a batch, translate with a template row that has each
+                    // column's first non-NULL value, so a NULL in the first row
+                    // does not fix the wrong placeholder type for later rows
+                    // (e.g. binary data through a character cast).
+                    let template: Vec<BindValue> = if execute.bind_rows.len() > 1 {
+                        (0..execute
+                            .binds
+                            .len()
+                            .max(execute.bind_rows.first().map_or(0, Vec::len)))
+                            .map(|c| {
+                                execute
+                                    .bind_rows
+                                    .iter()
+                                    .filter_map(|r| r.get(c))
+                                    .find(|v| !matches!(v, BindValue::Null))
+                                    .cloned()
+                                    .unwrap_or(BindValue::Null)
+                            })
+                            .collect()
+                    } else {
+                        execute.binds.clone()
+                    };
+                    let bound = match wire::bind_parameters(&execute.sql, &template, bind_style) {
+                        Ok(bound) => bound,
+                        Err(e) => {
+                            write_error_response(
+                                &mut tns,
+                                oci_dialect,
+                                response_completion,
+                                newer_describe_framing,
+                                1008,
+                                &e.to_string(),
+                                0,
+                                req_seq,
+                            )
+                            .await?;
+                            continue;
+                        }
+                    };
                     debug!(bind_count = execute.binds.len(), "executing statement");
 
                     // Translate Oracle-specific structural syntax before executing it.
-                    let pg_sql = match crate::translate::oracle_to_backend(
-                        &bound.sql,
-                        config.backend,
-                        config.identifier_case,
-                    ) {
+                    let pg_sql = match backend.translate(&bound.sql, &bound.binds) {
                         Ok(sql) => sql,
                         Err(e) => {
                             write_error_response(
