@@ -23,7 +23,9 @@ Expressible on PostgreSQL, but the wire framing or translation is not written.
   `SYS_REFCURSOR` are not implemented; ojdbc and ODP.NET get `ORA-03001` for
   `RETURNING … INTO` rather than a silent drop.
 - **LOB streaming.** `CLOB` / `BLOB` values are delivered inline and capped at
-  one ~64 MiB TTC packet. No TTC LOB locators, no multi-gigabyte streaming.
+  one ~64 MiB TTC packet. No TTC LOB locators, no multi-gigabyte streaming;
+  LOB RPCs answer `ORA-22275` (connection pools such as HikariCP evicted
+  connections on the older `ORA-03001`).
   `DBMS_LOB.GETLENGTH / SUBSTR / INSTR` exist as plain SQL functions.
 
 ### Type-metadata gaps

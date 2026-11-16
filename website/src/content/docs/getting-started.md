@@ -4,11 +4,12 @@ description: Run dbSaci in front of PostgreSQL or MariaDB and connect an Oracle 
 ---
 
 dbSaci needs either PostgreSQL with the [`orafce`](https://github.com/orafce/orafce)
-extension available, or MariaDB 11.4+ (dbSaci sets `SQL_MODE=ORACLE` on each
-session itself), plus a login role for the proxy to use. Below, "the client" is any supported Oracle driver.
+extension available, or MariaDB 11.8+ (any `lower_case_table_names`; dbSaci
+sets `SQL_MODE=ORACLE` and the rest of the session itself), plus a login role
+for the proxy to use. Below, "the client" is any supported Oracle driver.
 
 :::note[Getting the image / binary]
-`docker pull levyks/dbsaci:0.1.1` — a small [distroless](https://github.com/GoogleContainerTools/distroless)
+`docker pull levyks/dbsaci:0.3.0` — a small [distroless](https://github.com/GoogleContainerTools/distroless)
 image (glibc + CA roots + the dbSaci binary; no shell, no package manager). It is also buildable from the repo's
 [`Dockerfile`](https://github.com/Levyks/dbsaci/blob/main/Dockerfile), and
 [building from source](#option-e--build-from-source) is a single `cargo build`.
@@ -39,7 +40,7 @@ services:
     ports: ["5432:5432"]
 
   dbsaci:
-    image: levyks/dbsaci:0.1.1
+    image: levyks/dbsaci:0.3.0
     depends_on: [postgres]
     environment:
       DBSACI_LISTEN: 0.0.0.0:1521
@@ -73,7 +74,7 @@ docker run --rm -p 1521:1521 -p 9500:9500 \
   -e DBSACI_DB_PASSWORD=pgpw \
   -e DBSACI_ORACLE_VERSION=19 \
   -e DBSACI_HEALTH_ADDR=0.0.0.0:9500 \
-  levyks/dbsaci:0.1.1
+  levyks/dbsaci:0.3.0
 ```
 
 Your PostgreSQL must have `orafce` installed in the target database
@@ -81,25 +82,41 @@ Your PostgreSQL must have `orafce` installed in the target database
 
 ## Option C — MariaDB backend
 
-MariaDB 11.4+ supplies an Oracle compatibility mode. dbSaci enables it on each
-backend session (no server `sql-mode` needed), folds table identifiers to
-**upper** case by default (`DBSACI_IDENTIFIER_CASE=upper`; pass `lower` to match
-a lower-case schema), and adds rewrites for the Oracle constructs MariaDB does
-not implement itself:
+MariaDB 11.8+ supplies an Oracle compatibility mode. dbSaci enables it on each
+backend session (no server `sql-mode` or `lower-case-table-names` setting
+needed), applies Oracle's identifier rules itself (see
+[Identifier case](#identifier-case)), and adds rewrites for the Oracle
+constructs MariaDB does not implement itself.
+
+An Oracle user `APPUSER` is the MariaDB account `appuser` and works in the
+database `APPUSER` — Oracle's schema == user. The port defaults to `3306` and
+there is no default database (`--db-name` is only a fallback for logins without
+one of their own):
 
 ```bash
-docker run -d --name dbsaci-mariadb \
-  -e MARIADB_ROOT_PASSWORD=root \
-  -e MARIADB_DATABASE=appdb \
-  -e MARIADB_USER=appuser -e MARIADB_PASSWORD=apppw \
-  -p 3306:3306 mariadb:11.4
+docker run -d --name dbsaci-mariadb -e MARIADB_ROOT_PASSWORD=root \
+  -e MARIADB_DATABASE=APPUSER -e MARIADB_USER=appuser -e MARIADB_PASSWORD=apppw \
+  -p 3306:3306 mariadb:11.8
 
-DBSACI_BACKEND=mariadb \
-DBSACI_LISTEN=0.0.0.0:1521 \
-DBSACI_DB_HOST=127.0.0.1 DBSACI_DB_PORT=3306 \
-DBSACI_DB_NAME=appdb DBSACI_DB_PASSWORD=apppw \
-cargo run --release --bin dbsaci
+# once per server (and after upgrading dbSaci): the Oracle data dictionary
+dbsaci --backend mariadb --db-host 127.0.0.1 install --admin-password root
+
+# is everything in place for this login?
+dbsaci --backend mariadb --db-host 127.0.0.1 --db-user appuser:apppw check --user appuser
+
+# load an existing Oracle schema script (SQL*Plus style); without --apply it
+# only prints the translation and what it could not translate
+dbsaci --backend mariadb --db-host 127.0.0.1 --db-user appuser:apppw \
+  migrate schema.sql --apply --user appuser
+
+# run the proxy (serve is the default subcommand)
+dbsaci --backend mariadb --db-host 127.0.0.1 --db-user appuser:apppw
 ```
+
+The same options work as `DBSACI_*` variables (`DBSACI_BACKEND=mariadb`, …), so
+the container image runs the same way. On startup, `serve` checks every
+configured login and logs what it found — a missing schema or dictionary shows
+up there instead of at the first client.
 
 
 ## Option D — Binary from GitHub Releases
@@ -173,9 +190,9 @@ Console.WriteLine(cmd.ExecuteScalar());
 ## Credentials (multi-user)
 
 An Oracle login is a challenge/response — the password never crosses the wire —
-so dbSaci must already hold each user's PostgreSQL password. Declare them up
+so dbSaci must already hold each user's backend password. Declare them up
 front, and an Oracle client then authenticates with the **same** user/password it
-would use against PostgreSQL directly:
+would use against the backend directly:
 
 ```bash
 dbsaci \
@@ -190,12 +207,12 @@ Environment equivalents: `DBSACI_DB_USERS="alice:s3cret,bob:hunter2"`,
 Sources layer **file &lt; `DBSACI_DB_USERS` &lt; `--db-user`**. The username is
 matched case-insensitively; a user with no match and no fallback is rejected with
 `ORA-01017`. The matched password drives both the login challenge and the backend
-PostgreSQL connection.
+connection.
 
 ## Schemas
 
-dbSaci follows Oracle's **schema == user** model. On connect it ensures a
-PostgreSQL schema named after the user exists (`CREATE SCHEMA IF NOT EXISTS
+dbSaci follows Oracle's **schema == user** model. On **PostgreSQL**, on connect
+it ensures a schema named after the user exists (`CREATE SCHEMA IF NOT EXISTS
 "<user>"`) and sets `search_path` to `"<user>", oracle, public`:
 
 - unqualified `CREATE TABLE` / `SELECT` resolve in the user's own schema first;
@@ -212,12 +229,15 @@ If the backend role lacks `CREATE` on the database the connection still
 succeeds; objects then resolve via `oracle` / `public` and a warning is logged.
 
 On **MariaDB** a database *is* the schema and `USE` selects exactly one (there is
-no `search_path`). dbSaci issues `USE <user>` when a database of that name
-exists, otherwise `USE <DBSACI_DB_NAME>`. Give each Oracle login its own
-database, or point every login at one shared `DBSACI_DB_NAME` and qualify
-cross-schema references. `ALTER SESSION SET CURRENT_SCHEMA = x` maps to `USE x`.
+no `search_path`). The Oracle login `APPUSER` connects as the MariaDB account
+`appuser` and starts in the database named after the login — the Oracle name,
+`APPUSER` (stored per [Identifier case](#identifier-case)) — otherwise in
+`--db-name`. Other schemas are reached by qualifying (`SELECT * FROM hr.emp`,
+with grants) or `ALTER SESSION SET CURRENT_SCHEMA = hr`.
 
 ## Provisioning (read-only / least-privilege roles)
+
+### PostgreSQL
 
 dbSaci installs a set of **global** objects once: the `dbsaci` and `sys`
 schemas, the `SYS.*` catalog views, and `public.*` / `dbms_*` helper functions.
@@ -236,6 +256,28 @@ connecting role cannot create them, dbSaci logs one actionable line and the
 session still serves plain queries (`orafce` functions included) — only the
 `SYS.*` catalog and a few helpers are unavailable until an admin provisions.
 
+### MariaDB
+
+The data dictionary — `ALL_*` / `USER_*` / `SYS.*` views, `V$VERSION`,
+`NLS_SESSION_PARAMETERS`, `SYS_CONTEXT`, `DBMS_OUTPUT`,
+`DBMS_METADATA.GET_DDL` and a few Oracle functions MariaDB lacks — lives in one
+database, `dbsaci_sys`, installed **once per server and dbSaci version**:
+
+```bash
+dbsaci --backend mariadb --db-host db.internal install \
+  --admin-user root --admin-password '<admin-password>'
+```
+
+It is also installed automatically on first connect when the login may create
+it. The views run with the caller's rights and are granted to `PUBLIC`, so
+`ALL_TABLES` shows exactly what that account can see and an unprivileged login
+needs no per-account grants. **Nothing is created in application schemas**, and
+nothing is (re)created per session — a connect is about two backend round
+trips. `dbsaci check --user <U>` reports whether the dictionary is in place for
+a login.
+
+## Impersonated Oracle version
+
 `DBSACI_ORACLE_VERSION` (`--oracle-version`) picks which release dbSaci claims to
 be — `19` (default) or `11`. It changes the banner, the `AUTH_VERSION_*` values,
 and the auth-verifier family so that both modern and 11g-era clients negotiate
@@ -248,7 +290,7 @@ With `DBSACI_HEALTH_ADDR` set, dbSaci serves these dependency-free endpoints:
 | Path | Purpose |
 | --- | --- |
 | `GET /healthz` | process is up |
-| `GET /readyz` | backend PostgreSQL reachable |
+| `GET /readyz` | selected backend reachable |
 | `GET /metrics` | Prometheus text format |
 | `GET /sessions` | JSON list of live Oracle sessions — `id`, `addr`, `user`, `age_seconds` |
 | `DELETE /sessions/<id>` | abort one session (drops its backend connection, releasing any locks it held). Requires `Authorization: Bearer <token>` when the health port is not loopback. |
@@ -258,11 +300,15 @@ default 15 min; `0` disables). The effective value is logged at startup.
 
 ## Preflight diagnostics
 
-On its first backend connection dbSaci logs a one-time check of the target
-database: whether `orafce` is installed, the effective `search_path`, and
+On **PostgreSQL**, on its first backend connection dbSaci logs a one-time check
+of the target database: whether `orafce` is installed, the effective `search_path`, and
 whether the login user's schema contains any upper/mixed-case identifiers (see
 below). A missing assumption shows up here as one line instead of an opaque
 PostgreSQL error later.
+
+On **MariaDB** the equivalent is `dbsaci check --user <U>` — server version,
+case sensitivity (`lower_case_table_names`), the login's schema, the data
+dictionary — which `serve` also runs at startup for every configured login.
 
 ## Identifier case
 
@@ -277,18 +323,24 @@ The practical rule: **use lower-case identifiers in the target schema.** A
 table created in PostgreSQL as `"Employees"` (quoted, mixed case) is not
 reachable from an Oracle client, exactly as it would not be in Oracle itself.
 
-On **MariaDB** dbSaci goes further: identifiers in table-name position are
-folded to one case regardless of quoting, via `sqlparser`'s AST rather than
-text matching, so `FROM MY_TABLE` / `FROM my_table` / `FROM "MY_TABLE"` all
-find the same backend object no matter how `lower_case_table_names` is set on
-the server — the flag is not required. `--identifier-case upper|lower` /
-`DBSACI_IDENTIFIER_CASE` picks the direction (default **`upper`**, matching
-Oracle's own unquoted-identifier behaviour — author the MariaDB schema in that
-case, or pass `lower` for the PostgreSQL/MariaDB convention). Genuinely
-mixed-case quoted names are still respected as the case-sensitive escape
-hatch, and the session's `collation_connection` is pinned to the schema's
-default collation so client literals aggregate cleanly with the schema's
-columns.
+On **MariaDB** dbSaci applies Oracle's rule once, when it reads a statement:
+every **unquoted** word is upper-cased, a **quoted** identifier is taken exactly
+as written — whatever the word is (table, view, sequence, alias, schema,
+column). So `CREATE VIEW v`, `DROP TABLE emp`, `REFERENCES emp(id)`,
+`seq.NEXTVAL` and `SELECT E.ID FROM emp e` all reach the same backend object
+however they are spelled. Literals, comments and binds are never touched.
+
+How those Oracle names are *stored* matters only on a server with
+case-sensitive table names (`lower_case_table_names=0`, the Linux default):
+
+- `--identifier-case upper` (default): MariaDB names are the Oracle names
+  (`EMP`, `"MixedCase"`). The backend schema *is* the Oracle schema.
+- `--identifier-case lower`: Oracle-normal names are stored in lower case
+  (`emp`), for schemas authored in the MariaDB convention.
+
+A server with `lower_case_table_names=1|2` stores everything in lower case
+itself; dbSaci detects that and maps names back accordingly (quoted mixed-case
+names lose their case there). `dbsaci check` explains what it found.
 
 ## Time zones
 
@@ -304,3 +356,23 @@ PostgreSQL `timestamptz` columns are converted to the session zone on the wire
 one no longer needs an explicit `AT TIME ZONE` / `::timestamp` cast, and the
 Oracle JDBC thin driver does not need `oracle.jdbc.timezoneAsRegion=false`. PG
 `timestamp` (no zone) is returned unchanged.
+
+## Upgrading from 0.2
+
+0.3.0 changes the MariaDB model; PostgreSQL deployments are not affected by the
+points below. On MariaDB:
+
+- **MariaDB 11.8+ is required.** Older servers are unsupported.
+- **Schema names follow the identifier case.** A login `APP` works in the
+  database `APP` (default `--identifier-case upper`). A 0.2.x database named
+  `app` on a case-sensitive server (`lower_case_table_names=0`) needs either
+  `--identifier-case lower` or renaming to `APP`.
+- **The dictionary moved to `dbsaci_sys`.** Run `dbsaci install` once per
+  server; add `--drop-legacy` to remove the per-schema views and functions 0.2.x
+  created in every user schema.
+- **Bare `NUMBER` is now `DECIMAL`.** Columns dbSaci creates from a bare
+  `NUMBER` are `DECIMAL(65,30)` (MariaDB's Oracle mode made them a binary
+  `DOUBLE`); `NUMBER(p,s)` becomes `DECIMAL(p,s)`.
+- **`--db-name` is only a fallback** database for logins without their own.
+
+Afterwards, run `dbsaci check --user <U>` for each login.

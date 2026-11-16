@@ -23,9 +23,17 @@ Everything below has golden-corpus coverage. See the
   dialect — little-endian fixed-width integers — which dbSaci emits from the
   negotiated `TNS_CCAP_OCI1` capability. Not run in CI (needs a licensed Instant
   Client).
-- **Scalar and array binds** go across as PostgreSQL parameters. A cached
-  statement re-run with new binds (`REEXECUTE`) is handled. Results stream
-  batch by batch, including results past 1M rows or one 64 MiB packet.
+- **Scalar and array binds** go across as backend parameters (up to 65,535 per
+  statement). A cached statement re-run with new binds (`REEXECUTE`) is
+  handled, including an ojdbc `PreparedStatement` re-execute. Requests larger
+  than 8 KB (big `IN` lists, wide batches) are reassembled. Results stream
+  batch by batch on both backends, including results past 1M rows or one
+  64 MiB packet. On MariaDB, array DML runs as multi-row `INSERT`s (10,000
+  rows in about 0.6 s in a debug build).
+- **Describe metadata on MariaDB**: real precision/scale and nullability,
+  blank-padded `CHAR`, `TIMESTAMP` microseconds kept through binds, and an
+  unconstrained `NUMBER` described as precision 0 / scale -127. A bare `NUMBER`
+  column is created as `DECIMAL(65,30)`, `NUMBER(p,s)` as `DECIMAL(p,s)`.
 
 - `SELECT ... FROM DUAL`, `ROWNUM` (→ `LIMIT`), `FETCH FIRST n ROWS ONLY`,
   Oracle legacy `(+)` outer joins, `CONNECT BY` hierarchical queries
@@ -56,19 +64,38 @@ user's node: dbSaci gives each user a PostgreSQL schema of its own name
 (Oracle's "schema == user"), and `ALL_*` / `USER_*` report honest owners
 against it.
 
+On **MariaDB** the dictionary — including `SYS_CONTEXT`, `DBMS_OUTPUT`,
+`DBMS_METADATA.GET_DDL` and a few Oracle functions MariaDB lacks — is installed
+once per server in the `dbsaci_sys` database (`dbsaci install`). The views run
+with the caller's rights, so `ALL_TABLES` shows what that account can see;
+nothing is created in application schemas.
+
 ## Schemas
 
 Each user owns a schema of its own name; unqualified names resolve there first,
 then in `public` (the shared fallback, also reachable as `public.<name>`).
 Cross-schema access is a qualified name plus the usual grants
 (`SELECT * FROM hr.employees`); `ALTER SESSION SET CURRENT_SCHEMA` redirects
-unqualified resolution.
+unqualified resolution. On **MariaDB** the login `APPUSER` starts in the
+database `APPUSER` (otherwise in `--db-name`), and Oracle's
+identifier rules — unquoted upper-cased, quoted exact — apply to every name
+with any `lower_case_table_names`.
 
 ## Transactions
 
 Explicit control, `SAVEPOINT` / `ROLLBACK TO`, Oracle-style implicit commit on
 DDL, `SET TRANSACTION READ ONLY`, `SELECT ... FOR UPDATE` (`OF <cols>` dropped,
-`WAIT n` → blocking, `NOWAIT` / `SKIP LOCKED` passthrough).
+`WAIT n` → blocking, `NOWAIT` / `SKIP LOCKED` passthrough). The driver's
+autocommit (JDBC/HikariCP default, `connection.autocommit = True`) commits after
+each call on both backends.
+
+On **MariaDB**, Oracle's model: every statement sees what was committed before
+it began (`READ COMMITTED`, no stale snapshots in pooled sessions), a clean
+logoff commits, cursors stay fetchable across `COMMIT`,
+`SET TRANSACTION ISOLATION LEVEL SERIALIZABLE` gives a transaction snapshot
+(`ORA-01453` if it is not the first statement), and a lost backend connection
+with uncommitted work ends the session with `ORA-03113` rather than silently
+reconnecting. `ALTER SESSION` state is session state and survives reconnects.
 
 ## DDL
 
@@ -101,7 +128,10 @@ shims). Interval result columns stay text on MariaDB (no type 182/183).
 
 ## Errors
 
-~40 PostgreSQL `SQLSTATE`s map to real `ORA-` numbers — deadlock, serialization
+On MariaDB, errors map by errno — `ORA-00001`, `02291`, `02292`,
+`01400` / `01407`, `00060`, `00054` / `30006`, `12899`, `01438`, `01476`,
+`01722`, `01858`, `00942`, `00904`, `01013`, and more. On PostgreSQL,
+~40 `SQLSTATE`s map to real `ORA-` numbers — deadlock, serialization
 failure, unique / foreign-key / not-null / check violations, `NOWAIT`
 resource-busy, statement cancellation, connection loss, invalid number/date,
 single-row subquery returning many rows, and more. The PostgreSQL statement
@@ -110,7 +140,9 @@ character position is carried into the TTC `error_pos` field (`python-oracledb`
 
 ## Operations
 
-TCP keepalive, idle-session reaping, per-statement timeout → `ORA-01013`,
+TCP keepalive, idle-session reaping, `--max-sessions`, per-call timeout →
+`ORA-01013` (on MariaDB via `KILL QUERY`, covering streaming results and stored
+programs),
 `OCIBreak` / Ctrl-C cancels the in-flight statement, graceful drain on
 `SIGINT` / `SIGTERM`, and dependency-free `/healthz` + `/readyz` + `/metrics`
 (Prometheus) endpoints.

@@ -10,7 +10,7 @@ instead of at an Oracle database, and dbSaci:
 1. terminates the Oracle client handshake and authentication,
 2. translates the Oracle SQL dialect it understands into backend SQL,
 3. runs the query against PostgreSQL + [`orafce`](https://github.com/orafce/orafce)
-   or MariaDB 11.4 in `SQL_MODE=ORACLE`,
+   or MariaDB 11.8+ in `SQL_MODE=ORACLE`,
 4. re-encodes the backend result back into Oracle's binary framing.
 
 The application keeps its Oracle driver, its connection string shape, and most of
@@ -25,7 +25,8 @@ contributions, and design feedback are very welcome.
 ## What dbSaci is not
 
 It is **not an Oracle database implementation**. It supports the slice of Oracle
-that its SQL translation layer plus `orafce` can express — see
+that its SQL translation layer plus the backend (MariaDB's Oracle mode, or
+PostgreSQL with `orafce`) can express — see
 [What works](/dbsaci/what-works/) and [Limitations](/dbsaci/limitations/).
 
 ### How this differs from IvorySQL
@@ -41,8 +42,9 @@ OCI-linked tool) cannot connect to IvorySQL at all.
 dbSaci is the inverse trade. It speaks Oracle's **TNS/TTC wire protocol**, so the
 Oracle client connects exactly as it would to Oracle — no driver swap, no
 connection-string rewrite — while the database behind it is an ordinary,
-unmodified PostgreSQL. The cost is coverage: dbSaci only supports the slice of
-Oracle SQL / PL-SQL its translation layer plus `orafce` can express.
+unmodified PostgreSQL or MariaDB. The cost is coverage: dbSaci only supports the
+slice of Oracle SQL / PL-SQL its translation layer plus the backend's
+compatibility facilities can express.
 
 Use IvorySQL if you can repoint the application at a new database and want broad
 Oracle SQL semantics. Use dbSaci if the application **and its Oracle driver** have
@@ -50,13 +52,18 @@ to stay exactly as they are.
 
 ## Requirements
 
-- **PostgreSQL** (a recent release) with the **`orafce`** extension available
-  (`CREATE EXTENSION orafce`), or **MariaDB 11.4+** (dbSaci enables `SQL_MODE=ORACLE` per session).
+- **MariaDB 11.8+** — the primary backend from 0.3.0. A stock server with any
+  `lower_case_table_names`; dbSaci sets `SQL_MODE=ORACLE` and the rest of the
+  session itself. The Oracle data dictionary is installed once per server
+  (`dbsaci install`, see [Getting started](/dbsaci/getting-started/#mariadb)).
+- Or **PostgreSQL** (a recent release) with the **`orafce`** extension available
+  (`CREATE EXTENSION orafce`).
 - A login role on the selected backend for the proxy to connect as. **One
   Oracle session maps to one dedicated backend connection**, so size the
   backend connection capacity accordingly.
 - Transport defaults to plaintext. Enable TCPS with `--tls-cert` / `--tls-key`
-  and backend TLS with `--db-ssl`. A TLS-terminating boundary in front of a
+  and backend TLS with `--db-ssl` (on MariaDB, `--db-ssl-ca` verifies a server
+  certificate from a private CA). A TLS-terminating boundary in front of a
   plaintext listener is still valid.
 - To build from source: **Rust** (stable, 2024 edition).
 
