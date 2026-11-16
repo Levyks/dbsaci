@@ -510,6 +510,7 @@ fn after_statement(st: &mut State, sql: &str, wrote: bool) {
         st.read_open = false;
         st.special_tx = false;
         st.shared.schema_version.fetch_add(1, Ordering::Relaxed);
+        super::schema_cache::invalidate();
     } else if wrote {
         st.dirty = true;
     } else {

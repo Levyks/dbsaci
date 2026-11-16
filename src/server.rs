@@ -1298,7 +1298,7 @@ async fn handle_connection(mut tns: TnsStream, session_id: u64, config: Config) 
                                 continue;
                             }
                         };
-                        let pg_sql = match backend.translate(&bound.sql, &bound.binds) {
+                        let pg_sql = match backend.translate(&bound.sql, &bound.binds).await {
                             Ok(s) => s,
                             Err(e) => {
                                 write_error_response(
@@ -1469,7 +1469,7 @@ async fn handle_connection(mut tns: TnsStream, session_id: u64, config: Config) 
                     debug!(bind_count = execute.binds.len(), "executing statement");
 
                     // Translate Oracle-specific structural syntax before executing it.
-                    let pg_sql = match backend.translate(&bound.sql, &bound.binds) {
+                    let pg_sql = match backend.translate(&bound.sql, &bound.binds).await {
                         Ok(sql) => sql,
                         Err(e) => {
                             write_error_response(

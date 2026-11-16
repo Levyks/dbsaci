@@ -470,7 +470,7 @@ async fn migrate(
     for (i, stmt) in statements.iter().enumerate() {
         let n = i + 1;
         let translated = match &backend {
-            Some(b) => b.translate(stmt, &[]),
+            Some(b) => b.translate(stmt, &[]).await,
             None => dbsaci::translate::oracle_to_mariadb_with_case(stmt, cfg.case)
                 .map(|s| dbsaci::mariadb::route_dictionary(&s)),
         };

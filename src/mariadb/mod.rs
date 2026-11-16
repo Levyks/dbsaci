@@ -14,6 +14,7 @@ pub mod dictionary;
 pub mod errors;
 pub mod install;
 pub mod instead_of;
+pub mod schema_cache;
 pub mod session;
 pub mod types;
 
@@ -455,7 +456,7 @@ impl OracleBackend for Arc<MariaDbBackend> {
         )
     }
 
-    fn translate(&self, oracle_sql: &str, _binds: &[BindValue]) -> Result<String> {
+    async fn translate(&self, oracle_sql: &str, _binds: &[BindValue]) -> Result<String> {
         if let Some(hit) = self
             .translations
             .lock()

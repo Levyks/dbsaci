@@ -88,7 +88,7 @@ pub trait OracleBackend: Send + Sync {
     }
 
     /// Translate client SQL (binds already replaced by placeholders).
-    fn translate(&self, oracle_sql: &str, _binds: &[BindValue]) -> Result<String> {
+    async fn translate(&self, oracle_sql: &str, _binds: &[BindValue]) -> Result<String> {
         crate::translate::oracle_to_backend(
             oracle_sql,
             BackendKind::Postgres,
