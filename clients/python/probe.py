@@ -225,6 +225,47 @@ if not _reexec_ok:
 cur.execute("DROP TABLE reexec_demo")
 cur.execute("DROP TABLE reexec_seed")
 
+# 11. Oracle's transaction model across sessions.
+# Autocommit: the driver sets the commit bit on Execute and sends no COMMIT.
+cur.execute("BEGIN EXECUTE IMMEDIATE 'DROP TABLE ac_probe'; EXCEPTION WHEN OTHERS THEN NULL; END;")
+cur.execute("CREATE TABLE ac_probe (n NUMBER)")
+ac = oracledb.connect(user=user, password=password, dsn=dsn)
+ac.autocommit = True
+ac.cursor().execute("INSERT INTO ac_probe VALUES (1)")
+ac.close()
+other = oracledb.connect(user=user, password=password, dsn=dsn)
+ocur = other.cursor()
+check("autocommit_write_persists", ocur.execute("SELECT COUNT(*) FROM ac_probe").fetchone(), (1,))
+# Statement-level read consistency: a session that already read sees a later
+# commit by another session on its next statement (no stale snapshot).
+writer = oracledb.connect(user=user, password=password, dsn=dsn)
+writer.cursor().execute("INSERT INTO ac_probe VALUES (2)")
+writer.commit()
+check("next_statement_sees_other_commit", ocur.execute("SELECT COUNT(*) FROM ac_probe").fetchone(), (2,))
+# A cursor stays fetchable across COMMIT.
+for _i in range(3, 30):
+    writer.cursor().execute("INSERT INTO ac_probe VALUES (:1)", [_i])
+writer.commit()
+fc = other.cursor()
+fc.arraysize = 5
+fc.execute("SELECT n FROM ac_probe ORDER BY n")
+_first = [fc.fetchone() for _ in range(3)]
+other.commit()
+check("fetch_across_commit", len(_first) + len(fc.fetchall()), 29)
+writer.close()
+other.close()
+# Requests larger than one 8 KB TNS packet.
+cur.executemany("INSERT INTO ac_probe VALUES (:1)", [(1000 + i,) for i in range(3000)])
+check("executemany_3000_rows", cur.rowcount, 3000)
+_ids = list(range(1000, 3000))
+cur.execute(
+    "SELECT COUNT(*) FROM ac_probe WHERE n IN (" + ",".join(f":{i + 1}" for i in range(len(_ids))) + ")",
+    _ids,
+)
+check("in_list_2000_binds", cur.fetchone(), (2000,))
+conn.rollback()
+cur.execute("DROP TABLE ac_probe")
+
 cur.close()
 conn.close()
 
