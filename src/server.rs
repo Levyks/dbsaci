@@ -184,6 +184,9 @@ pub struct Config {
     pub tls_key: Option<std::path::PathBuf>,
     /// Require TLS when opening the backend connection.
     pub db_ssl: bool,
+    /// Refuse new clients beyond this many concurrent sessions (each holds a
+    /// backend connection). `None`: no limit.
+    pub max_sessions: Option<usize>,
 }
 
 /// The Oracle release DbSaci impersonates on the wire.
@@ -249,6 +252,7 @@ impl Default for Config {
             tls_cert: None,
             tls_key: None,
             db_ssl: false,
+            max_sessions: None,
         }
     }
 }
@@ -329,7 +333,23 @@ impl Server {
                     break;
                 }
             };
-            let (stream, addr) = accepted?;
+            // A failed accept (EMFILE during a connection storm, a reset
+            // during the handshake) must not stop the listener.
+            let (stream, addr) = match accepted {
+                Ok(a) => a,
+                Err(e) => {
+                    warn!(%e, "accept failed; retrying");
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    continue;
+                }
+            };
+            if let Some(max) = self.config.max_sessions
+                && ACTIVE_SESSIONS.load(Ordering::Relaxed) >= max as u64
+            {
+                warn!(%addr, max, "session limit reached; refusing connection");
+                drop(stream);
+                continue;
+            }
             let session_id = NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed);
             if let Err(error) = SockRef::from(&stream).set_keepalive(true) {
                 warn!(session_id, %addr, %error, "could not enable TCP keepalive");

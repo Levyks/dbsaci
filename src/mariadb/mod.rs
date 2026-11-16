@@ -51,8 +51,6 @@ pub struct MariaDbConfig {
 /// What this process learned about each server on first contact.
 #[derive(Clone, Copy)]
 struct ServerFacts {
-    /// `dbsaci_sys` is installed at the current version.
-    dictionary: bool,
     /// `@@lower_case_table_names` (0 = case-sensitive table names).
     lower_case_table_names: u8,
 }
@@ -169,7 +167,6 @@ async fn server_facts(cfg: &MariaDbConfig, opts: &Opts) -> ServerFacts {
         );
     }
     let facts = ServerFacts {
-        dictionary,
         lower_case_table_names: lctn,
     };
     if let Ok(mut m) = SERVERS.lock() {
@@ -626,6 +623,193 @@ pub async fn install_dictionary(
     }
     let _ = conn.disconnect().await;
     Ok(report)
+}
+
+/// The oldest MariaDB release DbSaci supports.
+pub const MIN_VERSION: (u32, u32) = (11, 8);
+
+/// One line of a `dbsaci check` report.
+#[derive(Debug, Clone)]
+pub struct CheckLine {
+    pub ok: bool,
+    pub what: String,
+}
+
+/// `dbsaci check`: can `login` use this server through DbSaci? Reports the
+/// server version, case sensitivity, the login's schema and the data
+/// dictionary. Never changes anything.
+pub async fn check(cfg: &MariaDbConfig, login: &str, password: &str) -> Vec<CheckLine> {
+    let mut out = Vec::new();
+    let mut line = |ok: bool, what: String| out.push(CheckLine { ok, what });
+    let mut builder = OptsBuilder::default()
+        .ip_or_hostname(cfg.host.clone())
+        .tcp_port(cfg.port)
+        .user(Some(login.to_ascii_lowercase()))
+        .pass(Some(password.to_string()))
+        .prefer_socket(false);
+    if cfg.ssl {
+        builder = builder.ssl_opts(mysql_async::SslOpts::default());
+    }
+    let mut conn = match Conn::new(Opts::from(builder)).await {
+        Ok(c) => c,
+        Err(e) => {
+            line(
+                false,
+                format!(
+                    "connect to {}:{} as '{}': {e}",
+                    cfg.host,
+                    cfg.port,
+                    login.to_ascii_lowercase()
+                ),
+            );
+            return out;
+        }
+    };
+    line(
+        true,
+        format!(
+            "connected to {}:{} as '{}'",
+            cfg.host,
+            cfg.port,
+            login.to_ascii_lowercase()
+        ),
+    );
+    let version: String = conn
+        .query_first("SELECT VERSION()")
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    let mut parts = version.split(|c: char| !c.is_ascii_digit());
+    let major: u32 = parts.next().and_then(|v| v.parse().ok()).unwrap_or(0);
+    let minor: u32 = parts.next().and_then(|v| v.parse().ok()).unwrap_or(0);
+    let is_mariadb = version.to_ascii_lowercase().contains("mariadb");
+    let new_enough = (major, minor) >= MIN_VERSION;
+    line(
+        is_mariadb && new_enough,
+        format!(
+            "server version {version} (DbSaci needs MariaDB {}.{} or newer)",
+            MIN_VERSION.0, MIN_VERSION.1
+        ),
+    );
+    let lctn: u8 = conn
+        .query_first("SELECT @@lower_case_table_names")
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or(0);
+    let effective = if lctn != 0 {
+        IdentifierCase::Lower
+    } else {
+        cfg.case
+    };
+    line(
+        true,
+        match lctn {
+            0 => format!(
+                "lower_case_table_names = 0: table names are case-sensitive; DbSaci stores Oracle names {} (--identifier-case {})",
+                if cfg.case == IdentifierCase::Upper {
+                    "as written in Oracle (EMP)"
+                } else {
+                    "in lower case (emp)"
+                },
+                if cfg.case == IdentifierCase::Upper {
+                    "upper"
+                } else {
+                    "lower"
+                }
+            ),
+            n => format!(
+                "lower_case_table_names = {n}: the server stores names in lower case; quoted mixed-case Oracle names (\"MyTable\") lose their case"
+            ),
+        },
+    );
+    let login_oracle = login.to_ascii_uppercase();
+    let schema = effective.physical(&login_oracle);
+    let exists: Option<String> = conn
+        .exec_first(
+            "SELECT SCHEMA_NAME FROM information_schema.SCHEMATA WHERE SCHEMA_NAME = ?",
+            (&schema,),
+        )
+        .await
+        .ok()
+        .flatten();
+    let default_exists: Option<String> = if cfg.default_db.is_empty() {
+        None
+    } else {
+        conn.exec_first(
+            "SELECT SCHEMA_NAME FROM information_schema.SCHEMATA WHERE SCHEMA_NAME = ?",
+            (&cfg.default_db,),
+        )
+        .await
+        .ok()
+        .flatten()
+    };
+    match (exists, default_exists) {
+        (Some(_), _) => line(
+            true,
+            format!("schema `{schema}` (Oracle user {login_oracle}) exists"),
+        ),
+        (None, Some(d)) => line(
+            true,
+            format!("no schema `{schema}`; sessions of {login_oracle} start in the default `{d}`"),
+        ),
+        (None, None) => {
+            let near: Vec<String> = conn
+                .exec(
+                    "SELECT SCHEMA_NAME FROM information_schema.SCHEMATA WHERE LOWER(SCHEMA_NAME) = LOWER(?)",
+                    (&schema,),
+                )
+                .await
+                .unwrap_or_default();
+            line(
+                false,
+                if near.is_empty() {
+                    format!(
+                        "no schema `{schema}` for Oracle user {login_oracle} and no usable --db-name; create it: CREATE DATABASE `{schema}`"
+                    )
+                } else {
+                    format!(
+                        "no schema `{schema}` for Oracle user {login_oracle}, but `{}` exists: rename it, or run with --identifier-case {}",
+                        near.join("`, `"),
+                        if cfg.case == IdentifierCase::Upper {
+                            "lower"
+                        } else {
+                            "upper"
+                        }
+                    )
+                },
+            )
+        }
+    }
+    let installed: Option<String> = conn
+        .query_first("SELECT version FROM dbsaci_sys.install_info")
+        .await
+        .ok()
+        .flatten();
+    match installed {
+        Some(v) if v == install::VERSION => line(
+            true,
+            format!("data dictionary `{}` is current ({v})", dictionary::SCHEMA),
+        ),
+        Some(v) => line(
+            false,
+            format!(
+                "data dictionary `{}` is version {v}, this DbSaci needs {}: run `dbsaci install`",
+                dictionary::SCHEMA,
+                install::VERSION
+            ),
+        ),
+        None => line(
+            false,
+            format!(
+                "data dictionary `{}` is not installed (or not readable): run `dbsaci install` with an administrative account",
+                dictionary::SCHEMA
+            ),
+        ),
+    }
+    let _ = conn.disconnect().await;
+    out
 }
 
 #[cfg(test)]

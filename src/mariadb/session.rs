@@ -148,6 +148,9 @@ struct State {
     nextval_seen: HashSet<String>,
     instead_of: HashMap<String, InsteadOfTrigger>,
     spilled: HashMap<u64, VecDeque<Row>>,
+    /// A spilled cursor whose remaining rows could not all be read: the
+    /// error is reported after its buffered rows.
+    spill_errors: HashMap<u64, String>,
     next_cursor: u64,
 }
 
@@ -165,6 +168,7 @@ pub async fn start(params: SessionParams, shared: Arc<Shared>) -> Result<mpsc::S
         nextval_seen: HashSet::new(),
         instead_of: HashMap::new(),
         spilled: HashMap::new(),
+        spill_errors: HashMap::new(),
         next_cursor: 1,
     };
     let conn = establish(&mut state).await?;
@@ -339,6 +343,7 @@ async fn handle(
         }
         Cmd::Close { cursor } => {
             st.spilled.remove(&cursor);
+            st.spill_errors.remove(&cursor);
             None
         }
         Cmd::Exec { sql, params, reply } => {
@@ -959,9 +964,15 @@ fn fetch_spilled(st: &mut State, cursor: u64, n: usize) -> Result<(Vec<Row>, boo
     let Some(buf) = st.spilled.get_mut(&cursor) else {
         return Err(Error::ora(1001, "invalid cursor"));
     };
+    if buf.is_empty()
+        && let Some(e) = st.spill_errors.remove(&cursor)
+    {
+        st.spilled.remove(&cursor);
+        return Err(Error::ora(1013, e));
+    }
     let take = n.min(buf.len());
     let rows: Vec<Row> = buf.drain(..take).collect();
-    let exhausted = buf.is_empty();
+    let exhausted = buf.is_empty() && !st.spill_errors.contains_key(&cursor);
     if exhausted {
         st.spilled.remove(&cursor);
     }
@@ -1144,19 +1155,30 @@ async fn serve<P: Protocol>(
                 // Another request needs the connection: read the rest of this
                 // cursor into memory so it stays fetchable, then hand over.
                 let mut rest = VecDeque::new();
+                let mut failure = None;
                 loop {
                     match result.next().await {
                         Ok(Some(row)) => match encode_row(&row, &wires) {
                             Ok(r) => rest.push_back(r),
-                            Err(_) => break,
+                            Err(e) => {
+                                failure = Some(e.to_string());
+                                break;
+                            }
                         },
-                        Ok(None) | Err(_) => break,
+                        Ok(None) => break,
+                        Err(e) => {
+                            failure = Some(mapped(st, e, sql).to_string());
+                            break;
+                        }
                     }
                 }
                 let _ = result.drop_result().await;
-                if !rest.is_empty() {
-                    st.spilled.insert(cursor, rest);
+                if let Some(f) = failure {
+                    st.spill_errors.insert(cursor, f);
                 }
+                // Kept even when empty: the client's next Fetch then gets
+                // "no more rows" rather than "invalid cursor".
+                st.spilled.insert(cursor, rest);
                 return Some(other);
             }
         }
