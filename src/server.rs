@@ -1033,7 +1033,28 @@ async fn handle_connection(mut tns: TnsStream, session_id: u64, config: Config) 
             warn!("backend session lost with uncommitted work; closing the client connection");
             break;
         }
-        let req = tns.read_message().await?;
+        let mut req = tns.read_message().await?;
+        // An Execute whose declared SQL is longer than what arrived: ojdbc
+        // sends a long statement as a short header packet followed by the SQL
+        // in further packets. Read until the declared text can be present.
+        if req.packet_type == PacketType::Data
+            && !oci_dialect
+            && let Some(sql_len) = wire::execute_declared_sql_len(&req.payload)
+            && req.payload.len() < sql_len
+        {
+            let mut whole = req.payload.to_vec();
+            while whole.len() < sql_len + 16
+                && tns
+                    .append_continuation(&mut whole, std::time::Duration::from_secs(5))
+                    .await?
+            {}
+            // and whatever follows the SQL in the same burst (binds)
+            while tns
+                .append_continuation(&mut whole, std::time::Duration::from_millis(50))
+                .await?
+            {}
+            req.payload = bytes::Bytes::from(whole);
+        }
         match req.packet_type {
             PacketType::Data => {
                 if req.payload.len() < 4 {

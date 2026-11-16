@@ -939,6 +939,22 @@ pub fn execute_commit_requested(payload: &[u8], func_code: u8, oci_dialect: bool
     parsed.unwrap_or(false)
 }
 
+/// The SQL length a thin-driver Execute (`0x5E`) declares in its preamble,
+/// when it carries SQL. The text itself may follow in later packets.
+pub fn execute_declared_sql_len(payload: &[u8]) -> Option<usize> {
+    let mut buf = ReadBuffer::from_slice(payload);
+    buf.read_u16_be().ok()?; // data flags
+    if buf.read_u8().ok()? != 0x03 || buf.read_u8().ok()? != 0x5E {
+        return None;
+    }
+    buf.read_u8().ok()?; // seq
+    buf.read_ub4().ok()?; // exec options
+    buf.read_ub4().ok()?; // cursor id
+    let sql_ptr = buf.read_u8().ok()?;
+    let sql_len = buf.read_ub4().ok()? as usize;
+    (sql_ptr != 0 && sql_len > 0).then_some(sql_len)
+}
+
 /// Cursor id from a thin-driver Execute preamble (`ub4` after exec options).
 pub fn parse_execute_cursor_id(payload: &[u8]) -> Option<u16> {
     let mut buf = ReadBuffer::from_slice(payload);
@@ -2457,6 +2473,17 @@ pub fn bind_parameters(sql: &str, binds: &[BindValue], style: BindStyle) -> Resu
         upper_words.first().map(String::as_str),
         Some("SELECT") | Some("WITH") | Some("(")
     );
+    // Oracle binds by position of appearance; numeric names are labels.
+    // DbSaci maps `:N` to the Nth value when the names fit the values sent,
+    // and by order of first appearance when they don't (ojdbc metadata SQL
+    // uses `:2` and `:4` and sends two values).
+    let positional = {
+        let order = numeric_bind_names(sql);
+        order
+            .iter()
+            .any(|&n| n == 0 || n > binds.len())
+            .then_some(order)
+    };
     let mut oracle_names = HashMap::<String, usize>::new();
     let mut parameter_for_bind = HashMap::<usize, usize>::new();
     let mut next_named = 0usize;
@@ -2512,7 +2539,10 @@ pub fn bind_parameters(sql: &str, binds: &[BindValue], style: BindStyle) -> Resu
             if end > start {
                 let name = &sql[start..end];
                 let bind_index = if name.bytes().all(|b| b.is_ascii_digit()) {
-                    let index = name.parse::<usize>().ok().and_then(|n| n.checked_sub(1));
+                    let index = name.parse::<usize>().ok().and_then(|n| match &positional {
+                        Some(order) => order.iter().position(|&m| m == n),
+                        None => n.checked_sub(1),
+                    });
                     if let Some(index) = index {
                         next_named = next_named.max(index + 1);
                     }
@@ -2573,6 +2603,57 @@ pub fn bind_parameters(sql: &str, binds: &[BindValue], style: BindStyle) -> Resu
 
 /// Text values are cast on the server side. This preserves typed parameter
 /// semantics without interpolating Oracle NUMBER's arbitrary precision text.
+/// Distinct numeric bind names (`:2`, `:4`) in order of first appearance,
+/// outside literals, quoted identifiers and comments.
+fn numeric_bind_names(sql: &str) -> Vec<usize> {
+    let b = sql.as_bytes();
+    let mut out: Vec<usize> = Vec::new();
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            q @ (b'\'' | b'"') => {
+                i += 1;
+                while i < b.len() && b[i] != q {
+                    i += 1;
+                }
+                i += 1;
+            }
+            b'-' if b.get(i + 1) == Some(&b'-') => {
+                while i < b.len() && b[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            b'/' if b.get(i + 1) == Some(&b'*') => {
+                i += 2;
+                while i + 1 < b.len() && !(b[i] == b'*' && b[i + 1] == b'/') {
+                    i += 1;
+                }
+                i += 2;
+            }
+            b':' if i == 0 || !(b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b':') => {
+                let start = i + 1;
+                let mut end = start;
+                while end < b.len() && b[end].is_ascii_digit() {
+                    end += 1;
+                }
+                let word_follows = b
+                    .get(end)
+                    .is_some_and(|c| c.is_ascii_alphabetic() || *c == b'_');
+                if end > start
+                    && !word_follows
+                    && let Ok(n) = sql[start..end].parse::<usize>()
+                    && !out.contains(&n)
+                {
+                    out.push(n);
+                }
+                i = end.max(i + 1);
+            }
+            _ => i += 1,
+        }
+    }
+    out
+}
+
 fn mariadb_placeholder(value: &BindValue, query: bool) -> &'static str {
     match value {
         // Keep binary data binary (no character-set conversion), and RAW in a
@@ -4220,8 +4301,45 @@ pub fn encode_oracle_number_decimal(value: &str) -> Result<Vec<u8>> {
 mod tests {
 
     #[test]
+    fn numeric_bind_names_beyond_the_values_bind_by_appearance() {
+        use crate::wire::{BindStyle, BindValue, bind_parameters};
+        let b = bind_parameters(
+            "select 1 from t where a = :2 and b = :4",
+            &[BindValue::String("x".into()), BindValue::String("y".into())],
+            BindStyle::MariaDb,
+        )
+        .unwrap();
+        assert_eq!(
+            b.binds,
+            vec![BindValue::String("x".into()), BindValue::String("y".into())]
+        );
+        // names that fit the values keep their numbers (reordered :2 / :1)
+        let b = bind_parameters(
+            "update t set a = :2 where b = :1",
+            &[
+                BindValue::String("one".into()),
+                BindValue::String("two".into()),
+            ],
+            BindStyle::MariaDb,
+        )
+        .unwrap();
+        assert_eq!(
+            b.binds,
+            vec![
+                BindValue::String("two".into()),
+                BindValue::String("one".into())
+            ]
+        );
+    }
+
+    #[test]
     fn oci_autocommit_bits_are_decoded() {
-        let hex = |h: &str| -> Vec<u8> { (0..h.len()).step_by(2).map(|i| u8::from_str_radix(&h[i..i + 2], 16).unwrap()).collect() };
+        let hex = |h: &str| -> Vec<u8> {
+            (0..h.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&h[i..i + 2], 16).unwrap())
+                .collect()
+        };
         // Instant Client 19 captures: Execute with / without autocommit.
         let on = hex("0000035e0c2981000000000000feffffffffffffff1e000000");
         let off = hex("0000035e0b2980000000000000feffffffffffffff1e000000");
@@ -4233,7 +4351,6 @@ mod tests {
         assert!(crate::wire::execute_commit_requested(&on, 0x04, true));
         assert!(!crate::wire::execute_commit_requested(&off, 0x04, true));
     }
-
 
     #[test]
     fn piggyback_close_of_cursor_3_does_not_hide_the_execute() {

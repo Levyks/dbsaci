@@ -192,6 +192,7 @@ const STOP: &[&str] = &[
 const MARIADB_EXTRA_RESERVED: &[&str] = &[
     "BODY",
     "OPTION",
+    "PRECISION",
     "RANK",
     "ROWS",
     "GROUPS",

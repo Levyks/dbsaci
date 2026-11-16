@@ -194,7 +194,32 @@ pub fn pieces(sql: &str) -> Vec<(Piece, std::ops::Range<usize>)> {
                 }
             }
             b'0'..=b'9' => {
-                while i < bytes.len() && (is_word_byte(bytes[i]) || bytes[i] == b'.') {
+                // An Oracle numeric literal: digits[.digits][e[+-]digits][f|d].
+                // It ends there: `93as` is the number 93 then `AS` (ojdbc's
+                // own getTypeInfo SQL relies on this).
+                let digits = |i: &mut usize| {
+                    while *i < bytes.len() && bytes[*i].is_ascii_digit() {
+                        *i += 1;
+                    }
+                };
+                digits(&mut i);
+                if bytes.get(i) == Some(&b'.') {
+                    i += 1;
+                    digits(&mut i);
+                }
+                if matches!(bytes.get(i), Some(b'e' | b'E')) {
+                    let mut j = i + 1;
+                    if matches!(bytes.get(j), Some(b'+' | b'-')) {
+                        j += 1;
+                    }
+                    if bytes.get(j).is_some_and(u8::is_ascii_digit) {
+                        i = j;
+                        digits(&mut i);
+                    }
+                }
+                if matches!(bytes.get(i), Some(b'f' | b'F' | b'd' | b'D'))
+                    && !bytes.get(i + 1).is_some_and(|&c| is_word_byte(c))
+                {
                     i += 1;
                 }
             }
@@ -240,7 +265,13 @@ pub fn canonicalize(sql: &str, case: IdentifierCase) -> String {
         let text = &sql[range];
         match piece {
             Piece::Opaque => out.push_str(text),
-            Piece::Word => out.push_str(&case.physical(&text.to_ascii_uppercase())),
+            Piece::Word => {
+                // A word glued to a number (`93as`): Oracle reads two tokens.
+                if out.ends_with(|c: char| c.is_ascii_digit()) {
+                    out.push(' ');
+                }
+                out.push_str(&case.physical(&text.to_ascii_uppercase()))
+            }
             Piece::Quoted => {
                 let inner = &text[1..text.len().saturating_sub(1).max(1)];
                 if text.len() < 2 || !text.ends_with('"') {

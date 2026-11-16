@@ -87,6 +87,10 @@ pub const RELATIONS: &[&str] = &[
     "user_dependencies",
     "session_privs",
     "session_roles",
+    "all_procedures",
+    "user_procedures",
+    "all_arguments",
+    "user_arguments",
     // instance / session
     "v$version",
     "product_component_version",

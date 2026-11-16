@@ -277,6 +277,31 @@ impl TnsStream {
         })
     }
 
+    /// Append the next DATA packet's payload (minus its data flags) to
+    /// `payload` if one arrives within `wait`; `false` when none does. Used
+    /// when a request's content says more bytes are coming (ojdbc sends a
+    /// long SQL text in packets after a short header packet).
+    pub async fn append_continuation(
+        &mut self,
+        payload: &mut Vec<u8>,
+        wait: Duration,
+    ) -> Result<bool> {
+        if self.lookahead.is_none() {
+            match timeout(wait, self.inner.io_read_one()).await {
+                Ok(Ok(Some(b))) => self.lookahead = Some(b),
+                Ok(Ok(None)) | Err(_) => return Ok(false),
+                Ok(Err(e)) => return Err(e.into()),
+            }
+        }
+        let next = self.read_packet().await?;
+        if next.packet_type != PacketType::Data {
+            self.pushback = Some(next);
+            return Ok(false);
+        }
+        payload.extend_from_slice(next.payload.get(2..).unwrap_or_default());
+        Ok(true)
+    }
+
     /// Does another packet start within [`CONTINUATION_WAIT`]?
     async fn continuation_pending(&mut self) -> Result<bool> {
         if self.lookahead.is_some() {

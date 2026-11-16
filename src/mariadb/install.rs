@@ -8,7 +8,7 @@
 use super::dictionary::{RELATIONS, SCHEMA};
 
 /// Bump on any change to the objects below.
-pub const VERSION: &str = "0.3.1-2026-11-16.2";
+pub const VERSION: &str = "0.3.4-2026-11-16.1";
 
 /// Schemas that are MariaDB's own, not Oracle objects; hidden from ALL_*.
 const SYSTEM_SCHEMAS: &str =
@@ -230,7 +230,9 @@ fn view_definitions() -> Vec<(&'static str, String)> {
                 "SELECT dbsaci_sys.oname(table_schema) AS owner, dbsaci_sys.oname(table_name) AS table_name, \
                    'USERS' AS tablespace_name, 'VALID' AS status, table_rows AS num_rows, \
                    CASE WHEN table_type = 'TEMPORARY' THEN 'Y' ELSE 'N' END AS temporary, \
-                   NULL AS iot_type, 'NO' AS partitioned, 'NO' AS nested, 'NO' AS dropped \
+                   NULL AS iot_type, 'NO' AS partitioned, 'NO' AS nested, 'NO' AS dropped, \
+                   NULL AS blocks, NULL AS empty_blocks, avg_row_length AS avg_row_len, \
+                   update_time AS last_analyzed, 'YES' AS logging, 'DISABLED' AS compression \
                  FROM information_schema.tables \
                  WHERE table_type IN ('BASE TABLE', 'TEMPORARY') AND table_schema NOT IN {sys}"
             ),
@@ -339,7 +341,10 @@ fn view_definitions() -> Vec<(&'static str, String)> {
                    'VALID' AS status, 'USERS' AS tablespace_name, NULL AS ityp_owner, NULL AS ityp_name, \
                    NULL AS parameters, NULL AS funcidx_status, 'VISIBLE' AS visibility, \
                    CASE WHEN index_name = 'PRIMARY' THEN 'YES' ELSE 'NO' END AS constraint_index, \
-                   '1' AS degree, 'NO' AS partitioned, 'N' AS temporary \
+                   '1' AS degree, 'NO' AS partitioned, 'N' AS temporary, \
+                   MAX(cardinality) AS distinct_keys, NULL AS leaf_blocks, NULL AS blevel, \
+                   NULL AS clustering_factor, MAX(cardinality) AS num_rows, \
+                   NULL AS last_analyzed \
                  FROM information_schema.statistics WHERE index_schema NOT IN {sys} \
                  GROUP BY index_schema, index_name, table_name"
             ),
@@ -427,6 +432,40 @@ fn view_definitions() -> Vec<(&'static str, String)> {
                    'NO' AS common, 'NO' AS oracle_maintained, 'OPEN' AS account_status, \
                    'USERS' AS default_tablespace \
                  FROM information_schema.schemata WHERE schema_name NOT IN {sys}"
+            ),
+        ),
+        (
+            "all_procedures",
+            format!(
+                "SELECT dbsaci_sys.oname(routine_schema) AS owner, \
+                   dbsaci_sys.oname(routine_name) AS object_name, NULL AS procedure_name, \
+                   NULL AS object_id, 1 AS subprogram_id, NULL AS overload, \
+                   routine_type AS object_type, 'NO' AS aggregate, 'NO' AS pipelined, \
+                   NULL AS impltypeowner, NULL AS impltypename, 'NO' AS parallel, \
+                   'NO' AS interface, \
+                   CASE WHEN is_deterministic = 'YES' THEN 'YES' ELSE 'NO' END AS `deterministic`, \
+                   CASE WHEN security_type = 'INVOKER' THEN 'CURRENT_USER' ELSE 'DEFINER' END \
+                     AS authid \
+                 FROM information_schema.routines WHERE routine_schema NOT IN {sys}"
+            ),
+        ),
+        (
+            "all_arguments",
+            format!(
+                "SELECT dbsaci_sys.oname(p.specific_schema) AS owner, \
+                   dbsaci_sys.oname(p.specific_name) AS object_name, NULL AS package_name, \
+                   NULL AS object_id, NULL AS overload, 1 AS subprogram_id, \
+                   dbsaci_sys.oname(p.parameter_name) AS argument_name, \
+                   COALESCE(p.ordinal_position, 0) AS position, \
+                   COALESCE(p.ordinal_position, 0) AS sequence, 0 AS data_level, \
+                   UPPER(p.data_type) AS data_type, NULL AS defaulted, \
+                   CASE WHEN p.parameter_mode IS NULL THEN 'OUT' \
+                        WHEN p.parameter_mode = 'INOUT' THEN 'IN/OUT' \
+                        ELSE p.parameter_mode END AS in_out, \
+                   p.character_maximum_length AS data_length, \
+                   p.numeric_precision AS data_precision, p.numeric_scale AS data_scale, \
+                   10 AS radix, NULL AS char_length \
+                 FROM information_schema.parameters p WHERE p.specific_schema NOT IN {sys}"
             ),
         ),
         (
@@ -537,6 +576,8 @@ fn view_definitions() -> Vec<(&'static str, String)> {
         ("user_views", "all_views", "owner"),
         ("user_synonyms", "all_synonyms", "owner"),
         ("user_mviews", "all_mviews", "owner"),
+        ("user_procedures", "all_procedures", "owner"),
+        ("user_arguments", "all_arguments", "owner"),
     ];
     for (user, all, owner) in user_views {
         v.push((
