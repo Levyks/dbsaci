@@ -989,8 +989,12 @@ async fn handle_connection(mut tns: TnsStream, session_id: u64, config: Config) 
     // arrives as a marker packet with no seq of its own; the OCI error frame
     // returned during break recovery still needs one.
     let mut last_req_seq: u8 = 0;
+    // Cursor ids closed by a COMMIT/ROLLBACK on a backend whose cursors do not
+    // survive it; a later Fetch on one gets ORA-01002 instead of a silent
+    // "no more rows".
+    let mut closed_by_commit: std::collections::HashSet<u16> = std::collections::HashSet::new();
     loop {
-        let req = tns.read_packet().await?;
+        let req = tns.read_message().await?;
         match req.packet_type {
             PacketType::Data => {
                 if req.payload.len() < 4 {
@@ -1029,6 +1033,11 @@ async fn handle_connection(mut tns: TnsStream, session_id: u64, config: Config) 
                 if msg_type == 0x03 && matches!(func_code, 0x5E | 0x4E | 0x04 | 0x05) {
                     STATEMENTS_TOTAL.fetch_add(1, Ordering::Relaxed);
                 }
+                // Autocommit: the client asked for a commit after a successful
+                // Execute (it sends no separate COMMIT).
+                let autocommit = msg_type == 0x03
+                    && matches!(func_code, 0x5E | 0x4E | 0x04)
+                    && wire::execute_commit_requested(&payload, func_code, oci_dialect);
                 if msg_type == 0x03 && matches!(func_code, 0x5E | 0x4E | 0x04) {
                     // Execute, or re-execute of the statement already prepared on
                     // the cursor (`REEXECUTE` / `REEXECUTE_AND_FETCH` carry new
@@ -1288,6 +1297,22 @@ async fn handle_connection(mut tns: TnsStream, session_id: u64, config: Config) 
                         .await?
                         {
                             Ok((rows, per_col)) => {
+                                if let Err(e) = autocommit_after(backend.as_ref(), autocommit).await
+                                {
+                                    let (code, message, error_pos) = oracle_error_for_pos(&e);
+                                    write_error_response(
+                                        &mut tns,
+                                        oci_dialect,
+                                        response_completion,
+                                        newer_describe_framing,
+                                        code,
+                                        &message,
+                                        error_pos,
+                                        req_seq,
+                                    )
+                                    .await?;
+                                    continue;
+                                }
                                 let resp = wire::build_returning_response(
                                     input_bind_count,
                                     &per_col,
@@ -1421,6 +1446,10 @@ async fn handle_connection(mut tns: TnsStream, session_id: u64, config: Config) 
                                 }
                             }
                         }
+                        let failed = match failed {
+                            None => autocommit_after(backend.as_ref(), autocommit).await.err(),
+                            some => some,
+                        };
                         match failed {
                             None => {
                                 let resp = if oci_dialect && is_ddl {
@@ -1497,6 +1526,27 @@ async fn handle_connection(mut tns: TnsStream, session_id: u64, config: Config) 
                                 {
                                     Ok(rows) => {
                                         let more = !cur.is_exhausted();
+                                        if autocommit
+                                            && (!more || backend.cursors_survive_commit())
+                                            && let Err(e) =
+                                                autocommit_after(backend.as_ref(), true).await
+                                        {
+                                            cur.finish().await;
+                                            let (code, message, error_pos) =
+                                                oracle_error_for_pos(&e);
+                                            write_error_response(
+                                                &mut tns,
+                                                oci_dialect,
+                                                response_completion,
+                                                newer_describe_framing,
+                                                code,
+                                                &message,
+                                                error_pos,
+                                                req_seq,
+                                            )
+                                            .await?;
+                                            continue;
+                                        }
                                         oci_rows_sent = rows.len() as u64;
                                         let response = if oci_dialect {
                                             // 0x4e REEXECUTE_AND_FETCH omits the
@@ -1570,6 +1620,12 @@ async fn handle_connection(mut tns: TnsStream, session_id: u64, config: Config) 
                                 backend.execute_simple(&pg_sql, &bound.binds),
                             )
                             .await?
+                        };
+                        let result = match result {
+                            Ok(n) => autocommit_after(backend.as_ref(), autocommit)
+                                .await
+                                .map(|()| n),
+                            err => err,
                         };
                         match result {
                             Ok(rows_affected) => {
@@ -1677,6 +1733,19 @@ async fn handle_connection(mut tns: TnsStream, session_id: u64, config: Config) 
                                 }
                             }
                         }
+                        None if closed_by_commit.remove(&fetch_cid) => {
+                            write_error_response(
+                                &mut tns,
+                                oci_dialect,
+                                response_completion,
+                                newer_describe_framing,
+                                1002,
+                                "ORA-01002: fetch out of sequence",
+                                0,
+                                req_seq,
+                            )
+                            .await?;
+                        }
                         None => {
                             // A fetch after the cursor is exhausted/closed. OCI
                             // clients will stall on `call_timeout` if handed the
@@ -1704,6 +1773,11 @@ async fn handle_connection(mut tns: TnsStream, session_id: u64, config: Config) 
                     for (_, mut cur) in cursors.drain() {
                         cur.finish().await;
                     }
+                    // A clean logoff commits in Oracle (an abrupt disconnect
+                    // rolls back, which dropping the backend connection does).
+                    if let Err(e) = backend.commit().await {
+                        warn!("commit on logoff failed: {}", e);
+                    }
                     if oci_dialect {
                         let _ = tns
                             .write_packet(PacketType::Data, &wire::build_logoff_response_oci())
@@ -1720,16 +1794,19 @@ async fn handle_connection(mut tns: TnsStream, session_id: u64, config: Config) 
                 } else if msg_type == 0x03 && matches!(func_code, 0x0e | 0x0f) {
                     // COMMIT (14) / ROLLBACK (15): thin drivers issue these as
                     // their own TTC function, not as an Execute.
-                    let verb = if func_code == 0x0e {
-                        "COMMIT"
-                    } else {
-                        "ROLLBACK"
-                    };
-                    for (_, mut cur) in cursors.drain() {
-                        cur.finish().await;
+                    if !backend.cursors_survive_commit() {
+                        for (id, mut cur) in cursors.drain() {
+                            cur.finish().await;
+                            closed_by_commit.insert(id);
+                        }
                     }
-                    match backend.execute_simple(verb, &[]).await {
-                        Ok(_) => {
+                    let done = if func_code == 0x0e {
+                        backend.commit().await
+                    } else {
+                        backend.rollback().await
+                    };
+                    match done {
+                        Ok(()) => {
                             let resp = if oci_dialect {
                                 wire::build_txn_response_oci()
                             } else if newer_describe_framing {
@@ -1889,6 +1966,16 @@ fn is_query_statement(sql: &str) -> bool {
             || upper.contains("MERGE "));
     }
     false
+}
+
+/// Commit after a successful Execute when the client asked for it
+/// (autocommit). A failing commit is what the client then sees.
+async fn autocommit_after(backend: &dyn OracleBackend, wanted: bool) -> Result<()> {
+    if wanted {
+        backend.commit().await
+    } else {
+        Ok(())
+    }
 }
 
 async fn backend_connect_error(

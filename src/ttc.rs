@@ -94,6 +94,13 @@ impl FunctionCode {
                 ora: 1017,
                 detail: "authentication function after session is established",
             },
+            // LOB RPCs answer with a LOB-range error, not ORA-03001: ojdbc maps
+            // ORA-030xx to SQLState 0A000, which HikariCP treats as a dead
+            // connection and evicts (Hibernate's createTemporaryClob probe).
+            Self::Other(code) if is_lob_function(code) => Dispatch::Unimplemented {
+                ora: 22275,
+                detail: "LOB locators are not supported by DbSaci",
+            },
             Self::Other(code) => Dispatch::Unimplemented {
                 ora: 3001,
                 detail: unimplemented_detail(code),
@@ -117,6 +124,14 @@ pub enum Dispatch {
         ora: u32,
         detail: &'static str,
     },
+}
+
+/// LOB locator RPCs (open/read/write/close/create-temporary family).
+fn is_lob_function(code: u8) -> bool {
+    matches!(
+        code,
+        0x60 | 0x61 | 0x62 | 0x63 | 0x64 | 0x65 | 0x66 | 0x67 | 0x68 | 0x6a | 0x6b | 0x6c
+    )
 }
 
 fn unimplemented_detail(code: u8) -> &'static str {
@@ -163,7 +178,7 @@ pub fn reject_unsupported_sql(
         || compact.contains("DBMS_LOB.OPEN")
         || compact.contains("DBMS_LOB.CLOSE")
     {
-        return Some((3001, "LOB locators are not implemented"));
+        return Some((22275, "LOB locators are not supported by DbSaci"));
     }
     None
 }
@@ -198,9 +213,10 @@ mod tests {
     }
 
     #[test]
+    // Not ORA-030xx: ojdbc maps those to SQLState 0A000, which HikariCP evicts on.
     fn lob_function_codes_are_explicit() {
         match FunctionCode::from_u8(0x60).dispatch() {
-            Dispatch::Unimplemented { ora: 3001, detail } => {
+            Dispatch::Unimplemented { ora: 22275, detail } => {
                 assert!(detail.contains("LOB"), "{detail}");
             }
             other => panic!("{other:?}"),

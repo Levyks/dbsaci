@@ -277,16 +277,25 @@ mod tests {
             up("create table d (e number references emp(id))"),
             "CREATE TABLE D (E NUMBER REFERENCES EMP(ID))"
         );
-        assert_eq!(up("select my_seq.nextval from dual"), "SELECT MY_SEQ.NEXTVAL FROM DUAL");
+        assert_eq!(
+            up("select my_seq.nextval from dual"),
+            "SELECT MY_SEQ.NEXTVAL FROM DUAL"
+        );
         assert_eq!(low("SELECT E.ID FROM Emp e"), "select e.id from emp e");
     }
 
     #[test]
     fn quoted_identifiers_are_exact() {
-        assert_eq!(up(r#"select "MyCol" from "MyTab""#), r#"SELECT "MyCol" FROM "MyTab""#);
+        assert_eq!(
+            up(r#"select "MyCol" from "MyTab""#),
+            r#"SELECT "MyCol" FROM "MyTab""#
+        );
         assert_eq!(up(r#"select "abc" from t"#), r#"SELECT "abc" FROM T"#);
         // Lower: an Oracle-normal quoted name is the same object as unquoted.
-        assert_eq!(low(r#"select "ABC", "MyCol" from t"#), r#"select "abc", "MyCol" from t"#);
+        assert_eq!(
+            low(r#"select "ABC", "MyCol" from t"#),
+            r#"select "abc", "MyCol" from t"#
+        );
     }
 
     #[test]
@@ -296,8 +305,14 @@ mod tests {
             up(sql),
             "SELECT 'it''s TO_NUMBER(x), dual' -- Mixed comment\n, q'[a 'b' c]' /*+ Hint */ FROM T WHERE A = :Bind AND B = @Var AND C = `Back`"
         );
-        assert_eq!(up("select n'abc', x'0aF' from t"), "SELECT n'abc', x'0aF' FROM T");
-        assert_eq!(up("select 1e10, 2.5d from dual"), "SELECT 1e10, 2.5d FROM DUAL");
+        assert_eq!(
+            up("select n'abc', x'0aF' from t"),
+            "SELECT n'abc', x'0aF' FROM T"
+        );
+        assert_eq!(
+            up("select 1e10, 2.5d from dual"),
+            "SELECT 1e10, 2.5d FROM DUAL"
+        );
     }
 
     #[test]

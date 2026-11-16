@@ -858,6 +858,41 @@ pub fn execute_frame_has_no_sql(payload: &[u8]) -> bool {
     }
 }
 
+/// `TNS_EXEC_OPTION_COMMIT`: the client asks the server to commit after a
+/// successful Execute (autocommit / `OCI_COMMIT_ON_SUCCESS`). Verified on the
+/// wire with python-oracledb thin (`0x8121` for an autocommitted INSERT).
+pub const EXEC_OPTION_COMMIT: u32 = 0x0100;
+/// `TNS_EXEC_OPTION_COMMIT_REEXECUTE`: the same request on a REEXECUTE /
+/// REEXECUTE_AND_FETCH, carried in the second options word.
+pub const EXEC_OPTION_COMMIT_REEXECUTE: u32 = 0x0001;
+
+/// Does this thin-driver Execute (`0x5E`) or re-execute (`0x04` / `0x4E`) ask
+/// the server to commit on success? OCI frames use a different fixed-width
+/// layout and are not decoded here (`false`).
+pub fn execute_commit_requested(payload: &[u8], func_code: u8, oci_dialect: bool) -> bool {
+    if oci_dialect {
+        return false;
+    }
+    let mut buf = ReadBuffer::from_slice(payload);
+    let parsed = (|| -> Result<bool> {
+        buf.read_u16_be()?; // data flags
+        buf.read_u8()?; // msg type
+        buf.read_u8()?; // function
+        buf.read_u8()?; // seq
+        match func_code {
+            0x5E => Ok(buf.read_ub4()? & EXEC_OPTION_COMMIT != 0),
+            0x04 | 0x4E => {
+                buf.read_ub4()?; // cursor id
+                buf.read_ub4()?; // iterations
+                buf.read_ub4()?; // options 1
+                Ok(buf.read_ub4()? & EXEC_OPTION_COMMIT_REEXECUTE != 0)
+            }
+            _ => Ok(false),
+        }
+    })();
+    parsed.unwrap_or(false)
+}
+
 /// Cursor id from a thin-driver Execute preamble (`ub4` after exec options).
 pub fn parse_execute_cursor_id(payload: &[u8]) -> Option<u16> {
     let mut buf = ReadBuffer::from_slice(payload);
@@ -872,6 +907,10 @@ pub fn parse_execute_cursor_id(payload: &[u8]) -> Option<u16> {
     .ok()
     .filter(|id| *id != 0)
 }
+
+/// Oracle's per-statement bind limit (ORA-01745 above it). A long IN-list or
+/// a wide batch easily exceeds a smaller ad-hoc cap.
+const MAX_BINDS: usize = 65_535;
 
 pub fn parse_execute_request(payload: &[u8]) -> Result<ExecuteRequest> {
     // oracle-rs and python-oracledb thin write an execute preamble with a fixed
@@ -981,7 +1020,7 @@ fn parse_execute_strict(payload: &[u8]) -> Result<ExecuteRequest> {
                 row_marker_already_read = true;
                 break;
             }
-            if bind_types.len() >= 1024 {
+            if bind_types.len() >= MAX_BINDS {
                 return Err(Error::Protocol("too many bind descriptors".into()));
             }
             buf.read_u8()?; // flags
@@ -1160,7 +1199,7 @@ fn parse_execute_scan(payload: &[u8]) -> Result<ExecuteRequest> {
             row_marker_already_read = true;
             break;
         }
-        if bind_types.len() >= 1024 {
+        if bind_types.len() >= MAX_BINDS {
             return Err(Error::Protocol("too many bind descriptors".into()));
         }
         buf.read_u8()?; // flags

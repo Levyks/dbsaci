@@ -64,7 +64,19 @@ pub struct Packet {
     pub packet_type: PacketType,
     pub flags: u8,
     pub payload: Bytes,
+    /// Declared on-wire length of the (first) packet, header included.
+    pub wire_len: usize,
 }
+
+/// The SDU DbSaci advertises in its ACCEPT (see [`build_accept_response`]).
+/// A client DATA packet of exactly this length was split by the client and is
+/// followed by continuation packets carrying the rest of the TTC message.
+pub const ADVERTISED_SDU: usize = 8192;
+
+/// How long to wait for a continuation packet after a full-SDU packet. A
+/// message whose length is an exact multiple of the SDU has no continuation;
+/// the client then waits for our reply, so this bounds that (rare) stall.
+const CONTINUATION_WAIT: Duration = Duration::from_millis(250);
 
 enum TnsInner {
     Plain(TcpStream),
@@ -105,6 +117,17 @@ impl TnsInner {
         }
     }
 
+    /// Read at most one byte; `None` at EOF. Cancel-safe: a cancelled call
+    /// consumes nothing.
+    async fn io_read_one(&mut self) -> std::io::Result<Option<u8>> {
+        let mut b = [0u8; 1];
+        let n = match self {
+            Self::Plain(s) => AsyncReadExt::read(s, &mut b).await?,
+            Self::Tls(s) => AsyncReadExt::read(&mut **s, &mut b).await?,
+        };
+        Ok((n == 1).then_some(b[0]))
+    }
+
     async fn io_write_all(&mut self, buf: &[u8]) -> std::io::Result<()> {
         match self {
             Self::Plain(s) => {
@@ -134,6 +157,10 @@ pub struct TnsStream {
     /// length and little-endian fixed fields, so the oracle-rs frame-completion
     /// fixup below must be skipped for them.
     oci_client: bool,
+    /// A byte already read from the socket while probing for a continuation.
+    lookahead: Option<u8>,
+    /// A complete non-DATA packet read while probing for a continuation.
+    pushback: Option<Packet>,
 }
 
 impl TnsStream {
@@ -143,6 +170,8 @@ impl TnsStream {
             mode: SduMode::Small,
             idle_timeout: None,
             oci_client: false,
+            lookahead: None,
+            pushback: None,
         }
     }
 
@@ -157,6 +186,8 @@ impl TnsStream {
             mode: SduMode::Small,
             idle_timeout: None,
             oci_client: false,
+            lookahead: None,
+            pushback: None,
         }
     }
 
@@ -188,6 +219,19 @@ impl TnsStream {
     }
 
     async fn read_exact(&mut self, buf: &mut [u8]) -> Result<()> {
+        let buf = match self.lookahead.take() {
+            Some(b) if !buf.is_empty() => {
+                buf[0] = b;
+                &mut buf[1..]
+            }
+            other => {
+                self.lookahead = other;
+                buf
+            }
+        };
+        if buf.is_empty() {
+            return Ok(());
+        }
         match self.idle_timeout {
             Some(idle_timeout) => {
                 match timeout(idle_timeout, self.inner.io_read_exact(buf)).await {
@@ -206,7 +250,52 @@ impl TnsStream {
         }
     }
 
+    /// Read one complete TTC request. Clients split a message larger than the
+    /// SDU into several DATA packets (each with its own 2-byte data flags);
+    /// TTC itself carries no end marker, so a full-SDU packet means "more
+    /// follows" whenever another packet arrives promptly. The continuation
+    /// payloads (minus their data flags) are appended to the first packet's.
+    pub async fn read_message(&mut self) -> Result<Packet> {
+        let first = self.read_packet().await?;
+        if first.packet_type != PacketType::Data || first.wire_len < ADVERTISED_SDU {
+            return Ok(first);
+        }
+        let mut payload = first.payload.to_vec();
+        let mut last_len = first.wire_len;
+        while last_len >= ADVERTISED_SDU && self.continuation_pending().await? {
+            let next = self.read_packet().await?;
+            if next.packet_type != PacketType::Data {
+                self.pushback = Some(next);
+                break;
+            }
+            payload.extend_from_slice(next.payload.get(2..).unwrap_or_default());
+            last_len = next.wire_len;
+        }
+        Ok(Packet {
+            payload: Bytes::from(payload),
+            ..first
+        })
+    }
+
+    /// Does another packet start within [`CONTINUATION_WAIT`]?
+    async fn continuation_pending(&mut self) -> Result<bool> {
+        if self.lookahead.is_some() {
+            return Ok(true);
+        }
+        match timeout(CONTINUATION_WAIT, self.inner.io_read_one()).await {
+            Ok(Ok(Some(b))) => {
+                self.lookahead = Some(b);
+                Ok(true)
+            }
+            Ok(Ok(None)) | Err(_) => Ok(false),
+            Ok(Err(e)) => Err(e.into()),
+        }
+    }
+
     pub async fn read_packet(&mut self) -> Result<Packet> {
+        if let Some(p) = self.pushback.take() {
+            return Ok(p);
+        }
         let header = match self.mode {
             SduMode::Small => {
                 let mut h = [0u8; 8];
@@ -278,6 +367,7 @@ impl TnsStream {
         Ok(Packet {
             packet_type,
             flags,
+            wire_len: length,
             payload: Bytes::from(payload),
         })
     }
@@ -461,7 +551,13 @@ impl TnsStream {
 }
 
 fn hex_dump(bytes: &[u8]) -> String {
-    let shown = &bytes[..bytes.len().min(4096)];
+    // `DBSACI_WIRE_DUMP=full` dumps whole payloads (for offline replay).
+    let cap = if std::env::var("DBSACI_WIRE_DUMP").as_deref() == Ok("full") {
+        usize::MAX
+    } else {
+        4096
+    };
+    let shown = &bytes[..bytes.len().min(cap)];
     let mut s = String::with_capacity(shown.len() * 2);
     for b in shown {
         s.push_str(&format!("{b:02x}"));

@@ -46,6 +46,23 @@ pub trait OracleBackend: Send + Sync {
         binds: &[BindValue],
     ) -> Result<(u64, Vec<Vec<Option<Vec<u8>>>>)>;
     async fn cancel(&self);
+
+    /// Commit the session's transaction.
+    async fn commit(&self) -> Result<()> {
+        self.execute_simple("COMMIT", &[]).await.map(|_| ())
+    }
+
+    /// Roll back the session's transaction.
+    async fn rollback(&self) -> Result<()> {
+        self.execute_simple("ROLLBACK", &[]).await.map(|_| ())
+    }
+
+    /// Whether open cursors stay fetchable across COMMIT/ROLLBACK (Oracle's
+    /// behaviour for non-`FOR UPDATE` queries). When `false`, the session loop
+    /// closes them on commit and a later fetch gets ORA-01002.
+    fn cursors_survive_commit(&self) -> bool {
+        false
+    }
 }
 
 /// Cursor contract exposed to the wire layer. Values are already encoded in
