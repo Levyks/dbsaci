@@ -1055,7 +1055,9 @@ async fn connect_maria_admin(host: &str, port: u16, db: &str) -> Result<MariaCon
     let url = format!("mysql://root@{host}:{port}/{db}");
     let opts = mysql_async::Opts::from_url(&url).map_err(|e| e.to_string())?;
     let mut last = String::new();
-    for _ in 0..50 {
+    // ~60 s: a first-boot MariaDB container on a loaded host can take a while
+    // past the fixed startup wait to accept connections.
+    for _ in 0..400 {
         match MariaConn::new(opts.clone()).await {
             Ok(conn) => return Ok(conn),
             Err(e) => {

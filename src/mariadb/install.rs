@@ -8,7 +8,7 @@
 use super::dictionary::{RELATIONS, SCHEMA};
 
 /// Bump on any change to the objects below.
-pub const VERSION: &str = "0.3.4-2026-11-16.2";
+pub const VERSION: &str = "0.3.4-2026-11-16.3";
 
 /// Schemas that are MariaDB's own, not Oracle objects; hidden from ALL_*.
 const SYSTEM_SCHEMAS: &str =
@@ -173,9 +173,12 @@ const COMPAT_FUNCTIONS: &[&str] = &[
          WHILE cur >= 1 LOOP IF SUBSTRING(s, cur, CHAR_LENGTH(sub)) = sub THEN c := c + 1; \
            IF c = nth THEN RETURN cur; END IF; END IF; cur := cur - 1; END LOOP; RETURN 0; END IF; END",
     // NUMTODSINTERVAL / NUMTOYMINTERVAL as bare values: Oracle's canonical text
+    // The return lengths (29 / 13, Oracle's widest DAY(9) TO SECOND(9) and
+    // YEAR(9) TO MONTH texts) are the marker mariadb/types.rs recognises to
+    // describe the column as a native INTERVAL: keep them unique.
     // form. In `date + NUMTOxINTERVAL(...)` arithmetic translate.rs rewrites to
     // DATE_ADD instead.
-    "CREATE OR REPLACE FUNCTION dbsaci_sys.numtodsinterval(n DOUBLE, unit VARCHAR(16)) RETURN VARCHAR(64) AS \
+    "CREATE OR REPLACE FUNCTION dbsaci_sys.numtodsinterval(n DOUBLE, unit VARCHAR(16)) RETURN VARCHAR(29) AS \
        secs DOUBLE; sgn VARCHAR(1) DEFAULT '+'; d INT; h INT; m INT; s DOUBLE; BEGIN \
        secs := n * CASE UPPER(unit) WHEN 'DAY' THEN 86400 WHEN 'HOUR' THEN 3600 \
          WHEN 'MINUTE' THEN 60 WHEN 'SECOND' THEN 1 ELSE 0 END; \
@@ -184,7 +187,7 @@ const COMPAT_FUNCTIONS: &[&str] = &[
        h := FLOOR(secs/3600); secs := secs - h*3600; \
        m := FLOOR(secs/60); s := secs - m*60; \
        RETURN CONCAT(sgn, LPAD(d,2,'0'), ' ', LPAD(h,2,'0'), ':', LPAD(m,2,'0'), ':', LPAD(FORMAT(s,6),9,'0')); END",
-    "CREATE OR REPLACE FUNCTION dbsaci_sys.numtoyminterval(n INT, unit VARCHAR(16)) RETURN VARCHAR(32) AS \
+    "CREATE OR REPLACE FUNCTION dbsaci_sys.numtoyminterval(n INT, unit VARCHAR(16)) RETURN VARCHAR(13) AS \
        months INT; sgn VARCHAR(1) DEFAULT '+'; BEGIN \
        months := n * CASE UPPER(unit) WHEN 'YEAR' THEN 12 WHEN 'MONTH' THEN 1 ELSE 0 END; \
        IF months < 0 THEN sgn := '-'; months := -months; END IF; \

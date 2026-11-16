@@ -40,7 +40,15 @@ pub enum Wire {
     Raw,
     /// MariaDB BIT, sent as an Oracle NUMBER.
     Bit,
+    /// `dbsaci_sys.numtodsinterval` text, sent as INTERVAL DAY TO SECOND.
+    IntervalDs,
+    /// `dbsaci_sys.numtoyminterval` text, sent as INTERVAL YEAR TO MONTH.
+    IntervalYm,
 }
+
+/// Character lengths of the interval helpers' results (see install.rs).
+const INTERVAL_DS_CHARS: u32 = 29;
+const INTERVAL_YM_CHARS: u32 = 13;
 
 /// Describe one column and pick its [`Wire`] form.
 pub fn describe(col: &Column, caps: &DescribeCaps, case: IdentifierCase) -> (ColumnMeta, Wire) {
@@ -127,6 +135,22 @@ pub fn describe(col: &Column, caps: &DescribeCaps, case: IdentifierCase) -> (Col
             }
         }
         MYSQL_TYPE_TIME | MYSQL_TYPE_TIME2 => (ColumnMeta::varchar(name, 32), Wire::Time),
+        _ if caps.native_intervals && !from_table && interval_marker(col).is_some() => {
+            let ym = interval_marker(col) == Some(Wire::IntervalYm);
+            let width = if ym { 5 } else { 11 };
+            let mut m = ColumnMeta::timestamp(name, 0);
+            m.oracle_type = if ym { 182 } else { 183 };
+            m.buffer_size = width;
+            m.max_size = width;
+            (
+                m,
+                if ym {
+                    Wire::IntervalYm
+                } else {
+                    Wire::IntervalDs
+                },
+            )
+        }
         _ if col.character_set() == BINARY_CHARSET && is_string_family(kind) => {
             let size = (col.column_length()).clamp(1, MAX_REPORTED_SIZE);
             (ColumnMeta::raw(name, size), Wire::Raw)
@@ -146,6 +170,32 @@ pub fn describe(col: &Column, caps: &DescribeCaps, case: IdentifierCase) -> (Col
     };
     meta.nullable = nullable;
     (meta, wire)
+}
+
+/// A computed column carrying an interval helper's result: a `_bin` (BINARY
+/// flag) string of exactly the helper's declared length, with the zero
+/// `decimals` MariaDB reports for a stored function's string result (string
+/// expressions such as SUBSTR or CONCAT report 39).
+fn interval_marker(col: &Column) -> Option<Wire> {
+    use ColumnType::*;
+    if !matches!(
+        col.column_type(),
+        MYSQL_TYPE_VAR_STRING | MYSQL_TYPE_VARCHAR
+    ) || col.character_set() == BINARY_CHARSET
+        || !col.flags().contains(ColumnFlags::BINARY_FLAG)
+        || col.decimals() != 0
+    {
+        return None;
+    }
+    let chars = char_length(col);
+    if col.column_length() != chars * bytes_per_char(col) {
+        return None;
+    }
+    match chars {
+        INTERVAL_DS_CHARS => Some(Wire::IntervalDs),
+        INTERVAL_YM_CHARS => Some(Wire::IntervalYm),
+        _ => None,
+    }
 }
 
 /// The describe of an unconstrained Oracle NUMBER. Clients that predate real
@@ -175,12 +225,15 @@ fn is_string_family(kind: ColumnType) -> bool {
 
 /// A character column's length in characters (MariaDB reports bytes).
 fn char_length(col: &Column) -> u32 {
-    let bytes_per_char = match col.character_set() {
+    (col.column_length() / bytes_per_char(col)).clamp(1, MAX_REPORTED_SIZE)
+}
+
+fn bytes_per_char(col: &Column) -> u32 {
+    match col.character_set() {
         45 | 46 | 224..=247 | 255..=309 => 4, // utf8mb4 collations
         33 | 83 | 192..=223 => 3,             // utf8mb3 collations
         _ => 1,
-    };
-    (col.column_length() / bytes_per_char).clamp(1, MAX_REPORTED_SIZE)
+    }
 }
 
 /// Encode one value for a column described as `wire`. `None` is SQL NULL.
@@ -222,6 +275,18 @@ pub fn encode(value: &Value, wire: Wire) -> Result<Option<Vec<u8>>> {
             Value::UInt(v) => encode_oracle_number_decimal(&v.to_string())?,
             other => return Err(conv("BIT", other)),
         },
+        Wire::IntervalDs => {
+            let text = interval_text(value)?;
+            parse_interval_ds(text)
+                .ok_or_else(|| conv("INTERVAL DAY TO SECOND", value))?
+                .encode_day_to_second()
+        }
+        Wire::IntervalYm => {
+            let text = interval_text(value)?;
+            parse_interval_ym(text)
+                .ok_or_else(|| conv("INTERVAL YEAR TO MONTH", value))?
+                .encode_year_to_month()
+        }
         Wire::Text | Wire::Raw => match value {
             Value::Bytes(b) => b.clone(),
             Value::Int(v) => v.to_string().into_bytes(),
@@ -237,6 +302,62 @@ pub fn encode(value: &Value, wire: Wire) -> Result<Option<Vec<u8>>> {
         },
     };
     Ok(Some(bytes))
+}
+
+fn interval_text(value: &Value) -> Result<&str> {
+    match value {
+        Value::Bytes(b) => utf8(b),
+        other => Err(conv("INTERVAL", other)),
+    }
+}
+
+/// `[+-]D HH:MM:SS[.f]` (numtodsinterval's output) → days and signed micros.
+fn parse_interval_ds(text: &str) -> Option<crate::backend::PgInterval> {
+    let text = text.trim();
+    let (neg, body) = match text.as_bytes().first()? {
+        b'-' => (true, &text[1..]),
+        b'+' => (false, &text[1..]),
+        _ => (false, text),
+    };
+    let (days, clock) = body.trim().split_once(' ')?;
+    let days: i64 = days.trim().parse().ok()?;
+    let mut parts = clock.trim().splitn(3, ':');
+    let h: i64 = parts.next()?.parse().ok()?;
+    let m: i64 = parts.next()?.parse().ok()?;
+    let sec = parts.next()?;
+    let (whole, frac) = sec.split_once('.').unwrap_or((sec, ""));
+    let s: i64 = whole.parse().ok()?;
+    let frac: String = frac.chars().chain(std::iter::repeat('0')).take(6).collect();
+    let us: i64 = frac.parse().ok()?;
+    let mut micros = ((h * 60 + m) * 60 + s) * 1_000_000 + us;
+    let mut days = days;
+    if neg {
+        micros = -micros;
+        days = -days;
+    }
+    Some(crate::backend::PgInterval::new(
+        0,
+        i32::try_from(days).ok()?,
+        micros,
+    ))
+}
+
+/// `[+-]Y-MM` (numtoyminterval's output) → signed months.
+fn parse_interval_ym(text: &str) -> Option<crate::backend::PgInterval> {
+    let text = text.trim();
+    let (neg, body) = match text.as_bytes().first()? {
+        b'-' => (true, &text[1..]),
+        b'+' => (false, &text[1..]),
+        _ => (false, text),
+    };
+    let (y, m) = body.split_once('-')?;
+    let months = y.trim().parse::<i64>().ok()? * 12 + m.trim().parse::<i64>().ok()?;
+    let months = if neg { -months } else { months };
+    Some(crate::backend::PgInterval::new(
+        i32::try_from(months).ok()?,
+        0,
+        0,
+    ))
 }
 
 fn utf8(b: &[u8]) -> Result<&str> {
@@ -321,6 +442,40 @@ mod tests {
             encode(&v, Wire::Time).unwrap().unwrap(),
             b"26:03:04".to_vec()
         );
+    }
+
+    #[test]
+    fn interval_texts_encode_natively() {
+        let ds = |t: &str| {
+            encode(&Value::Bytes(t.as_bytes().to_vec()), Wire::IntervalDs)
+                .unwrap()
+                .unwrap()
+        };
+        let pos = ds("+09 06:30:00.000000");
+        assert_eq!(
+            u32::from_be_bytes([pos[0], pos[1], pos[2], pos[3]]),
+            0x8000_0000 + 9
+        );
+        assert_eq!(&pos[4..7], &[66, 90, 60]);
+        let neg = ds("-02 12:00:00.000000");
+        assert_eq!(
+            u32::from_be_bytes([neg[0], neg[1], neg[2], neg[3]]),
+            0x8000_0000 - 2
+        );
+        assert_eq!(neg[4], 60 - 12);
+        let half = ds("+00 00:00:01.5");
+        assert_eq!(
+            u32::from_be_bytes([half[7], half[8], half[9], half[10]]),
+            0x8000_0000 + 500_000_000
+        );
+        let ym = encode(&Value::Bytes(b"+01-06".to_vec()), Wire::IntervalYm)
+            .unwrap()
+            .unwrap();
+        assert_eq!(ym, vec![0x80, 0, 0, 1, 66]);
+        let ym = encode(&Value::Bytes(b"-01-06".to_vec()), Wire::IntervalYm)
+            .unwrap()
+            .unwrap();
+        assert_eq!(ym, vec![0x7f, 0xff, 0xff, 0xff, 54]);
     }
 
     #[test]

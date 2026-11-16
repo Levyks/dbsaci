@@ -2468,6 +2468,14 @@ impl<'a> FromSql<'a> for PgInterval {
 }
 
 impl PgInterval {
+    pub(crate) fn new(months: i32, days: i32, micros: i64) -> Self {
+        Self {
+            months,
+            days,
+            micros,
+        }
+    }
+
     /// Oracle INTERVAL YEAR TO MONTH wire form (5 bytes): `u32` years and a
     /// `u8` month, each biased (years by 2^31, month by 60).
     pub(crate) fn encode_year_to_month(&self) -> Vec<u8> {

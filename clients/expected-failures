@@ -4,8 +4,5 @@
 # this file for the current backend+driver. Remove a line when it goes green.
 #
 # MariaDB has no native Oracle INTERVAL wire types yet; result columns stay text.
-mariadb python interval_ds_value
-mariadb python interval_ds_negative
-mariadb python interval_ym_value
 # PostgreSQL closes open cursors on COMMIT (no WITH HOLD portals yet).
 postgres python fetch_across_commit
