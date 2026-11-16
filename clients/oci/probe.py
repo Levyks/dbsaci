@@ -63,6 +63,31 @@ check("bind_select", cur.fetchone(), ("Ada",))
 cur.execute("SELECT COUNT(*) FROM people")
 check("count_people", cur.fetchone()[0] >= 1, True)
 
+# Array DML: OCI sends every row in one Execute (first run) or REEXECUTE
+# (later runs); every row must arrive, NULLs included.
+try:
+    cur.execute("DROP TABLE oci_arr")
+except oracledb.DatabaseError:
+    pass
+cur.execute("CREATE TABLE oci_arr (n NUMBER, s VARCHAR2(20))")
+rows = [(i, None if i % 3 == 0 else f"r{i}") for i in range(1, 301)]
+cur.executemany("INSERT INTO oci_arr VALUES (:1, :2)", rows)
+cur.executemany("INSERT INTO oci_arr VALUES (:1, :2)", [(1001, "a"), (1002, None)])
+conn.commit()
+cur.execute("SELECT COUNT(*), SUM(n), COUNT(s) FROM oci_arr")
+check("array_dml_all_rows", cur.fetchone(), (302, sum(range(1, 301)) + 2003, 201))
+
+# Autocommit (OCI_COMMIT_ON_SUCCESS): writes persist with no COMMIT call.
+conn.autocommit = True
+cur.execute("INSERT INTO oci_arr VALUES (:1, :2)", [2001, "ac"])
+cur.executemany("INSERT INTO oci_arr VALUES (:1, :2)", [(2002, "ac"), (2003, "ac")])
+other = oracledb.connect(user=user, password=password, dsn=dsn)
+ocur = other.cursor()
+ocur.execute("SELECT COUNT(*) FROM oci_arr WHERE s = 'ac'")
+check("autocommit_visible_to_other_session", ocur.fetchone(), (3,))
+other.close()
+cur.execute("DROP TABLE oci_arr")
+
 cur.close()
 conn.close()
 

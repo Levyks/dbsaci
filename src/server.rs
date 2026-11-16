@@ -1570,7 +1570,10 @@ async fn handle_connection(mut tns: TnsStream, session_id: u64, config: Config) 
                         };
                         match failed {
                             None => {
-                                let resp = if oci_dialect && is_ddl {
+                                let resp = if oci_dialect && func_code == 0x04 {
+                                    // Array REEXECUTE: the compact ack, as for one row.
+                                    wire::build_reexecute_response_oci(total, req_seq)
+                                } else if oci_dialect && is_ddl {
                                     wire::build_ddl_response_oci(cursor_id, req_seq)
                                 } else if oci_dialect {
                                     wire::build_dml_response_oci(

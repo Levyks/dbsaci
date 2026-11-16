@@ -899,11 +899,25 @@ pub const EXEC_OPTION_COMMIT: u32 = 0x0100;
 pub const EXEC_OPTION_COMMIT_REEXECUTE: u32 = 0x0001;
 
 /// Does this thin-driver Execute (`0x5E`) or re-execute (`0x04` / `0x4E`) ask
-/// the server to commit on success? OCI frames use a different fixed-width
-/// layout and are not decoded here (`false`).
+/// the server to commit on success? Thin drivers encode the option words as
+/// TTC `ub4`s, OCI as fixed-width little-endian u32s.
 pub fn execute_commit_requested(payload: &[u8], func_code: u8, oci_dialect: bool) -> bool {
     if oci_dialect {
-        return false;
+        // OCI writes the same words as fixed-width little-endian u32s right
+        // after `[flags:2][0x03][func][seq]` (captured from Instant Client 19:
+        // Execute options 0x8121 vs 0x8021; REEXECUTE second options word 1
+        // vs 0 with autocommit on/off).
+        let word = |n: usize| -> Option<u32> {
+            let at = 5 + 4 * n;
+            payload
+                .get(at..at + 4)
+                .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        };
+        return match func_code {
+            0x5E => word(0).is_some_and(|o| o & EXEC_OPTION_COMMIT != 0),
+            0x04 | 0x4E => word(3).is_some_and(|o| o & EXEC_OPTION_COMMIT_REEXECUTE != 0),
+            _ => false,
+        };
     }
     let mut buf = ReadBuffer::from_slice(payload);
     let parsed = (|| -> Result<bool> {
@@ -1307,7 +1321,39 @@ fn parse_execute_scan(payload: &[u8]) -> Result<ExecuteRequest> {
 /// length words that does not match the thin layout, so the SQL is located by
 /// content: the first ASCII run that starts with a statement keyword. Binds are
 /// not yet decoded from the OCI value block.
+/// OCI Execute (`0x5E`). For array DML (`executemany` / `OCIStmtExecute`
+/// with iters > 1) the `al8i4` words after the SQL text carry the iteration
+/// count (word 1, little-endian u32, as in the thin layout) and the frame ends
+/// with one `[0x07] values…` row per iteration; all of them are decoded.
 pub fn parse_execute_request_oci(payload: &[u8]) -> Result<ExecuteRequest> {
+    let mut req = parse_execute_request_oci_single(payload)?;
+    if req.sql.is_empty() || req.bind_types.is_empty() {
+        return Ok(req);
+    }
+    let sql = req.sql.as_bytes();
+    let Some(end) = payload
+        .windows(sql.len())
+        .rposition(|w| w == sql)
+        .map(|at| at + sql.len())
+    else {
+        return Ok(req);
+    };
+    let iters = payload
+        .get(end + 4..end + 8)
+        .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        .unwrap_or(1);
+    if iters > 1
+        && iters <= 1_000_000
+        && let Some(rows) = oci_value_rows(payload, &req.bind_types, iters as usize)
+    {
+        req.binds = rows[0].clone();
+        req.num_iters = iters;
+        req.bind_rows = rows;
+    }
+    Ok(req)
+}
+
+fn parse_execute_request_oci_single(payload: &[u8]) -> Result<ExecuteRequest> {
     const KEYWORDS: [&[u8]; 24] = [
         b"SELECT",
         b"INSERT",
@@ -1660,7 +1706,63 @@ pub fn parse_reexecute_request_oci(
     sql: &str,
     bind_types: &[u8],
 ) -> Result<ExecuteRequest> {
-    parse_reexecute_request_oci_ex(payload, sql, bind_types, false)
+    let mut req = parse_reexecute_request_oci_ex(payload, sql, bind_types, false)?;
+    // Array re-execute (`executemany`): the iteration count is the second
+    // fixed-width word, and the frame carries one `[0x07] values…` row per
+    // iteration. Decode them all — taking only the last row silently dropped
+    // every other one.
+    let iters = payload
+        .get(9..13)
+        .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        .unwrap_or(1);
+    if iters > 1
+        && !req.bind_types.is_empty()
+        && let Some(rows) = oci_value_rows(payload, &req.bind_types, iters as usize)
+    {
+        req.binds = rows[0].clone();
+        req.num_iters = iters;
+        req.bind_rows = rows;
+    }
+    Ok(req)
+}
+
+/// `rows` consecutive OCI value rows (`[0x07]` then per bind a length byte and
+/// bytes; `00` / `ff` / `fd <ind>` = NULL) ending at the end of the frame
+/// (give or take a short trailer). Tries each `0x07` from the front.
+fn oci_value_rows(payload: &[u8], types: &[u8], rows: usize) -> Option<Vec<Vec<BindValue>>> {
+    let decode_from = |start: usize| -> Option<Vec<Vec<BindValue>>> {
+        let mut p = start;
+        let mut out = Vec::with_capacity(rows);
+        for _ in 0..rows {
+            if payload.get(p) != Some(&0x07) {
+                return None;
+            }
+            p += 1;
+            let mut row = Vec::with_capacity(types.len());
+            for &t in types {
+                let len = *payload.get(p)? as usize;
+                p += 1;
+                let raw = match len {
+                    0 | 0xff => None,
+                    0xfd => {
+                        p += 1;
+                        None
+                    }
+                    n => {
+                        let v = payload.get(p..p + n)?.to_vec();
+                        p += n;
+                        Some(v)
+                    }
+                };
+                row.push(decode_bind_value(t, raw).ok()?);
+            }
+            out.push(row);
+        }
+        (payload.len().saturating_sub(p) <= 3).then_some(out)
+    };
+    (0..payload.len())
+        .filter(|&i| payload[i] == 0x07)
+        .find_map(decode_from)
 }
 
 /// `rescan_types`: a `0x5E` re-parse frame carries FRESH bind descriptors (the
@@ -4116,6 +4218,22 @@ pub fn encode_oracle_number_decimal(value: &str) -> Result<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn oci_autocommit_bits_are_decoded() {
+        let hex = |h: &str| -> Vec<u8> { (0..h.len()).step_by(2).map(|i| u8::from_str_radix(&h[i..i + 2], 16).unwrap()).collect() };
+        // Instant Client 19 captures: Execute with / without autocommit.
+        let on = hex("0000035e0c2981000000000000feffffffffffffff1e000000");
+        let off = hex("0000035e0b2980000000000000feffffffffffffff1e000000");
+        assert!(crate::wire::execute_commit_requested(&on, 0x5E, true));
+        assert!(!crate::wire::execute_commit_requested(&off, 0x5E, true));
+        // REEXECUTE: [cursor][iterations][options 1][options 2]
+        let on = hex("000003040d060000000100000000000000010000000702c104");
+        let off = hex("000003040c060000000100000000000000000000000702c104");
+        assert!(crate::wire::execute_commit_requested(&on, 0x04, true));
+        assert!(!crate::wire::execute_commit_requested(&off, 0x04, true));
+    }
+
 
     #[test]
     fn piggyback_close_of_cursor_3_does_not_hide_the_execute() {
