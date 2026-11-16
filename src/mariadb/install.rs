@@ -8,7 +8,7 @@
 use super::dictionary::{RELATIONS, SCHEMA};
 
 /// Bump on any change to the objects below.
-pub const VERSION: &str = "0.3.0-2026-11-16.1";
+pub const VERSION: &str = "0.3.0-2026-11-16.2";
 
 /// Schemas that are MariaDB's own, not Oracle objects; hidden from ALL_*.
 const SYSTEM_SCHEMAS: &str =
@@ -450,8 +450,9 @@ fn view_definitions() -> Vec<(&'static str, String)> {
                 .into(),
         ),
         (
+            // Object tables only in DbSaci's model (empty), as on PostgreSQL.
             "all_all_tables",
-            "SELECT * FROM dbsaci_sys.all_tables".into(),
+            "SELECT * FROM dbsaci_sys.all_tables WHERE 1=0".into(),
         ),
         (
             "all_object_tables",
@@ -534,7 +535,11 @@ fn view_definitions() -> Vec<(&'static str, String)> {
     for (user, all, owner) in user_views {
         v.push((
             user,
-            format!("SELECT * FROM dbsaci_sys.{all} WHERE {owner} = dbsaci_sys.login_user()"),
+            // DbSaci's shared `PUBLIC` schema (fixtures, reference data) is
+            // listed with the user's own objects, as on PostgreSQL.
+            format!(
+                "SELECT * FROM dbsaci_sys.{all}                  WHERE {owner} = dbsaci_sys.login_user() OR {owner} = 'PUBLIC'"
+            ),
         ));
     }
     // Empty dictionary views IDE schema browsers walk; each carries the

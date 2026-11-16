@@ -323,6 +323,7 @@ impl CorpusAdmin {
         match self {
             Self::Postgres(client) => client.batch_execute(sql).await.map_err(|e| e.to_string()),
             Self::MariaDb(conn) => {
+                let sql = maria(sql);
                 for statement in sql.split(';').map(str::trim).filter(|s| !s.is_empty()) {
                     conn.query_drop(statement)
                         .await
@@ -359,7 +360,7 @@ impl CorpusAdmin {
                 .map(|row| pg_scalar_text(&row))
                 .map_err(|e| e.to_string()),
             Self::MariaDb(conn) => conn
-                .query_first::<mysql_async::Value, _>(sql)
+                .query_first::<mysql_async::Value, _>(maria(sql))
                 .await
                 .map(|row| {
                     row.map(|r| maria_scalar_text(&r))
@@ -458,14 +459,17 @@ impl TestBackend {
         let image = std::env::var("DBSACI_TEST_MARIADB_IMAGE")
             .unwrap_or_else(|_| "mariadb:11.8".to_string());
         let (repo, tag) = image.split_once(':').unwrap_or((image.as_str(), "latest"));
+        // `DBSACI_TEST_MARIADB_LCTN` (default 0, the Linux server default)
+        // sets the server's `lower_case_table_names`; 0 means case-sensitive
+        // table names, which DbSaci must handle without help.
+        let lctn = std::env::var("DBSACI_TEST_MARIADB_LCTN").unwrap_or_else(|_| "0".into());
+        let corpus_db = mariadb_case().physical("CORPUS");
         let container = GenericImage::new(repo, tag)
             .with_wait_for(WaitFor::seconds(8))
             .with_exposed_port(ContainerPort::Tcp(3306))
             .with_env_var("MARIADB_ALLOW_EMPTY_ROOT_PASSWORD", "yes")
-            .with_env_var("MARIADB_DATABASE", "corpus")
-            // Oracle folds unquoted identifiers to a single case; make MariaDB
-            // table-name lookups case-insensitive to match.
-            .with_cmd(["--lower-case-table-names=1"])
+            .with_env_var("MARIADB_DATABASE", corpus_db.clone())
+            .with_cmd([format!("--lower-case-table-names={lctn}")])
             .start()
             .await
             .map_err(|e| format!("start MariaDB container: {e}"))?;
@@ -479,28 +483,31 @@ impl TestBackend {
             .get_host_port_ipv4(3306)
             .await
             .map_err(|e| e.to_string())?;
-        let mut admin = connect_maria_admin(&host, port).await?;
+        let mut admin = connect_maria_admin(&host, port, &corpus_db).await?;
+        // The dictionary is installed once by an administrator (what
+        // `dbsaci install` does); the corpus login is an ordinary
+        // least-privilege application account.
+        dbsaci::mariadb::install_dictionary(&host, port, "root", "", false, false)
+            .await
+            .map_err(|e| format!("install DbSaci dictionary: {e}"))?;
         admin
             .query_drop("CREATE USER IF NOT EXISTS 'corpus'@'%' IDENTIFIED BY 'corpus'")
             .await
             .map_err(|e| format!("create MariaDB corpus user: {e}"))?;
-        admin
-            .query_drop("GRANT ALL PRIVILEGES ON corpus.* TO 'corpus'@'%'")
-            .await
-            .map_err(|e| format!("grant MariaDB corpus user: {e}"))?;
-        admin
-            .query_drop("GRANT ALL PRIVILEGES ON *.* TO 'corpus'@'%' WITH GRANT OPTION")
-            .await
-            .map_err(|e| format!("grant MariaDB cross-schema access: {e}"))?;
         // Mirror PostgreSQL's `public` + per-user schema model: fixtures that
         // land in `public` on PG must show owner PUBLIC in ALL_TABLES here too.
-        for db in ["public", "corpus_hr", "pg_catalog"] {
+        for db in ["CORPUS", "PUBLIC", "CORPUS_HR", "PG_CATALOG"] {
+            let db = mariadb_case().physical(db);
             admin
                 .query_drop(format!("CREATE DATABASE IF NOT EXISTS `{db}`"))
                 .await
                 .map_err(|e| format!("create MariaDB schema `{db}`: {e}"))?;
+            admin
+                .query_drop(format!("GRANT ALL PRIVILEGES ON `{db}`.* TO 'corpus'@'%'"))
+                .await
+                .map_err(|e| format!("grant MariaDB corpus user on `{db}`: {e}"))?;
         }
-        for statement in MARIADB_BASELINE_SQL
+        for statement in maria(MARIADB_BASELINE_SQL)
             .split(';')
             .map(str::trim)
             .filter(|s| !s.is_empty())
@@ -515,15 +522,15 @@ impl TestBackend {
             .await
             .map_err(|e| format!("configure MariaDB recursive fixtures: {e}"))?;
         admin
-            .query_drop("DROP TABLE IF EXISTS mariadb_series")
+            .query_drop(maria("DROP TABLE IF EXISTS mariadb_series"))
             .await
             .map_err(|e| format!("reset MariaDB series fixture: {e}"))?;
         admin
-            .query_drop("CREATE TABLE mariadb_series (g INT PRIMARY KEY)")
+            .query_drop(maria("CREATE TABLE mariadb_series (g INT PRIMARY KEY)"))
             .await
             .map_err(|e| format!("create MariaDB series fixture: {e}"))?;
         admin
-            .query_drop("INSERT INTO mariadb_series WITH RECURSIVE seq(g) AS (SELECT 1 UNION ALL SELECT g + 1 FROM seq WHERE g < 1000000) SELECT g FROM seq")
+            .query_drop(maria("INSERT INTO mariadb_series WITH RECURSIVE seq(g) AS (SELECT 1 UNION ALL SELECT g + 1 FROM seq WHERE g < 1000000) SELECT g FROM seq"))
             .await
             .map_err(|e| format!("seed MariaDB series fixture: {e}"))?;
         for fixture in &fixtures {
@@ -577,7 +584,7 @@ impl TestBackend {
                         let table = if table.contains('.') {
                             table.to_string()
                         } else if mariadb_fixture_owns_public(table) {
-                            format!("`public`.{table}")
+                            format!("public.{table}")
                         } else {
                             table.to_string()
                         };
@@ -589,7 +596,7 @@ impl TestBackend {
                     statement.to_string()
                 };
                 // Unqualified fixture DDL (PG's public schema) → `public` DB.
-                let statement = qualify_mariadb_public_fixture(&statement);
+                let statement = maria(&qualify_mariadb_public_fixture(&statement));
                 // Fixtures are intentionally shared with PostgreSQL. MariaDB
                 // should still start and report the affected cases when a
                 // fixture uses PostgreSQL-only DDL (COMMENT ON, extensions,
@@ -601,9 +608,9 @@ impl TestBackend {
         }
         // Unqualified fallback for `public` objects (PG search_path behaviour).
         let _ = admin
-            .query_drop(
-                "CREATE OR REPLACE VIEW corpus.corpus_shared_ref AS SELECT * FROM `public`.corpus_shared_ref",
-            )
+            .query_drop(maria(
+                "CREATE OR REPLACE VIEW corpus.corpus_shared_ref AS SELECT * FROM public.corpus_shared_ref",
+            ))
             .await;
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -617,10 +624,11 @@ impl TestBackend {
                 listen_addr: format!("127.0.0.1:{proxy_port}"),
                 db_host: backend_host,
                 db_port: port,
-                db_name: "corpus".into(),
+                db_name: corpus_db.clone(),
                 credentials: dbsaci::Credentials::with_fallback(CORPUS_USER),
                 statement_timeout: Some(Duration::from_secs(2)),
                 idle_timeout: Some(Duration::from_secs(30)),
+                identifier_case: mariadb_case(),
                 ..Default::default()
             })
             .run_with_listener(listener)
@@ -987,7 +995,7 @@ fn qualify_mariadb_public_fixture(statement: &str) -> String {
                     if mariadb_fixture_owns_public(table) {
                         let (before_on, _) = rest_orig.split_at(on_at);
                         let after_table = &table_part[table.len()..];
-                        return format!("{after_kw}{before_on} ON `public`.{table}{after_table}");
+                        return format!("{after_kw}{before_on} ON public.{table}{after_table}");
                     }
                 }
                 return statement.to_string();
@@ -996,14 +1004,28 @@ fn qualify_mariadb_public_fixture(statement: &str) -> String {
                 return statement.to_string();
             }
             let after_name = &rest_orig[name.len()..];
-            return format!("{after_kw}`public`.{name}{after_name}");
+            return format!("{after_kw}public.{name}{after_name}");
         }
     }
     statement.to_string()
 }
 
-async fn connect_maria_admin(host: &str, port: u16) -> Result<MariaConn, String> {
-    let url = format!("mysql://root@{host}:{port}/corpus");
+/// `DBSACI_IDENTIFIER_CASE` (`upper` default / `lower`) for the MariaDB run.
+fn mariadb_case() -> dbsaci::IdentifierCase {
+    std::env::var("DBSACI_IDENTIFIER_CASE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or_default()
+}
+
+/// SQL run directly on MariaDB by the harness (fixtures, teardown, verify)
+/// gets Oracle identifier semantics, exactly as statements through DbSaci do.
+fn maria(sql: &str) -> String {
+    dbsaci::translate::names::canonicalize(sql, mariadb_case())
+}
+
+async fn connect_maria_admin(host: &str, port: u16, db: &str) -> Result<MariaConn, String> {
+    let url = format!("mysql://root@{host}:{port}/{db}");
     let opts = mysql_async::Opts::from_url(&url).map_err(|e| e.to_string())?;
     let mut last = String::new();
     for _ in 0..50 {

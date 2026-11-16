@@ -1725,6 +1725,64 @@ pub fn parse_reexecute_request_oci_ex(
     })
 }
 
+/// A thin-driver Execute (`0x5E`) that re-runs an already-parsed statement
+/// sends no SQL and no bind descriptors, only the value rows (ojdbc re-using a
+/// `PreparedStatement`). The fixed header's length varies by driver, so find
+/// the first `0x07` RowData marker from which `rows × types` length-prefixed
+/// values decode exactly to the end of the message.
+pub fn parse_execute_values_scan(
+    payload: &[u8],
+    sql: &str,
+    bind_types: &[u8],
+) -> Result<ExecuteRequest> {
+    let n = bind_types.len();
+    if n == 0 {
+        return Ok(ExecuteRequest {
+            sql: sql.to_string(),
+            binds: Vec::new(),
+            bind_types: Vec::new(),
+            prefetch: 0,
+            num_iters: 1,
+            bind_rows: Vec::new(),
+        });
+    }
+    let decode_rows = |start: usize| -> Option<Vec<Vec<BindValue>>> {
+        let mut buf = ReadBuffer::from_slice(&payload[start..]);
+        let mut rows = Vec::new();
+        while buf.remaining() > 0 {
+            if buf.read_u8().ok()? != 0x07 {
+                return None;
+            }
+            let mut row = Vec::with_capacity(n);
+            for &t in bind_types {
+                let raw = buf.read_bytes_with_length().ok()?;
+                row.push(decode_bind_value(t, raw).ok()?);
+            }
+            rows.push(row);
+        }
+        (!rows.is_empty()).then_some(rows)
+    };
+    let limit = payload.len().min(512);
+    let rows = (5..limit)
+        .filter(|&i| payload[i] == 0x07)
+        .find_map(decode_rows)
+        .ok_or_else(|| Error::Protocol("execute: no decodable bind value row".into()))?;
+    let mut rows = rows;
+    let (binds, bind_rows) = if rows.len() == 1 {
+        (rows.pop().unwrap_or_default(), Vec::new())
+    } else {
+        (rows[0].clone(), rows)
+    };
+    Ok(ExecuteRequest {
+        sql: sql.to_string(),
+        binds,
+        bind_types: bind_types.to_vec(),
+        prefetch: 0,
+        num_iters: bind_rows.len().max(1) as u32,
+        bind_rows,
+    })
+}
+
 pub fn parse_reexecute_request(
     payload: &[u8],
     sql: &str,

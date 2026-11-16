@@ -48,8 +48,16 @@ pub struct MariaDbConfig {
     pub case: IdentifierCase,
 }
 
-/// Has this process already made sure `dbsaci_sys` is current on a server?
-static DICTIONARY_CHECKED: Mutex<Option<HashMap<String, bool>>> = Mutex::new(None);
+/// What this process learned about each server on first contact.
+#[derive(Clone, Copy)]
+struct ServerFacts {
+    /// `dbsaci_sys` is installed at the current version.
+    dictionary: bool,
+    /// `@@lower_case_table_names` (0 = case-sensitive table names).
+    lower_case_table_names: u8,
+}
+
+static SERVERS: Mutex<Option<HashMap<String, ServerFacts>>> = Mutex::new(None);
 
 /// One Oracle session on MariaDB.
 pub struct MariaDbBackend {
@@ -80,7 +88,19 @@ impl MariaDbBackend {
             builder = builder.ssl_opts(mysql_async::SslOpts::default());
         }
         let opts: Opts = builder.into();
-        ensure_dictionary_once(cfg, &opts).await;
+        let facts = server_facts(cfg, &opts).await;
+        // A server with lower_case_table_names != 0 stores table and database
+        // names in lower case itself, whatever DbSaci sends: names read back
+        // from it map to Oracle names the `Lower` way.
+        let case = if facts.lower_case_table_names != 0 {
+            IdentifierCase::Lower
+        } else {
+            cfg.case
+        };
+        let cfg = &MariaDbConfig {
+            case,
+            ..cfg.clone()
+        };
 
         let login_oracle = login.to_ascii_uppercase();
         let shared = Arc::new(Shared::default());
@@ -120,37 +140,42 @@ impl MariaDbBackend {
     }
 }
 
-/// Install / upgrade the data dictionary the first time this process talks
-/// to a server. Failure (no privileges) is logged once; sessions still work,
+/// First contact with a server (per process): install / upgrade the data
+/// dictionary if needed and possible, and read `lower_case_table_names`.
+/// A missing dictionary (no privileges) is logged once; sessions still work,
 /// and `dbsaci install` fixes it.
-async fn ensure_dictionary_once(cfg: &MariaDbConfig, opts: &Opts) {
+async fn server_facts(cfg: &MariaDbConfig, opts: &Opts) -> ServerFacts {
     let key = format!("{}:{}", cfg.host, cfg.port);
-    if DICTIONARY_CHECKED
+    if let Some(f) = SERVERS
         .lock()
         .ok()
         .and_then(|m| m.as_ref().and_then(|m| m.get(&key).copied()))
-        .is_some()
     {
-        return;
+        return f;
     }
-    let ok = match session::ensure_dictionary(opts).await {
-        Ok(ok) => ok,
+    let (dictionary, lctn) = match session::ensure_dictionary(opts).await {
+        Ok(r) => r,
         Err(e) => {
             tracing::warn!("DbSaci data dictionary check failed: {e}");
-            false
+            (false, 0)
         }
     };
-    if !ok {
+    if !dictionary {
         tracing::warn!(
             "the DbSaci data dictionary (`{}`) is missing or outdated and this login cannot \
-             install it; Oracle dictionary views (ALL_TABLES, USER_SEQUENCES, …) will fail \
+             install it; Oracle dictionary views (ALL_TABLES, USER_SEQUENCES, ...) will fail \
              until an administrator runs `dbsaci install`",
             dictionary::SCHEMA
         );
     }
-    if let Ok(mut m) = DICTIONARY_CHECKED.lock() {
-        m.get_or_insert_with(HashMap::new).insert(key, ok);
+    let facts = ServerFacts {
+        dictionary,
+        lower_case_table_names: lctn,
+    };
+    if let Ok(mut m) = SERVERS.lock() {
+        m.get_or_insert_with(HashMap::new).insert(key, facts);
     }
+    facts
 }
 
 fn params_of(binds: &[BindValue]) -> Result<Vec<mysql_async::Value>> {

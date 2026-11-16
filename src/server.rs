@@ -1076,7 +1076,10 @@ async fn handle_connection(mut tns: TnsStream, session_id: u64, config: Config) 
                                     .or(last_execute.as_ref());
                                 match hint {
                                     Some((sql, types)) => {
-                                        wire::parse_reexecute_request(&payload, sql, types)
+                                        wire::parse_execute_values_scan(&payload, sql, types)
+                                            .or_else(|_| {
+                                                wire::parse_reexecute_request(&payload, sql, types)
+                                            })
                                     }
                                     None => wire::parse_execute_request(&payload),
                                 }

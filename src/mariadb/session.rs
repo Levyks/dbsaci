@@ -504,6 +504,16 @@ async fn exec(conn: &mut Conn, st: &mut State, sql: &str, params: &[Value]) -> R
         st.dirty = true;
         return Ok(n);
     }
+    // `UPDATE … RETURNING` without INTO (row-count path): MariaDB has no
+    // UPDATE RETURNING, and the client only wants the count.
+    let stripped;
+    let sql = match split_update_returning(sql) {
+        Some((update, _)) => {
+            stripped = update;
+            stripped.as_str()
+        }
+        None => sql,
+    };
     let sep = crate::translate::MARIADB_BATCH_SEP.trim();
     let affected = if sql.contains(sep) {
         let parts = binds::split_batch(sql, sep, params.to_vec())?;
@@ -823,9 +833,12 @@ async fn query(
     reply: oneshot::Sender<Result<(u64, Vec<ColumnMeta>)>>,
     rx: &mut mpsc::Receiver<Cmd>,
 ) -> Option<Cmd> {
-    if let Err(e) = check_currval(st, &sql) {
-        let _ = reply.send(Err(e));
-        return None;
+    match check_currval(st, &sql) {
+        Ok(nextvals) => st.nextval_seen.extend(nextvals),
+        Err(e) => {
+            let _ = reply.send(Err(e));
+            return None;
+        }
     }
     st.shared.in_flight.store(true, Ordering::Relaxed);
     let locks = sql.to_ascii_uppercase().contains("FOR UPDATE");
@@ -1030,18 +1043,25 @@ async fn columns(
 }
 
 /// Run the dictionary install if `dbsaci_sys` is missing or stale. Returns
-/// `Ok(true)` when the dictionary is current afterwards.
-pub async fn ensure_dictionary(opts: &Opts) -> Result<bool> {
+/// whether the dictionary is current afterwards, and the server's
+/// `lower_case_table_names`.
+pub async fn ensure_dictionary(opts: &Opts) -> Result<(bool, u8)> {
     let mut conn = Conn::new(opts.clone())
         .await
         .map_err(|e| connect_error(e, "-"))?;
+    let lctn: u8 = conn
+        .query_first::<u8, _>("SELECT @@lower_case_table_names")
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or(0);
     conn.query_drop(format!("SET SESSION sql_mode = '{SQL_MODE}'"))
         .await
         .map_err(|e| errors::map_error(e, "SET").error)?;
     let current = installed_version(&mut conn).await;
     if current.as_deref() == Some(super::install::VERSION) {
         let _ = conn.disconnect().await;
-        return Ok(true);
+        return Ok((true, lctn));
     }
     let got: Option<i64> = conn
         .query_first("SELECT GET_LOCK('dbsaci_install', 60)")
@@ -1065,7 +1085,7 @@ pub async fn ensure_dictionary(opts: &Opts) -> Result<bool> {
         let _ = conn.query_drop("DO RELEASE_LOCK('dbsaci_install')").await;
     }
     let _ = conn.disconnect().await;
-    Ok(ok)
+    Ok((ok, lctn))
 }
 
 async fn installed_version(conn: &mut Conn) -> Option<String> {
