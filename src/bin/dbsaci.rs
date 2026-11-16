@@ -42,6 +42,10 @@
 //! `--db-user` flag. A user not in the list falls back to `--db-password` if set,
 //! and is rejected with ORA-01017 otherwise.
 
+#[cfg(target_env = "musl")]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use std::path::PathBuf;
 use std::time::Duration;
 

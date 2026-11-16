@@ -45,7 +45,7 @@ else hostpath() { printf '%s' "$1"; }; fi
 
 ora_image="gvenzl/oracle-xe:21-slim"
 pg_image="${DBSACI_TEST_PG_IMAGE:-dbsaci-test-pg:18}"
-dbsaci_image="${DBSACI_IMAGE:-levyks/dbsaci:0.3.0}"
+dbsaci_image="${DBSACI_IMAGE:-levyks/dbsaci:0.3.2}"
 client_image="bench-client:local"
 
 cpus="${BENCH_CPUS:-2}"

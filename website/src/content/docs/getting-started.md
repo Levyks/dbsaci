@@ -9,8 +9,7 @@ sets `SQL_MODE=ORACLE` and the rest of the session itself), plus a login role
 for the proxy to use. Below, "the client" is any supported Oracle driver.
 
 :::note[Getting the image / binary]
-`docker pull levyks/dbsaci:0.3.0` — a small [distroless](https://github.com/GoogleContainerTools/distroless)
-image (glibc + CA roots + the dbSaci binary; no shell, no package manager). It is also buildable from the repo's
+`docker pull levyks/dbsaci:0.3.2` — a ~20 MB image: one static binary (musl + mimalloc) and a CA bundle on `scratch`; no shell, no package manager. It is also buildable from the repo's
 [`Dockerfile`](https://github.com/Levyks/dbsaci/blob/main/Dockerfile), and
 [building from source](#option-e--build-from-source) is a single `cargo build`.
 Pre-built stand-alone binaries, when published, land on the
@@ -40,7 +39,7 @@ services:
     ports: ["5432:5432"]
 
   dbsaci:
-    image: levyks/dbsaci:0.3.0
+    image: levyks/dbsaci:0.3.2
     depends_on: [postgres]
     environment:
       DBSACI_LISTEN: 0.0.0.0:1521
@@ -74,7 +73,7 @@ docker run --rm -p 1521:1521 -p 9500:9500 \
   -e DBSACI_DB_PASSWORD=pgpw \
   -e DBSACI_ORACLE_VERSION=19 \
   -e DBSACI_HEALTH_ADDR=0.0.0.0:9500 \
-  levyks/dbsaci:0.3.0
+  levyks/dbsaci:0.3.2
 ```
 
 Your PostgreSQL must have `orafce` installed in the target database

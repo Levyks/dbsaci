@@ -104,8 +104,8 @@ for the backend-by-backend feature status.
 
 Then connect any Oracle client to `//host:1521/FREEPDB1`.
 
-Or run it from a container (`levyks/dbsaci:0.3.0`) —
-`docker run -p 1521:1521 -e DBSACI_DB_HOST=… levyks/dbsaci:0.3.0`. See the
+Or run it from a container (`levyks/dbsaci:0.3.2`) —
+`docker run -p 1521:1521 -e DBSACI_DB_HOST=… levyks/dbsaci:0.3.2`. See the
 [docs](https://levyks.github.io/dbsaci/getting-started/) for a full
 docker-compose.
 
@@ -294,7 +294,7 @@ One sample run — 2 000 iterations/op (30 for the heavy ops), single connection
 Everything runs in Docker on one bridge network — the client, Oracle XE,
 PostgreSQL and dbSaci — so every hop is a container veth with no host
 port-proxy in the path. dbSaci runs from its published image
-(`levyks/dbsaci:0.2.0`, a distroless glibc build). Both database containers get
+(`levyks/dbsaci:0.2.0`, a distroless glibc build; from 0.3.2 the image is a ~20 MB static musl + mimalloc binary on `scratch`, as fast or faster). Both database containers get
 **2 CPU / 2.5 GiB**: Oracle XE spends its full 2 GiB licence (`INIT_SGA_SIZE`
 1536M + `INIT_PGA_SIZE` 512M), PostgreSQL is **tuned to that envelope**
 (`shared_buffers` 768 MB, 64 MB `work_mem`, parallel workers, `jit=off`). A
