@@ -251,7 +251,11 @@ fc.arraysize = 5
 fc.execute("SELECT n FROM ac_probe ORDER BY n")
 _first = [fc.fetchone() for _ in range(3)]
 other.commit()
-check("fetch_across_commit", len(_first) + len(fc.fetchall()), 29)
+try:
+    _across = len(_first) + len(fc.fetchall())
+except oracledb.DatabaseError as _e:
+    _across = str(_e).splitlines()[0]
+check("fetch_across_commit", _across, 29)
 writer.close()
 other.close()
 # Requests larger than one 8 KB TNS packet.

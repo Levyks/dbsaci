@@ -110,6 +110,7 @@ public class JdbcCompat {
             w.setAutoCommit(true);
             try (Statement s = w.createStatement()) { s.executeUpdate("INSERT INTO jdbc_ac VALUES (4)"); }
             try (ResultSet rs = q.executeQuery()) { rs.next(); check("next_statement_sees_other_commit", rs.getInt(1), 4); }
+            r.commit();
             try (Statement s = w.createStatement()) { s.execute("DROP TABLE jdbc_ac"); }
         }
         System.out.printf("%n%d/%d checks passed%n", pass, pass + fail);

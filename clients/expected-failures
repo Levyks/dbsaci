@@ -7,3 +7,5 @@
 mariadb python interval_ds_value
 mariadb python interval_ds_negative
 mariadb python interval_ym_value
+# PostgreSQL closes open cursors on COMMIT (no WITH HOLD portals yet).
+postgres python fetch_across_commit
