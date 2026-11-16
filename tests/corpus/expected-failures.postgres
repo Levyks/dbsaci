@@ -8,3 +8,12 @@ mariadb_oracle_mode::oracle_package_function
 # ALTER SESSION SET NLS_* lives in a rolled-back temp table.
 transactions_concurrency::set_transaction_after_dml_is_rejected
 transactions_concurrency::alter_session_survives_rollback
+# PostgreSQL lane gaps in the 0.3.0 translator-review group (the rewrite was
+# MariaDB-only; the PostgreSQL translator still has these approximations).
+translator_review::full_join_or_condition_no_duplicates
+translator_review::insert_first_inserts_each_row_once
+translator_review::insert_first_null_condition_goes_to_else
+translator_review::merge_update_where_and_insert_where
+translator_review::order_siblings_by_is_numeric
+translator_review::outer_join_marker_in_subquery
+translator_review::outer_join_marker_with_or_is_ora_01719
