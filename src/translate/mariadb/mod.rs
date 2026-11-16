@@ -275,7 +275,9 @@ fn lower_statement(sql: String, cx: &MariaDbContext) -> Result<Vec<String>> {
             )
             .replace(") G FROM DUAL", ") _gs")
             .replace(") FROM DUAL) Q", ") _gs) Q")
-            .replace(") FROM DUAL) q", ") _gs) q");
+            .replace(") FROM DUAL) q", ") _gs) q")
+            // the helper table is an ordinary (canonical) identifier
+            .replace("mariadb_series", &cx.case.physical("MARIADB_SERIES"));
     }
     if has_outer_marker {
         sql = structural::lower_outer_joins(sql)?;

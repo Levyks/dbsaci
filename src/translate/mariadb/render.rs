@@ -2670,6 +2670,19 @@ impl<'a> Render<'a> {
                 format!("UNHEX({})", a(0))
             }
             ("PG_SLEEP", 1) => format!("SLEEP({})", a(0)),
+            // DATABASE() inside a stored routine is the routine's own schema,
+            // so the current schema is computed inline, in the caller's context
+            // (same Oracle-name mapping as `dbsaci_sys.oname`).
+            ("SYS_CONTEXT", 2)
+                if self.str_arg(args[1]).is_some_and(|k| {
+                    k.eq_ignore_ascii_case("CURRENT_SCHEMA")
+                        || k.eq_ignore_ascii_case("SESSION_SCHEMA")
+                }) =>
+            {
+                "CAST(IF(@dbsaci_lower_names = 1 AND CAST(DATABASE() AS BINARY) = \
+                 CAST(LOWER(DATABASE()) AS BINARY), UPPER(DATABASE()), DATABASE()) AS CHAR(128))"
+                    .to_string()
+            }
             ("RAISE_APPLICATION_ERROR", 2 | 3) => {
                 let code = self
                     .str_or_num(args[0])
