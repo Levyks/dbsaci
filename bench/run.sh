@@ -45,7 +45,7 @@ else hostpath() { printf '%s' "$1"; }; fi
 
 ora_image="gvenzl/oracle-xe:21-slim"
 pg_image="${DBSACI_TEST_PG_IMAGE:-dbsaci-test-pg:18}"
-dbsaci_image="${DBSACI_IMAGE:-levyks/dbsaci:0.1.0}"
+dbsaci_image="${DBSACI_IMAGE:-levyks/dbsaci:0.3.0}"
 client_image="bench-client:local"
 
 cpus="${BENCH_CPUS:-2}"
@@ -180,6 +180,40 @@ sys.exit(1)
 echo "== workload vs PostgreSQL via dbSaci =="
 run_client "$saci_name:1521/FREEPDB1" dbsaci.json
 
+# ---------------------------------------------------------- MariaDB + dbSaci ---
+mdb_image="${BENCH_MARIADB_IMAGE:-mariadb:11.8}"
+mdb_name="bench-mariadb-$$"
+msaci_name="bench-saci-mdb-$$"
+echo "== starting MariaDB ($mdb_image), ${cpus} CPU / $mem =="
+docker run -d --name "$mdb_name" --network "$net" \
+  --cpus="$cpus" --memory="$mem" --memory-swap="$mem" \
+  -e MARIADB_ROOT_PASSWORD=root -e MARIADB_DATABASE=BENCH \
+  "$mdb_image" --innodb-buffer-pool-size=1G >/dev/null
+for _ in $(seq 1 120); do docker exec "$mdb_name" mariadb -uroot -proot -e 'SELECT 1' >/dev/null 2>&1 && break; sleep 0.5; done
+docker exec -i "$mdb_name" mariadb -uroot -proot <<'SQL'
+CREATE USER IF NOT EXISTS 'bench'@'%' IDENTIFIED BY 'bench';
+GRANT ALL PRIVILEGES ON `BENCH`.* TO 'bench'@'%';
+SQL
+docker run --rm --network "$net" "$dbsaci_image" --backend mariadb --db-host "$mdb_name" \
+  install --admin-password root >/dev/null
+echo "== starting dbSaci ($dbsaci_image) for MariaDB =="
+docker run -d --name "$msaci_name" --network "$net" \
+  -e DBSACI_BACKEND=mariadb -e DBSACI_LISTEN=0.0.0.0:1521 \
+  -e DBSACI_DB_HOST="$mdb_name" -e DBSACI_DB_PASSWORD=bench -e RUST_LOG=dbsaci=warn \
+  "$dbsaci_image" >/dev/null
+docker run --rm --network "$net" "$client_image" python -c "
+import socket, sys, time
+for _ in range(120):
+    s = socket.socket(); s.settimeout(1)
+    if s.connect_ex(('$msaci_name', 1521)) == 0:
+        sys.exit(0)
+    time.sleep(0.5)
+sys.exit(1)
+" || { echo 'dbSaci (MariaDB) listener never came up'; docker logs --tail 60 "$msaci_name"; exit 1; }
+echo "== workload vs MariaDB via dbSaci =="
+run_client "$msaci_name:1521/FREEPDB1" dbsaci-mariadb.json
+docker rm -f "$msaci_name" "$mdb_name" >/dev/null 2>&1 || true
+
 # ------------------------------------------------------------------- report ---
 echo
 docker run --rm -i -e BENCH_MEM="$mem" -v "$(hostpath "$outdir"):/out" "$client_image" python - <<'PY'
@@ -187,26 +221,29 @@ import json, os
 MEM = os.environ.get("BENCH_MEM", "?")
 O = json.load(open("/out/oracle.json"))
 P = json.load(open("/out/dbsaci.json"))
-o, p = O["results"], P["results"]
+M = json.load(open("/out/dbsaci-mariadb.json"))
+o, p, m = O["results"], P["results"], M["results"]
 
 def cell(d, key):
     return f"{d[key]:.3f} ms" if "error" not in d else "err"
 
 def table(kind, note):
     print(f"\n**{kind}** {note}\n")
-    print("| operation | Oracle XE p50 | dbSaci p50 | Oracle p95 | dbSaci p95 | dbSaci / Oracle (p50) |")
+    def ratio(a, b):
+        if "error" in a or "error" in b or not a["p50_ms"]:
+            return "n/a"
+        return f"{b['p50_ms'] / a['p50_ms']:.2f}x"
+    print("| operation | Oracle XE p50 | dbSaci+MariaDB p50 | dbSaci+PostgreSQL p50 "
+          "| MariaDB / Oracle | PostgreSQL / Oracle |")
     print("| --- | ---: | ---: | ---: | ---: | ---: |")
     for k, a in o.items():
         if a.get("kind") != kind:
             continue
         b = p.get(k, {"error": "not run"})
-        if "error" in a or "error" in b:
-            ratio = "n/a"
-        else:
-            ratio = f"{b['p50_ms'] / a['p50_ms']:.2f}x" if a["p50_ms"] else "n/a"
-        print(f"| `{k}` | {cell(a,'p50_ms')} | {cell(b,'p50_ms')} "
-              f"| {cell(a,'p95_ms')} | {cell(b,'p95_ms')} | {ratio} |")
-    errs = {k: v['error'] for k, v in list(o.items()) + list(p.items())
+        c = m.get(k, {"error": "not run"})
+        print(f"| `{k}` | {cell(a,'p50_ms')} | {cell(c,'p50_ms')} | {cell(b,'p50_ms')} "
+              f"| {ratio(a, c)} | {ratio(a, b)} |")
+    errs = {k: v['error'] for k, v in list(o.items()) + list(p.items()) + list(m.items())
             if v.get('kind') == kind and 'error' in v}
     for k, msg in errs.items():
         print(f"\n> `{k}` errored: {msg}")
