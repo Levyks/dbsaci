@@ -58,6 +58,8 @@ pub struct Shared {
     pub lost: AtomicBool,
     /// Bumped by DDL; part of translation cache keys.
     pub schema_version: AtomicU64,
+    /// Bumped per backend call; a call timeout only fires for its own call.
+    pub calls: AtomicU64,
 }
 
 /// Fixed parameters of the session.
@@ -182,12 +184,6 @@ async fn establish(st: &mut State) -> Result<Conn> {
         login = quote(&st.params.login),
         lower = u8::from(st.params.case == IdentifierCase::Lower),
     );
-    if let Some(t) = st.params.statement_timeout {
-        set.push_str(&format!(
-            ", max_statement_time = {}",
-            t.as_secs_f64().max(0.001)
-        ));
-    }
     if let Some(tz) = &st.time_zone {
         set.push_str(&format!(", time_zone = {}", quote(tz)));
     }
@@ -262,6 +258,45 @@ async fn run(mut conn: Conn, mut st: State, mut rx: mpsc::Receiver<Cmd>) {
     let _ = conn.disconnect().await;
 }
 
+/// A per-call timeout (Oracle's call timeout applies to each execute or fetch,
+/// not to a cursor's lifetime — MariaDB's `max_statement_time` would kill a
+/// streaming query whose client reads slowly). When it expires, the running
+/// statement is killed from a side connection; MariaDB then fails it with
+/// error 1317 (ORA-01013). Dropping the guard disarms it.
+struct Deadline(Option<tokio::task::JoinHandle<()>>);
+
+impl Deadline {
+    fn arm(st: &State) -> Self {
+        let Some(after) = st.params.statement_timeout else {
+            return Deadline(None);
+        };
+        let opts = st.params.opts.clone();
+        let shared = st.shared.clone();
+        let generation = shared.calls.fetch_add(1, Ordering::Relaxed) + 1;
+        Deadline(Some(tokio::spawn(async move {
+            tokio::time::sleep(after).await;
+            if shared.calls.load(Ordering::Relaxed) != generation {
+                return;
+            }
+            let id = shared.conn_id.load(Ordering::Relaxed);
+            if let Ok(mut side) = Conn::new(opts).await {
+                if shared.calls.load(Ordering::Relaxed) == generation {
+                    let _ = side.query_drop(format!("KILL QUERY {id}")).await;
+                }
+                let _ = side.disconnect().await;
+            }
+        })))
+    }
+}
+
+impl Drop for Deadline {
+    fn drop(&mut self) {
+        if let Some(h) = self.0.take() {
+            h.abort();
+        }
+    }
+}
+
 /// Answer `cmd` with an error.
 fn fail(cmd: Cmd, err: impl Fn() -> Error) {
     match cmd {
@@ -303,7 +338,9 @@ async fn handle(
         }
         Cmd::Exec { sql, params, reply } => {
             st.shared.in_flight.store(true, Ordering::Relaxed);
+            let deadline = Deadline::arm(st);
             let mut r = exec(conn, st, &sql, &params).await;
+            drop(deadline);
             if is_link_lost(&r) {
                 r = match recover(conn, st).await {
                     Ok(()) => exec(conn, st, &sql, &params).await,
@@ -709,7 +746,9 @@ async fn returning(
     params: &[Value],
 ) -> Result<(u64, Vec<Row>)> {
     st.shared.in_flight.store(true, Ordering::Relaxed);
+    let deadline = Deadline::arm(st);
     let r = returning_inner(conn, st, sql, params).await;
+    drop(deadline);
     st.shared.in_flight.store(false, Ordering::Relaxed);
     if r.is_ok() {
         after_statement(st, sql, true);
@@ -841,6 +880,7 @@ async fn query(
         }
     }
     st.shared.in_flight.store(true, Ordering::Relaxed);
+    let deadline = Deadline::arm(st);
     let locks = sql.to_ascii_uppercase().contains("FOR UPDATE");
     // Start the query (reconnecting once if the link died and nothing is
     // uncommitted). The result borrows the connection, so the reconnect
@@ -850,6 +890,7 @@ async fn query(
         let started = if params.is_empty() {
             match conn.query_iter(sql.as_str()).await {
                 Ok(r) => {
+                    drop(deadline);
                     let out = serve(r, st, &sql, &caps, locks, reply, rx).await;
                     st.shared.in_flight.store(false, Ordering::Relaxed);
                     return out;
@@ -862,6 +903,7 @@ async fn query(
                 .await
             {
                 Ok(r) => {
+                    drop(deadline);
                     let out = serve(r, st, &sql, &caps, locks, reply, rx).await;
                     st.shared.in_flight.store(false, Ordering::Relaxed);
                     return out;
@@ -944,6 +986,8 @@ async fn serve<P: Protocol>(
                 let mut rows = Vec::with_capacity(n.min(4096));
                 let mut done = false;
                 let mut err = None;
+                let deadline = Deadline::arm(st);
+                st.shared.in_flight.store(true, Ordering::Relaxed);
                 while rows.len() < n {
                     match result.next().await {
                         Ok(Some(row)) => match encode_row(&row, &wires) {
@@ -963,6 +1007,8 @@ async fn serve<P: Protocol>(
                         }
                     }
                 }
+                drop(deadline);
+                st.shared.in_flight.store(false, Ordering::Relaxed);
                 if let Some(e) = err {
                     let _ = reply.send(Err(e));
                     let _ = result.drop_result().await;
