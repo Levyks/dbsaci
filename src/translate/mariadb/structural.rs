@@ -371,7 +371,7 @@ pub fn lower_outer_joins(sql: String) -> Result<String> {
                 filters.push(ts.tslice(ca, cb).to_string());
                 continue;
             }
-            if (ca..cb).any(|i| ts.is(i, "OR") || ts.is(i, "IN")) {
+            if (ca..cb).any(|i| ts.is(i, "OR")) {
                 return Err(Error::ora(
                     1719,
                     "outer join operator (+) not allowed in operand of OR or IN",
@@ -1210,8 +1210,8 @@ pub fn lower_merge(sql: &str, cx: &MariaDbContext) -> Result<Option<Vec<String>>
                 return Err(Error::ora(905, "missing keyword"));
             }
             let set_a = ts.next(act, n) + 1;
-            let w = ts.find_kw(set_a, clause_end, &["WHERE"]);
             let d = ts.find_kw(set_a, clause_end, &["DELETE"]);
+            let w = ts.find_kw(set_a, d.unwrap_or(clause_end), &["WHERE"]);
             let set_b = [w, d].into_iter().flatten().min().unwrap_or(clause_end);
             let mut sets = vec![];
             for (x, y) in ts.split_commas(set_a, set_b) {

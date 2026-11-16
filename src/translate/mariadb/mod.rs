@@ -130,7 +130,10 @@ pub fn classify(ts: &Ts) -> StmtKind {
         }
         return StmtKind::Ddl;
     }
-    if ts.is_any(i, &["ALTER", "DROP", "TRUNCATE", "COMMENT", "RENAME"]) {
+    if ts.is_any(
+        i,
+        &["ALTER", "DROP", "TRUNCATE", "COMMENT", "RENAME", "REFRESH"],
+    ) {
         return StmtKind::Ddl;
     }
     StmtKind::Other
@@ -265,7 +268,14 @@ fn lower_statement(sql: String, cx: &MariaDbContext) -> Result<Vec<String>> {
         sql = super::rewrite_pivot(&sql);
     }
     if has("GENERATE_SERIES") {
-        sql = super::rewrite_generate_series(&sql);
+        sql = super::rewrite_generate_series(&sql)
+            .replace(
+                "SELECT (SELECT g FROM mariadb_series",
+                "SELECT g FROM (SELECT g FROM mariadb_series",
+            )
+            .replace(") G FROM DUAL", ") _gs")
+            .replace(") FROM DUAL) Q", ") _gs) Q")
+            .replace(") FROM DUAL) q", ") _gs) q");
     }
     if has_outer_marker {
         sql = structural::lower_outer_joins(sql)?;

@@ -1838,11 +1838,12 @@ impl<'a> Render<'a> {
                 "SESSIONTIMEZONE" => Some("SESSIONTIMEZONE()"),
                 "DBTIMEZONE" => Some("DBTIMEZONE()"),
                 "UID" => Some("CONNECTION_ID()"),
-                "USER" => Some("UPPER(SUBSTRING_INDEX(SESSION_USER(), '@', 1))"),
+                "USER" => Some("SYS_CONTEXT('USERENV', 'SESSION_USER')"),
                 _ => None,
             };
             if let Some(rep) = rep {
                 let rep = match w.as_str() {
+                    "USER" => format!("{}('USERENV', 'SESSION_USER')", self.fname("sys_context")),
                     "SESSIONTIMEZONE" => self.fname("sessiontimezone") + "()",
                     "DBTIMEZONE" => self.fname("dbtimezone") + "()",
                     _ => rep.to_string(),
@@ -2360,6 +2361,7 @@ impl<'a> Render<'a> {
                 }
             }
             "INTEGER" | "INT" | "SMALLINT" => "DECIMAL(38,0)".into(),
+            "BIGINT" => "SIGNED".into(),
             "BINARY_DOUBLE" | "REAL" => "DOUBLE".into(),
             "FLOAT" if args.is_empty() => "DOUBLE".into(),
             "DOUBLE" => "DOUBLE".into(),
@@ -2677,20 +2679,6 @@ impl<'a> Render<'a> {
                 format!("UNHEX({})", a(0))
             }
             ("PG_SLEEP", 1) => format!("SLEEP({})", a(0)),
-            ("SYS_CONTEXT", 2 | 3) => {
-                let key = up(&self.str_arg(args[1])?);
-                match key.as_str() {
-                    "CURRENT_SCHEMA" | "SESSION_SCHEMA" => {
-                        "CAST(COALESCE(@dbsaci_current_schema, DATABASE()) AS CHAR(128))".into()
-                    }
-                    "CURRENT_USER" | "SESSION_USER" => {
-                        "UPPER(SUBSTRING_INDEX(SESSION_USER(), '@', 1))".into()
-                    }
-                    "SESSIONTIMEZONE" => format!("{}()", self.fname("sessiontimezone")),
-                    "DB_TIMEZONE" | "DBTIMEZONE" => format!("{}()", self.fname("dbtimezone")),
-                    _ => return None,
-                }
-            }
             ("RAISE_APPLICATION_ERROR", 2 | 3) => {
                 let code = self
                     .str_or_num(args[0])

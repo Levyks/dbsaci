@@ -181,6 +181,23 @@ fn execute_immediate_literal_is_translated() {
 }
 
 #[test]
+fn order_by_across_lines_and_in_windows() {
+    assert_eq!(
+        tr("SELECT a FROM t\nORDER\nBY a DESC"),
+        "SELECT A FROM T\nORDER\nBY A IS NULL DESC, A DESC"
+    );
+    assert_eq!(
+        tr("SELECT RANK() OVER (PARTITION BY d ORDER BY s DESC) FROM t"),
+        "SELECT RANK() OVER (PARTITION BY D ORDER BY S IS NULL DESC, S DESC) FROM T"
+    );
+    // ordered-set aggregates take a single key
+    assert_eq!(
+        tr("SELECT PERCENTILE_DISC(0.5) WITHIN GROUP (ORDER BY s) OVER () FROM t"),
+        "SELECT PERCENTILE_DISC(0.5) WITHIN GROUP (ORDER BY S) OVER () FROM T"
+    );
+}
+
+#[test]
 fn cast_char_targets_pass_through() {
     assert_eq!(
         tr("SELECT CAST(? AS CHAR) FROM dual"),
