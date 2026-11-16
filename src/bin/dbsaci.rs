@@ -157,6 +157,11 @@ struct Common {
     /// Require TLS when connecting to the backend database.
     #[arg(long, env = "DBSACI_DB_SSL", default_value_t = false, global = true)]
     db_ssl: bool,
+
+    /// MariaDB: PEM CA bundle that signed the server certificate (implies
+    /// `--db-ssl`).
+    #[arg(long, env = "DBSACI_DB_SSL_CA", value_name = "PATH", global = true)]
+    db_ssl_ca: Option<PathBuf>,
 }
 
 #[derive(Args, Debug)]
@@ -263,7 +268,8 @@ fn mariadb_config(c: &Common) -> dbsaci::mariadb::MariaDbConfig {
         port: c.db_port.unwrap_or(3306),
         default_db: c.db_name.clone().unwrap_or_default(),
         statement_timeout: None,
-        ssl: c.db_ssl,
+        ssl: c.db_ssl || c.db_ssl_ca.is_some(),
+        ssl_ca: c.db_ssl_ca.clone(),
         case: c
             .identifier_case
             .map(IdentifierCase::from)
@@ -328,11 +334,9 @@ async fn main() {
             require_mariadb(&cli.common, "install");
             let cfg = mariadb_config(&cli.common);
             match dbsaci::mariadb::install_dictionary(
-                &cfg.host,
-                cfg.port,
+                &cfg,
                 &admin_user,
                 &admin_password,
-                cfg.ssl,
                 drop_legacy,
             )
             .await
@@ -395,7 +399,8 @@ async fn serve(common: Common, args: ServeArgs, credentials: Credentials) {
         health_token: args.health_token,
         tls_cert: args.tls_cert,
         tls_key: args.tls_key,
-        db_ssl: common.db_ssl,
+        db_ssl: common.db_ssl || common.db_ssl_ca.is_some(),
+        db_ssl_ca: common.db_ssl_ca.clone(),
         max_sessions: args.max_sessions,
     };
 

@@ -184,6 +184,8 @@ pub struct Config {
     pub tls_key: Option<std::path::PathBuf>,
     /// Require TLS when opening the backend connection.
     pub db_ssl: bool,
+    /// PEM CA bundle for the backend's TLS certificate (MariaDB).
+    pub db_ssl_ca: Option<std::path::PathBuf>,
     /// Refuse new clients beyond this many concurrent sessions (each holds a
     /// backend connection). `None`: no limit.
     pub max_sessions: Option<usize>,
@@ -252,6 +254,7 @@ impl Default for Config {
             tls_cert: None,
             tls_key: None,
             db_ssl: false,
+            db_ssl_ca: None,
             max_sessions: None,
         }
     }
@@ -951,6 +954,7 @@ async fn handle_connection(mut tns: TnsStream, session_id: u64, config: Config) 
                 default_db: config.db_name.clone(),
                 statement_timeout: config.statement_timeout,
                 ssl: config.db_ssl,
+                ssl_ca: config.db_ssl_ca.clone(),
                 case: config.identifier_case,
             },
             &username,

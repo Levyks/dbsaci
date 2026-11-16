@@ -487,7 +487,16 @@ impl TestBackend {
         // The dictionary is installed once by an administrator (what
         // `dbsaci install` does); the corpus login is an ordinary
         // least-privilege application account.
-        dbsaci::mariadb::install_dictionary(&host, port, "root", "", false, false)
+        let admin_cfg = dbsaci::mariadb::MariaDbConfig {
+            host: host.clone(),
+            port,
+            default_db: String::new(),
+            statement_timeout: None,
+            ssl: false,
+            ssl_ca: None,
+            case: mariadb_case(),
+        };
+        dbsaci::mariadb::install_dictionary(&admin_cfg, "root", "", false)
             .await
             .map_err(|e| format!("install DbSaci dictionary: {e}"))?;
         admin

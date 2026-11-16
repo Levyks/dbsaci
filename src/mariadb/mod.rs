@@ -45,7 +45,23 @@ pub struct MariaDbConfig {
     pub default_db: String,
     pub statement_timeout: Option<Duration>,
     pub ssl: bool,
+    /// PEM CA bundle to verify the server certificate with (implies `ssl`);
+    /// otherwise the public web roots are used.
+    pub ssl_ca: Option<std::path::PathBuf>,
     pub case: IdentifierCase,
+}
+
+impl MariaDbConfig {
+    /// TLS options for a connection to this server, if TLS is on.
+    fn ssl_opts(&self) -> Option<mysql_async::SslOpts> {
+        match &self.ssl_ca {
+            Some(ca) => {
+                Some(mysql_async::SslOpts::default().with_root_certs(vec![ca.clone().into()]))
+            }
+            None if self.ssl => Some(mysql_async::SslOpts::default()),
+            None => None,
+        }
+    }
 }
 
 /// What this process learned about each server on first contact.
@@ -82,8 +98,8 @@ impl MariaDbBackend {
             // UPDATE row count = rows matched (Oracle), not rows changed.
             .client_found_rows(true)
             .stmt_cache_size(256);
-        if cfg.ssl {
-            builder = builder.ssl_opts(mysql_async::SslOpts::default());
+        if let Some(tls) = cfg.ssl_opts() {
+            builder = builder.ssl_opts(tls);
         }
         let opts: Opts = builder.into();
         let facts = server_facts(cfg, &opts).await;
@@ -535,21 +551,19 @@ pub fn route_dictionary(sql: &str) -> String {
 /// `dbsaci install`: create or upgrade `dbsaci_sys` and grant it to everyone.
 /// With `drop_legacy`, also remove the per-schema objects DbSaci 0.2.x created.
 pub async fn install_dictionary(
-    host: &str,
-    port: u16,
+    cfg: &MariaDbConfig,
     user: &str,
     password: &str,
-    ssl: bool,
     drop_legacy: bool,
 ) -> Result<Vec<String>> {
     let mut builder = OptsBuilder::default()
-        .ip_or_hostname(host.to_string())
-        .tcp_port(port)
+        .ip_or_hostname(cfg.host.clone())
+        .tcp_port(cfg.port)
         .user(Some(user.to_string()))
         .pass(Some(password.to_string()))
         .prefer_socket(false);
-    if ssl {
-        builder = builder.ssl_opts(mysql_async::SslOpts::default());
+    if let Some(tls) = cfg.ssl_opts() {
+        builder = builder.ssl_opts(tls);
     }
     let mut conn = Conn::new(Opts::from(builder))
         .await
@@ -647,8 +661,8 @@ pub async fn check(cfg: &MariaDbConfig, login: &str, password: &str) -> Vec<Chec
         .user(Some(login.to_ascii_lowercase()))
         .pass(Some(password.to_string()))
         .prefer_socket(false);
-    if cfg.ssl {
-        builder = builder.ssl_opts(mysql_async::SslOpts::default());
+    if let Some(tls) = cfg.ssl_opts() {
+        builder = builder.ssl_opts(tls);
     }
     let mut conn = match Conn::new(Opts::from(builder)).await {
         Ok(c) => c,
