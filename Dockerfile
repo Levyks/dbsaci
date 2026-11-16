@@ -1,5 +1,5 @@
-# Build: docker build -t levyks/dbsaci:0.3.2 .
-# Run:   docker run --rm -p 1521:1521 -e DBSACI_DB_HOST=... levyks/dbsaci:0.3.2
+# Build: docker build -t levyks/dbsaci:0.3.3 .
+# Run:   docker run --rm -p 1521:1521 -e DBSACI_DB_HOST=... levyks/dbsaci:0.3.3
 #
 # A fully static musl binary on `scratch` (~20 MB image). dbSaci links no C
 # libraries: `ring` and the RustCrypto ciphers build from vendored code,

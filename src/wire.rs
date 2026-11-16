@@ -161,30 +161,62 @@ pub fn build_protocol_response() -> Bytes {
 /// DbSaci owns its single streamed cursor, so the piggyback body itself needs no
 /// action. Returns `None` if no embedded FUNCTION message is found.
 pub fn strip_piggyback(payload: &[u8]) -> Option<&[u8]> {
-    // Real TTC functions that can follow a piggyback. `0x11` is the piggyback
-    // marker itself (several may chain); the scan skips past every one.
-    const KNOWN_FUNCS: [u8; 13] = [
-        0x03, 0x04, 0x05, 0x09, 0x0e, 0x0f, 0x2f, 0x3b, 0x47, 0x4e, 0x5e, 0x67, 0x69,
+    // Function codes a real `[0x03][func]` message can carry after the
+    // piggybacks. (`0x03` itself is the message type, never a function: a
+    // closed cursor id 3 right before the message must not look like one.)
+    const KNOWN_FUNCS: [u8; 12] = [
+        0x04, 0x05, 0x09, 0x0e, 0x0f, 0x2f, 0x3b, 0x47, 0x4e, 0x5e, 0x67, 0x69,
     ];
-    // A piggyback is `[0x11][func][seq]` then function-specific args, repeated,
-    // then the real `[0x03][func]` message. Walk it structurally: from just
-    // after the leading `[flags:2]`, for each `0x11` skip its 3-byte header and
-    // the argument run up to the next `0x11` or `0x03` boundary; stop at the
-    // first `0x03 <known func>`.
     let mut i = 2;
+    // Structural walk first. Every piggyback the thin drivers send (cursor
+    // close 0x69, ojdbc's 0x78) is `[0x11][func][seq][ptr u8][count ub4]
+    // [count x ub4]`; follow that exactly and require the next byte to start
+    // another piggyback or the real message.
+    while payload.get(i) == Some(&0x11) {
+        match piggyback_len(&payload[i..]) {
+            Some(n) if matches!(payload.get(i + n), Some(0x11) | Some(0x03)) => i += n,
+            _ => return strip_piggyback_scan(payload, i, &KNOWN_FUNCS),
+        }
+    }
+    match (payload.get(i), payload.get(i + 1)) {
+        (Some(0x03), Some(f)) if KNOWN_FUNCS.contains(f) => Some(&payload[i..]),
+        _ => strip_piggyback_scan(payload, 2, &KNOWN_FUNCS),
+    }
+}
+
+/// Length of one `[0x11][func][seq][ptr][count ub4][count x ub4]` piggyback.
+fn piggyback_len(p: &[u8]) -> Option<usize> {
+    let mut buf = ReadBuffer::from_slice(p);
+    buf.read_u8().ok()?; // 0x11
+    buf.read_u8().ok()?; // function
+    buf.read_u8().ok()?; // sequence
+    buf.read_u8().ok()?; // pointer
+    let count = buf.read_ub4().ok()?;
+    if count > 65_535 {
+        return None;
+    }
+    for _ in 0..count {
+        buf.read_ub4().ok()?;
+    }
+    Some(p.len() - buf.remaining())
+}
+
+/// Fallback for a piggyback of unknown shape: skip each `0x11` header and
+/// scan to the next message boundary.
+fn strip_piggyback_scan<'a>(payload: &'a [u8], start: usize, known: &[u8]) -> Option<&'a [u8]> {
+    let mut i = start;
     while i + 1 < payload.len() {
         match payload[i] {
             0x11 => {
-                // header, then scan forward to the next message boundary
                 i += 3;
                 while i + 1 < payload.len()
                     && !(payload[i] == 0x11
-                        || (payload[i] == 0x03 && KNOWN_FUNCS.contains(&payload[i + 1])))
+                        || (payload[i] == 0x03 && known.contains(&payload[i + 1])))
                 {
                     i += 1;
                 }
             }
-            0x03 if KNOWN_FUNCS.contains(&payload[i + 1]) => return Some(&payload[i..]),
+            0x03 if known.contains(&payload[i + 1]) => return Some(&payload[i..]),
             _ => i += 1,
         }
     }
@@ -4084,6 +4116,38 @@ pub fn encode_oracle_number_decimal(value: &str) -> Result<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn piggyback_close_of_cursor_3_does_not_hide_the_execute() {
+        // ojdbc: [11 78 seq 01 01 01 01 03] [11 69 seq 01 01 01 01 03] [03 5e ...]
+        // (close cursor 3 twice, then Execute). The old scan stopped at the
+        // id byte 03 followed by the message's 03 and dispatched function 0x03.
+        let p = [
+            0x00, 0x00, 0x11, 0x78, 0x05, 0x01, 0x01, 0x01, 0x01, 0x03, 0x11, 0x69, 0x06, 0x01,
+            0x01, 0x01, 0x01, 0x03, 0x03, 0x5e, 0x07, 0x02, 0x80, 0x21,
+        ];
+        let inner = crate::wire::strip_piggyback(&p).unwrap();
+        assert_eq!(&inner[..2], &[0x03, 0x5e]);
+        // several cursors, multi-byte ids (cursor 0x035e = 862)
+        let p = [
+            0x00, 0x00, 0x11, 0x69, 0x06, 0x01, 0x01, 0x02, 0x02, 0x03, 0x5e, 0x01, 0x03, 0x03,
+            0x5e, 0x07,
+        ];
+        assert_eq!(
+            &crate::wire::strip_piggyback(&p).unwrap()[..2],
+            &[0x03, 0x5e]
+        );
+        // captured frame (cursor 1)
+        let p = [
+            0x00, 0x00, 0x11, 0x78, 0x05, 0x01, 0x01, 0x01, 0x01, 0x01, 0x11, 0x69, 0x06, 0x01,
+            0x01, 0x01, 0x01, 0x01, 0x03, 0x5e, 0x07,
+        ];
+        assert_eq!(
+            &crate::wire::strip_piggyback(&p).unwrap()[..2],
+            &[0x03, 0x5e]
+        );
+    }
+
     use super::{
         BindValue, bind_postgres_parameters, decode_bind_value, decode_oracle_number,
         encode_oracle_number_decimal, encode_oracle_number_i64, parse_auth_phase_one_request,

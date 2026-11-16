@@ -113,6 +113,24 @@ public class JdbcCompat {
             r.commit();
             try (Statement s = w.createStatement()) { s.execute("DROP TABLE jdbc_ac"); }
         }
+        // ojdbc closes abandoned cursors by piggybacking a close-cursors call
+        // (with the cursor ids) in front of the next Execute. Closing server
+        // cursor 3 put the bytes `03 | 03 5e` next to each other, which 0.3.2
+        // misread as TTC function 0x03 -> ORA-03001 (SQLState 0A000, evicted
+        // by HikariCP). Abandon several cursors with rows left, in sequence.
+        try (Connection c = DriverManager.getConnection(url, user, pw)) {
+            int ok = 0;
+            for (int i = 1; i <= 8; i++) {
+                try (PreparedStatement p = c.prepareStatement("SELECT LEVEL * " + i + " FROM DUAL CONNECT BY LEVEL <= 50");
+                     ResultSet r = p.executeQuery()) {
+                    r.next();
+                    ok++;
+                } catch (SQLException e) {
+                    System.out.println("   detail: " + e.getMessage().trim());
+                }
+            }
+            check("abandoned_cursor_piggyback_close", ok, 8);
+        }
         System.out.printf("%n%d/%d checks passed%n", pass, pass + fail);
         System.exit(fail == 0 ? 0 : 1);
     }

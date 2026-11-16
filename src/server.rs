@@ -1973,6 +1973,13 @@ async fn handle_connection(mut tns: TnsStream, session_id: u64, config: Config) 
                             tns.write_packet(PacketType::Data, &resp).await?;
                         }
                         crate::ttc::Dispatch::Unimplemented { ora, detail } => {
+                            warn!(
+                                "TTC function 0x{:02x} is not implemented (ORA-{:05}); \
+                                 message head {:02x?}",
+                                func_code,
+                                ora,
+                                &payload[..payload.len().min(24)]
+                            );
                             write_error_response(
                                 &mut tns,
                                 oci_dialect,
