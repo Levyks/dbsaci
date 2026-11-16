@@ -6,6 +6,7 @@ pub mod error;
 pub mod mariadb;
 pub mod ops;
 pub mod profile;
+pub mod script;
 pub mod server;
 pub mod tls;
 pub mod tns;

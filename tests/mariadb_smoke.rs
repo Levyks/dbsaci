@@ -14,7 +14,7 @@ async fn mariadb_oracle_mode_executes_basic_queries_and_binds() {
     let _ = tracing_subscriber::fmt()
         .with_max_level(tracing::Level::INFO)
         .try_init();
-    let container = GenericImage::new("mariadb", "11.4")
+    let container = GenericImage::new("mariadb", "11.8")
         // The official image writes the readiness line through a stream that
         // differs between Docker Desktop and Linux, so use the driver's retry
         // below as the authoritative readiness check.

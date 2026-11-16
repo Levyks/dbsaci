@@ -32,18 +32,26 @@ cleanup() {
 trap cleanup EXIT
 
 if [ "$backend" = "mariadb" ]; then
-  echo "== starting mariadb:11.4 =="
+  # MariaDB 11.8+ with case-sensitive table names (the Linux default) unless
+  # DBSACI_TEST_MARIADB_LCTN says otherwise; an ordinary least-privilege
+  # application account; the dictionary installed by an administrator.
+  mdb_image="${DBSACI_TEST_MARIADB_IMAGE:-mariadb:11.8}"
+  lctn="${DBSACI_TEST_MARIADB_LCTN:-0}"
+  if [ "${DBSACI_IDENTIFIER_CASE:-upper}" = "lower" ] || [ "$lctn" != "0" ]; then
+    schema=corpus; people=people; teams=teams
+  else
+    schema=CORPUS; people=PEOPLE; teams=TEAMS
+  fi
+  echo "== starting $mdb_image (lower_case_table_names=$lctn) =="
   cid=$(docker run -d \
-    -e MARIADB_ALLOW_EMPTY_ROOT_PASSWORD=yes \
-    -e MARIADB_DATABASE=corpus \
-    -e MARIADB_USER=corpus \
-    -e MARIADB_PASSWORD=corpus \
-    -P mariadb:11.4 --lower-case-table-names=1)
+    -e MARIADB_ROOT_PASSWORD=root \
+    -e MARIADB_DATABASE="$schema" \
+    -P "$mdb_image" --lower-case-table-names="$lctn")
   db_port=$(docker inspect -f '{{(index (index .NetworkSettings.Ports "3306/tcp") 0).HostPort}}' "$cid")
   echo "== waiting for mariadb =="
   ok=0
   for _ in $(seq 1 120); do
-    if docker exec "$cid" mariadb -ucorpus -pcorpus corpus -e 'SELECT 1' >/dev/null 2>&1; then
+    if docker exec "$cid" mariadb -uroot -proot -e 'SELECT 1' >/dev/null 2>&1; then
       ok=$((ok + 1))
       [ "$ok" -ge 3 ] && break
     else
@@ -52,15 +60,21 @@ if [ "$backend" = "mariadb" ]; then
     sleep 1
   done
   echo "== seeding MariaDB baseline =="
-  docker exec -i "$cid" mariadb -ucorpus -pcorpus corpus <<'SQL'
-DROP TABLE IF EXISTS people, teams;
-CREATE TABLE teams  (id INTEGER PRIMARY KEY, name VARCHAR(64) NOT NULL);
-CREATE TABLE people (id INTEGER PRIMARY KEY, name VARCHAR(64) NOT NULL, team_id INTEGER);
-INSERT INTO teams  (id, name)          VALUES (1,'Engineering'),(2,'Sales'),(3,'Marketing');
-INSERT INTO people (id, name, team_id) VALUES (1,'Ada',1),(2,'Grace',1),(3,'Linus',2),(4,'Margaret',NULL);
+  docker exec -i "$cid" mariadb -uroot -proot "$schema" <<SQL
+CREATE USER IF NOT EXISTS 'corpus'@'%' IDENTIFIED BY 'corpus';
+GRANT ALL PRIVILEGES ON \`$schema\`.* TO 'corpus'@'%';
+DROP TABLE IF EXISTS $people, $teams;
+CREATE TABLE $teams  (ID DECIMAL(38,0) PRIMARY KEY, NAME VARCHAR(64) NOT NULL);
+CREATE TABLE $people (ID DECIMAL(38,0) PRIMARY KEY, NAME VARCHAR(64) NOT NULL, TEAM_ID DECIMAL(38,0));
+INSERT INTO $teams  VALUES (1,'Engineering'),(2,'Sales'),(3,'Marketing');
+INSERT INTO $people VALUES (1,'Ada',1),(2,'Grace',1),(3,'Linus',2),(4,'Margaret',NULL);
 SQL
+  echo "== installing the DbSaci dictionary =="
+  cargo build --quiet --bin dbsaci
+  ./target/debug/dbsaci --backend mariadb --db-host 127.0.0.1 --db-port "$db_port" \
+    install --admin-user root --admin-password root
   export DBSACI_BACKEND=mariadb
-  export DBSACI_DB_NAME=corpus
+  export DBSACI_DB_NAME="$schema"
   export DBSACI_DB_PORT="$db_port"
 else
 if ! docker image inspect "$pg_image" >/dev/null 2>&1; then

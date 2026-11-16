@@ -14,7 +14,9 @@ use crate::credentials::Credentials;
 use crate::error::{Error, Result};
 use crate::mariadb::MariaDbBackend;
 use crate::tns::{PacketType, SduMode, TnsStream, build_accept_response};
-use crate::wire::{self, build_dml_response, build_error_response, build_error_response_at};
+use crate::wire::{
+    self, BindValue, build_dml_response, build_error_response, build_error_response_at,
+};
 
 static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(1);
 /// Process-wide counters exposed on `/metrics` (Prometheus text format).
@@ -182,6 +184,11 @@ pub struct Config {
     pub tls_key: Option<std::path::PathBuf>,
     /// Require TLS when opening the backend connection.
     pub db_ssl: bool,
+    /// PEM CA bundle for the backend's TLS certificate (MariaDB).
+    pub db_ssl_ca: Option<std::path::PathBuf>,
+    /// Refuse new clients beyond this many concurrent sessions (each holds a
+    /// backend connection). `None`: no limit.
+    pub max_sessions: Option<usize>,
 }
 
 /// The Oracle release DbSaci impersonates on the wire.
@@ -247,6 +254,8 @@ impl Default for Config {
             tls_cert: None,
             tls_key: None,
             db_ssl: false,
+            db_ssl_ca: None,
+            max_sessions: None,
         }
     }
 }
@@ -327,7 +336,23 @@ impl Server {
                     break;
                 }
             };
-            let (stream, addr) = accepted?;
+            // A failed accept (EMFILE during a connection storm, a reset
+            // during the handshake) must not stop the listener.
+            let (stream, addr) = match accepted {
+                Ok(a) => a,
+                Err(e) => {
+                    warn!(%e, "accept failed; retrying");
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    continue;
+                }
+            };
+            if let Some(max) = self.config.max_sessions
+                && ACTIVE_SESSIONS.load(Ordering::Relaxed) >= max as u64
+            {
+                warn!(%addr, max, "session limit reached; refusing connection");
+                drop(stream);
+                continue;
+            }
             let session_id = NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed);
             if let Err(error) = SockRef::from(&stream).set_keepalive(true) {
                 warn!(session_id, %addr, %error, "could not enable TCP keepalive");
@@ -923,13 +948,17 @@ async fn handle_connection(mut tns: TnsStream, session_id: u64, config: Config) 
             }
         },
         BackendKind::MariaDb => match MariaDbBackend::connect(
-            &config.db_host,
-            config.db_port,
+            &crate::mariadb::MariaDbConfig {
+                host: config.db_host.clone(),
+                port: config.db_port,
+                default_db: config.db_name.clone(),
+                statement_timeout: config.statement_timeout,
+                ssl: config.db_ssl,
+                ssl_ca: config.db_ssl_ca.clone(),
+                case: config.identifier_case,
+            },
             &username,
             &db_password,
-            &config.db_name,
-            config.statement_timeout,
-            config.db_ssl,
         )
         .await
         {
@@ -994,6 +1023,10 @@ async fn handle_connection(mut tns: TnsStream, session_id: u64, config: Config) 
     // "no more rows".
     let mut closed_by_commit: std::collections::HashSet<u16> = std::collections::HashSet::new();
     loop {
+        if backend.session_lost() {
+            warn!("backend session lost with uncommitted work; closing the client connection");
+            break;
+        }
         let req = tns.read_message().await?;
         match req.packet_type {
             PacketType::Data => {
@@ -1067,7 +1100,10 @@ async fn handle_connection(mut tns: TnsStream, session_id: u64, config: Config) 
                                     .or(last_execute.as_ref());
                                 match hint {
                                     Some((sql, types)) => {
-                                        wire::parse_reexecute_request(&payload, sql, types)
+                                        wire::parse_execute_values_scan(&payload, sql, types)
+                                            .or_else(|_| {
+                                                wire::parse_reexecute_request(&payload, sql, types)
+                                            })
                                     }
                                     None => wire::parse_execute_request(&payload),
                                 }
@@ -1262,11 +1298,7 @@ async fn handle_connection(mut tns: TnsStream, session_id: u64, config: Config) 
                                 continue;
                             }
                         };
-                        let pg_sql = match crate::translate::oracle_to_backend(
-                            &bound.sql,
-                            config.backend,
-                            config.identifier_case,
-                        ) {
+                        let pg_sql = match backend.translate(&bound.sql, &bound.binds) {
                             Ok(s) => s,
                             Err(e) => {
                                 write_error_response(
@@ -1339,6 +1371,46 @@ async fn handle_connection(mut tns: TnsStream, session_id: u64, config: Config) 
                         continue;
                     }
 
+                    if let Some(result) = backend.session_statement(&execute.sql).await {
+                        let result = match result {
+                            Ok(n) => autocommit_after(backend.as_ref(), autocommit)
+                                .await
+                                .map(|()| n),
+                            err => err,
+                        };
+                        match result {
+                            Ok(n) => {
+                                let resp = if oci_dialect {
+                                    wire::build_dml_response_oci(
+                                        n,
+                                        cursor_id,
+                                        req_seq,
+                                        wire::DmlKind::of(&execute.sql),
+                                    )
+                                } else if newer_describe_framing {
+                                    wire::build_dml_response_jdbc(n, req_seq)
+                                } else {
+                                    build_dml_response(n)
+                                };
+                                tns.write_packet(PacketType::Data, &resp).await?;
+                            }
+                            Err(e) => {
+                                let (code, message, error_pos) = oracle_error_for_pos(&e);
+                                write_error_response(
+                                    &mut tns,
+                                    oci_dialect,
+                                    response_completion,
+                                    newer_describe_framing,
+                                    code,
+                                    &message,
+                                    error_pos,
+                                    req_seq,
+                                )
+                                .await?;
+                            }
+                        }
+                        continue;
+                    }
                     if let Some((ora, detail)) =
                         crate::ttc::reject_unsupported_sql(&execute.sql, config.backend)
                     {
@@ -1355,32 +1427,49 @@ async fn handle_connection(mut tns: TnsStream, session_id: u64, config: Config) 
                         .await?;
                         continue;
                     }
-                    let bound =
-                        match wire::bind_parameters(&execute.sql, &execute.binds, bind_style) {
-                            Ok(bound) => bound,
-                            Err(e) => {
-                                write_error_response(
-                                    &mut tns,
-                                    oci_dialect,
-                                    response_completion,
-                                    newer_describe_framing,
-                                    1008,
-                                    &e.to_string(),
-                                    0,
-                                    req_seq,
-                                )
-                                .await?;
-                                continue;
-                            }
-                        };
+                    // For a batch, translate with a template row that has each
+                    // column's first non-NULL value, so a NULL in the first row
+                    // does not fix the wrong placeholder type for later rows
+                    // (e.g. binary data through a character cast).
+                    let template: Vec<BindValue> = if execute.bind_rows.len() > 1 {
+                        (0..execute
+                            .binds
+                            .len()
+                            .max(execute.bind_rows.first().map_or(0, Vec::len)))
+                            .map(|c| {
+                                execute
+                                    .bind_rows
+                                    .iter()
+                                    .filter_map(|r| r.get(c))
+                                    .find(|v| !matches!(v, BindValue::Null))
+                                    .cloned()
+                                    .unwrap_or(BindValue::Null)
+                            })
+                            .collect()
+                    } else {
+                        execute.binds.clone()
+                    };
+                    let bound = match wire::bind_parameters(&execute.sql, &template, bind_style) {
+                        Ok(bound) => bound,
+                        Err(e) => {
+                            write_error_response(
+                                &mut tns,
+                                oci_dialect,
+                                response_completion,
+                                newer_describe_framing,
+                                1008,
+                                &e.to_string(),
+                                0,
+                                req_seq,
+                            )
+                            .await?;
+                            continue;
+                        }
+                    };
                     debug!(bind_count = execute.binds.len(), "executing statement");
 
                     // Translate Oracle-specific structural syntax before executing it.
-                    let pg_sql = match crate::translate::oracle_to_backend(
-                        &bound.sql,
-                        config.backend,
-                        config.identifier_case,
-                    ) {
+                    let pg_sql = match backend.translate(&bound.sql, &bound.binds) {
                         Ok(sql) => sql,
                         Err(e) => {
                             write_error_response(
@@ -1419,7 +1508,30 @@ async fn handle_connection(mut tns: TnsStream, session_id: u64, config: Config) 
                         let is_ddl = is_ddl_statement(&pg_sql);
                         let mut total: u64 = 0;
                         let mut failed: Option<Error> = None;
+                        let mut row_binds = Vec::with_capacity(execute.bind_rows.len());
                         for row in &execute.bind_rows {
+                            match wire::bind_parameters(&execute.sql, row, bind_style) {
+                                Ok(b) => row_binds.push(b.binds),
+                                Err(e) => {
+                                    failed = Some(e);
+                                    break;
+                                }
+                            }
+                        }
+                        if !is_ddl && failed.is_none() {
+                            match race_break(
+                                &mut tns,
+                                backend.as_ref(),
+                                backend.execute_batch(&pg_sql, &row_binds),
+                            )
+                            .await?
+                            {
+                                Ok(n) => total = n,
+                                Err(e) => failed = Some(e),
+                            }
+                            row_binds.clear();
+                        }
+                        for row in execute.bind_rows.iter().take(row_binds.len()) {
                             let row_bound =
                                 match wire::bind_parameters(&execute.sql, row, bind_style) {
                                     Ok(b) => b,

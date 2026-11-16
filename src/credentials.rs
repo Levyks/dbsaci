@@ -89,6 +89,13 @@ impl Credentials {
             .or(self.fallback.as_deref())
     }
 
+    /// The named logins (lower case), sorted.
+    pub fn users(&self) -> Vec<String> {
+        let mut u: Vec<String> = self.users.keys().cloned().collect();
+        u.sort();
+        u
+    }
+
     pub fn named_user_count(&self) -> usize {
         self.users.len()
     }

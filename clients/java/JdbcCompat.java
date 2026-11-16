@@ -87,6 +87,31 @@ public class JdbcCompat {
             }
             c.commit();
         }
+        // Oracle's transaction model with autoCommit=true (the JDBC / HikariCP
+        // default): writes persist without COMMIT, a session sees other
+        // sessions' commits on its next statement, a reused PreparedStatement
+        // re-executes.
+        try (Connection setup = DriverManager.getConnection(url, user, pw); Statement s = setup.createStatement()) {
+            try { s.execute("DROP TABLE jdbc_ac"); } catch (SQLException ignore) {}
+            s.execute("CREATE TABLE jdbc_ac (n NUMBER(10))");
+        }
+        try (Connection w = DriverManager.getConnection(url, user, pw);
+             PreparedStatement p = w.prepareStatement("INSERT INTO jdbc_ac VALUES (?)")) {
+            w.setAutoCommit(true);
+            int sum = 0;
+            for (int i = 1; i <= 3; i++) { p.setInt(1, i); sum += p.executeUpdate(); }
+            check("prepared_reexecute", sum, 3);
+        }
+        try (Connection r = DriverManager.getConnection(url, user, pw);
+             Connection w = DriverManager.getConnection(url, user, pw);
+             PreparedStatement q = r.prepareStatement("SELECT COUNT(*) FROM jdbc_ac")) {
+            r.setAutoCommit(false);
+            try (ResultSet rs = q.executeQuery()) { rs.next(); check("autocommit_write_persists", rs.getInt(1), 3); }
+            w.setAutoCommit(true);
+            try (Statement s = w.createStatement()) { s.executeUpdate("INSERT INTO jdbc_ac VALUES (4)"); }
+            try (ResultSet rs = q.executeQuery()) { rs.next(); check("next_statement_sees_other_commit", rs.getInt(1), 4); }
+            try (Statement s = w.createStatement()) { s.execute("DROP TABLE jdbc_ac"); }
+        }
         System.out.printf("%n%d/%d checks passed%n", pass, pass + fail);
         System.exit(fail == 0 ? 0 : 1);
     }

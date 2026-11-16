@@ -47,6 +47,17 @@ pub trait OracleBackend: Send + Sync {
     ) -> Result<(u64, Vec<Vec<Option<Vec<u8>>>>)>;
     async fn cancel(&self);
 
+    /// Run one DML statement for many bind rows (array DML / JDBC batch);
+    /// returns the summed row count. Stops at the first failing row, whose
+    /// error is returned; the rows before it stay applied (Oracle).
+    async fn execute_batch(&self, sql: &str, rows: &[Vec<BindValue>]) -> Result<u64> {
+        let mut total = 0;
+        for row in rows {
+            total += self.execute_simple(sql, row).await?;
+        }
+        Ok(total)
+    }
+
     /// Commit the session's transaction.
     async fn commit(&self) -> Result<()> {
         self.execute_simple("COMMIT", &[]).await.map(|_| ())
@@ -62,6 +73,27 @@ pub trait OracleBackend: Send + Sync {
     /// closes them on commit and a later fetch gets ORA-01002.
     fn cursors_survive_commit(&self) -> bool {
         false
+    }
+
+    /// The backend connection is gone with uncommitted work; the session
+    /// loop closes the client connection (the client sees ORA-03113).
+    fn session_lost(&self) -> bool {
+        false
+    }
+
+    /// Statements the backend handles itself, before translation (session
+    /// settings, transaction control). `None`: translate and execute as usual.
+    async fn session_statement(&self, _oracle_sql: &str) -> Option<Result<u64>> {
+        None
+    }
+
+    /// Translate client SQL (binds already replaced by placeholders).
+    fn translate(&self, oracle_sql: &str, _binds: &[BindValue]) -> Result<String> {
+        crate::translate::oracle_to_backend(
+            oracle_sql,
+            BackendKind::Postgres,
+            crate::translate::IdentifierCase::default(),
+        )
     }
 }
 

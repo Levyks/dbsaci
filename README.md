@@ -10,7 +10,7 @@ instead of at an Oracle database, and DbSaci:
 1. terminates the Oracle client handshake and authentication,
 2. translates the Oracle SQL dialect it understands into backend SQL,
 3. runs the query against PostgreSQL + [`orafce`](https://github.com/orafce/orafce)
-   or MariaDB 11.4 in `SQL_MODE=ORACLE`,
+   or MariaDB 11.8+ in `SQL_MODE=ORACLE`,
 4. re-encodes the backend result back into Oracle's binary framing.
 
 The application keeps its Oracle driver, its connection string shape, and most of
@@ -43,12 +43,11 @@ exactly as they are.
 
 ## Requirements
 
-- **PostgreSQL** (recent release) with the **`orafce`** extension available
-  (`CREATE EXTENSION orafce`), or **MariaDB 11.4+**. DbSaci sets
-  `SQL_MODE=ORACLE` on every backend session itself and folds table identifiers
-  to **upper** case by default (`--identifier-case upper|lower`), so the MariaDB
-  server needs no special `lower_case_table_names` setting. A PostgreSQL test
-  image is built from `testcontainers/Dockerfile`.
+- **MariaDB 11.8+** (stock server, any `lower_case_table_names`; DbSaci sets
+  `SQL_MODE=ORACLE` and the rest of the session itself), or **PostgreSQL**
+  (recent release) with the **`orafce`** extension available
+  (`CREATE EXTENSION orafce`). A PostgreSQL test image is built from
+  `testcontainers/Dockerfile`.
 - **Rust** (stable, 2024 edition) to build DbSaci.
 - A login role on the selected backend for the proxy to connect as; one Oracle
   session maps to one dedicated backend connection, so size the backend's
@@ -74,19 +73,30 @@ DBSACI_DB_NAME=postgres DBSACI_DB_PASSWORD=<role-password> \
 cargo run --bin dbsaci
 ```
 
-For MariaDB, set `DBSACI_BACKEND=mariadb` and point the same options at it
-(no server-side `sql-mode` or `lower-case-table-names` needed):
+For MariaDB, set `DBSACI_BACKEND=mariadb` (port defaults to 3306). An Oracle
+user `APPUSER` is the MariaDB account `appuser` and works in the database
+`APPUSER` (Oracle's schema == user; `--db-name` names a fallback database for
+logins without one). No server-side `sql-mode` or `lower-case-table-names`
+setting is needed:
 
 ```bash
-docker run -d --name dbsaci-mariadb \
-  -e MARIADB_ROOT_PASSWORD=root \
-  -e MARIADB_DATABASE=appdb -e MARIADB_USER=appuser -e MARIADB_PASSWORD=apppw \
-  -p 3306:3306 mariadb:11.4
+docker run -d --name dbsaci-mariadb -e MARIADB_ROOT_PASSWORD=root \
+  -e MARIADB_DATABASE=APPUSER -e MARIADB_USER=appuser -e MARIADB_PASSWORD=apppw \
+  -p 3306:3306 mariadb:11.8
 
-DBSACI_BACKEND=mariadb \
-DBSACI_DB_HOST=127.0.0.1 DBSACI_DB_PORT=3306 \
-DBSACI_DB_NAME=appdb DBSACI_DB_PASSWORD=apppw \
-cargo run --bin dbsaci
+# once per server (and after upgrading DbSaci): the Oracle data dictionary
+dbsaci --backend mariadb --db-host 127.0.0.1 install --admin-password root
+
+# is everything in place for this login?
+dbsaci --backend mariadb --db-host 127.0.0.1 --db-user appuser:apppw check --user appuser
+
+# load an existing Oracle schema script (SQL*Plus style); without --apply it
+# only prints the translation and what it could not translate
+dbsaci --backend mariadb --db-host 127.0.0.1 --db-user appuser:apppw \
+  migrate schema.sql --apply --user appuser
+
+# run the proxy
+dbsaci --backend mariadb --db-host 127.0.0.1 --db-user appuser:apppw
 ```
 
 See the [compatibility matrix](https://levyks.github.io/dbsaci/compatibility/)
@@ -94,8 +104,8 @@ for the backend-by-backend feature status.
 
 Then connect any Oracle client to `//host:1521/FREEPDB1`.
 
-Or run it from a container (`levyks/dbsaci:0.2.0`) —
-`docker run -p 1521:1521 -e DBSACI_DB_HOST=… levyks/dbsaci:0.2.0`. See the
+Or run it from a container (`levyks/dbsaci:0.3.0`) —
+`docker run -p 1521:1521 -e DBSACI_DB_HOST=… levyks/dbsaci:0.3.0`. See the
 [docs](https://levyks.github.io/dbsaci/getting-started/) for a full
 docker-compose.
 
@@ -141,31 +151,54 @@ Oracle's *schema == user*.
   `ALTER SESSION SET CURRENT_SCHEMA`. If the role can't `CREATE` a schema the
   connection still works and logs a warning.
 * **MariaDB** — a database is the schema, and `USE` selects exactly one (there is
-  no `search_path`). DbSaci issues `USE <user>` when a database of that name
-  exists, otherwise `USE <DBSACI_DB_NAME>`. So: give each Oracle login its own
-  database, or point every login at one shared `DBSACI_DB_NAME` and qualify
-  cross-schema references. `ALTER SESSION SET CURRENT_SCHEMA = x` maps to
-  `USE x`.
+  no `search_path`). A session starts in the database named after the login
+  (the Oracle name, e.g. `APPUSER`; see below for case), otherwise in
+  `--db-name`. Other schemas are reached by qualifying (`SELECT * FROM hr.emp`,
+  with grants) or `ALTER SESSION SET CURRENT_SCHEMA = hr`.
 
-### Identifiers and collation (MariaDB)
+### Identifiers (MariaDB)
 
-Identifiers in table-name position are folded to one case — via `sqlparser`'s
-relation visitor, falling back to a text scan only for syntax it cannot
-represent (anonymous PL/SQL blocks, some DDL bodies) — so `FROM MY_TABLE` /
-`FROM my_table` / `FROM "MY_TABLE"` all resolve the same backend object no
-matter how `lower_case_table_names` is set on the server. `--identifier-case
-upper|lower` / `DBSACI_IDENTIFIER_CASE` picks the direction; **`upper` is the
-default**, matching Oracle's own unquoted-identifier behaviour (and how a
-vendored `data.sql`-style schema is already spelled) — author the MariaDB
-schema in that case, or pass `lower` to match the PostgreSQL/MariaDB
-convention instead. Genuinely mixed-case quoted identifiers (`"MixedCase"`,
-`` `MixedCase` ``) are left exactly as written — the deliberate case-sensitive
-escape hatch — and `DUAL` is never touched. This has no effect on the
-PostgreSQL backend, which folds unquoted identifiers to lower case itself.
+DbSaci applies Oracle's rule once, when it reads a statement: every **unquoted**
+word is upper-cased, a **quoted** identifier is taken exactly as written —
+whatever the word is (table, view, sequence, alias, schema, column). So
+`CREATE VIEW v`, `DROP TABLE emp`, `REFERENCES emp(id)`, `seq.NEXTVAL` and
+`SELECT E.ID FROM emp e` all reach the same backend object however they are
+spelled. Literals, comments and binds are never touched.
 
-The session's `collation_connection` is pinned to the current schema's default
-collation so string literals in client SQL aggregate cleanly with the schema's
-columns (no `ER_CANT_AGGREGATE_2COLLATIONS` against `utf8mb4_uca1400_ai_ci`).
+How those Oracle names are *stored* matters only on a server with
+case-sensitive table names (`lower_case_table_names=0`, the Linux default):
+
+* `--identifier-case upper` (default): MariaDB names are the Oracle names
+  (`EMP`, `"MixedCase"`). The backend schema *is* the Oracle schema.
+* `--identifier-case lower`: Oracle-normal names are stored in lower case
+  (`emp`), for schemas authored in the MariaDB convention.
+
+A server with `lower_case_table_names=1|2` stores everything in lower case
+itself; DbSaci detects that and maps names back accordingly (quoted mixed-case
+names lose their case there). `dbsaci check` explains what it found.
+
+### Data dictionary (MariaDB)
+
+`ALL_*` / `USER_*` / `SYS.*` views, `V$VERSION`, `NLS_SESSION_PARAMETERS`,
+`SYS_CONTEXT`, `DBMS_OUTPUT`, `DBMS_METADATA.GET_DDL` and a few Oracle
+functions MariaDB lacks live in one database, `dbsaci_sys`, installed once per
+server and DbSaci version (`dbsaci install`, or automatically on first connect
+when the login may create it). The views run with the caller's rights, so
+`ALL_TABLES` shows what that account can see. Nothing is created in
+application schemas; `dbsaci install --drop-legacy` removes what 0.2.x left
+there.
+
+### Transactions (MariaDB)
+
+Oracle's model: a transaction starts with the first statement and every
+statement sees what was committed before it began (`READ COMMITTED`; no stale
+snapshots in pooled sessions). DDL commits. Autocommit from the driver
+(JDBC/HikariCP default, `connection.autocommit = True`) commits after each
+call. A clean logoff commits; a dropped connection rolls back.
+`SET TRANSACTION ISOLATION LEVEL SERIALIZABLE` gives a transaction snapshot,
+`READ ONLY` rejects writes. Cursors stay fetchable across `COMMIT`. If the
+backend connection is lost with uncommitted work, the session ends with
+`ORA-03113` instead of silently continuing on a new connection.
 
 ## What works
 
