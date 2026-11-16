@@ -1,14 +1,16 @@
 //! Golden tests for `dbsaci::translate::oracle_to_postgres` — pure string→string
 //! SQL translation, no backend. Cases live in `tests/corpus/translate/*.txt`,
 //! one per line as `oracle SQL  =>  expected PostgreSQL`, or `oracle SQL  =>  !`
-//! to assert the translator rejects it.
+//! to assert the translator rejects it. `translate/mariadb/*.txt` holds the
+//! `oracle_to_mariadb` goldens in the same format; a multi-statement batch is
+//! written with its statements separated by ` ;; `.
 //!
 //! `#[test] fn translate_goldens` walks every file so a bad line names its file
 //! and line number.
 
 use std::path::Path;
 
-use dbsaci::translate::{oracle_to_mariadb, oracle_to_postgres};
+use dbsaci::translate::{MARIADB_BATCH_SEP, oracle_to_mariadb, oracle_to_postgres};
 
 const DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/corpus/translate");
 const MARIADB_DIR: &str = concat!(
@@ -119,7 +121,8 @@ fn translate_goldens_mariadb() {
             let input = input.trim();
             let expected = expected.trim();
             count += 1;
-            let got = oracle_to_mariadb(input);
+            // a multi-statement batch is written ` ;; `-separated
+            let got = oracle_to_mariadb(input).map(|s| s.replace(MARIADB_BATCH_SEP, " ;; "));
             match (expected, got) {
                 ("!", Ok(out)) => failures.push(format!(
                     "{}:{}: expected rejection, translated to `{out}`\n    input: {input}",

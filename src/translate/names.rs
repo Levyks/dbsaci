@@ -42,6 +42,7 @@ impl IdentifierCase {
     }
 
     /// Kept for callers that fold a bare word (unquoted spelling).
+    #[allow(dead_code)]
     pub(crate) fn apply(self, s: &str) -> String {
         self.physical(&s.to_ascii_uppercase())
     }
