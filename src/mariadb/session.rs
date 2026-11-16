@@ -224,6 +224,14 @@ fn connect_error(e: mysql_async::Error, schema: &str) -> Error {
         mysql_async::Error::Server(s) if s.code == 1049 => {
             Error::ora(1918, format!("user (schema) '{schema}' does not exist"))
         }
+        // No grants on the database: MariaDB answers "access denied" rather
+        // than revealing whether it exists. Either way the login has no usable
+        // schema of that name (and `dbsaci check`, which reads SCHEMATA, sees
+        // it the same way), so the caller may fall back to the default one.
+        mysql_async::Error::Server(s) if s.code == 1044 => Error::ora(
+            1918,
+            format!("user (schema) '{schema}' does not exist or is not accessible"),
+        ),
         mysql_async::Error::Server(s) if s.code == 1040 => {
             Error::ora(18, "maximum number of sessions exceeded")
         }
@@ -1285,6 +1293,13 @@ async fn installed_version(conn: &mut Conn) -> Option<String> {
 
 /// Run every install statement, then the grants (best-effort).
 pub async fn install(conn: &mut Conn) -> Result<()> {
+    // Literals in view definitions take the connection collation.
+    conn.query_drop(format!(
+        "SET NAMES utf8mb4 COLLATE {}",
+        super::install::COLLATION
+    ))
+    .await
+    .map_err(|e| errors::map_error(e, "SET NAMES").error)?;
     for stmt in super::install::install_statements() {
         conn.query_drop(&stmt).await.map_err(|e| {
             let m = errors::map_error(e, &stmt).error;

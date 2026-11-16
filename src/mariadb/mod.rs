@@ -608,10 +608,11 @@ pub async fn install_dictionary(
                     .await
                     .ok()
                     .flatten();
-                let ours = def.is_some_and(|d| {
-                    let d = d.to_ascii_lowercase();
-                    d.contains("information_schema") || d.contains("where 1 = 0")
-                });
+                // 0.2.x defined these over information_schema, over each
+                // other (user_* over all_*), or over DUAL; any view with one of
+                // these Oracle dictionary names in an application schema is
+                // DbSaci's (an application table of that name is never a view).
+                let ours = def.is_some();
                 if ours && conn.query_drop(format!("DROP VIEW {}", q(v))).await.is_ok() {
                     report.push(format!("dropped view {db}.{v}"));
                 }

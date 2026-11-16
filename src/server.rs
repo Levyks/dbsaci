@@ -383,8 +383,14 @@ impl Server {
                         handle_connection(crate::tns::TnsStream::new(stream), session_id, config)
                             .await
                     };
-                    if let Err(e) = outcome {
-                        warn!("connection handler error: {}", e);
+                    match outcome {
+                        // A peer that connects and closes without a TNS
+                        // packet (a load-balancer / reachability probe).
+                        Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                            debug!("connection closed before any TNS packet: {}", e)
+                        }
+                        Err(e) => warn!("connection handler error: {}", e),
+                        Ok(()) => {}
                     }
                 }
                 .instrument(info_span!("oracle_session", session_id, %addr)),

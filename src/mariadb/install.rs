@@ -8,7 +8,7 @@
 use super::dictionary::{RELATIONS, SCHEMA};
 
 /// Bump on any change to the objects below.
-pub const VERSION: &str = "0.3.0-2026-11-16.3";
+pub const VERSION: &str = "0.3.1-2026-11-16.2";
 
 /// Schemas that are MariaDB's own, not Oracle objects; hidden from ALL_*.
 const SYSTEM_SCHEMAS: &str =
@@ -631,23 +631,83 @@ fn view_definitions() -> Vec<(&'static str, String)> {
     v
 }
 
+/// The one collation of everything DbSaci installs. Binary, like Oracle's
+/// dictionary comparisons. Pinned explicitly because MariaDB otherwise mixes
+/// the server collation (`collation_server`, used for routine parameters and
+/// results) with `character_set_collations` (used for literals and new
+/// databases from 11.x), and comparing the two raises "Illegal mix of
+/// collations".
+pub const COLLATION: &str = "utf8mb4_bin";
+
+/// Give every character type in a stored-routine definition (`VARCHAR(n)`,
+/// `TEXT`, in parameters, return types and local variables) an explicit
+/// charset and [`COLLATION`].
+fn pin_collation(ddl: &str) -> String {
+    let mut out = String::with_capacity(ddl.len() + 128);
+    let bytes = ddl.as_bytes();
+    let mut i = 0;
+    let mut in_lit = false;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if c == b'\'' {
+            in_lit = !in_lit;
+            out.push('\'');
+            i += 1;
+            continue;
+        }
+        let word_start =
+            !in_lit && (i == 0 || !(bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_'));
+        let rest = &ddl[i..];
+        let up = rest.get(..8).unwrap_or(rest).to_ascii_uppercase();
+        let ty_len = if word_start && up.starts_with("VARCHAR(") {
+            rest.find(')').map(|e| e + 1)
+        } else if word_start
+            && up.starts_with("TEXT")
+            && !rest[4..].starts_with(|ch: char| ch.is_ascii_alphanumeric() || ch == '_')
+        {
+            Some(4)
+        } else {
+            None
+        };
+        if let Some(n) = ty_len {
+            out.push_str(&rest[..n]);
+            if !rest[n..]
+                .trim_start()
+                .to_ascii_uppercase()
+                .starts_with("CHARACTER SET")
+            {
+                out.push_str(&format!(" CHARACTER SET utf8mb4 COLLATE {COLLATION}"));
+            }
+            i += n;
+            continue;
+        }
+        let ch = rest.chars().next().unwrap_or(' ');
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
 /// Every statement of an install, in order (idempotent: `CREATE OR REPLACE`).
 pub fn install_statements() -> Vec<String> {
     let mut out = vec![
-        format!("CREATE DATABASE IF NOT EXISTS {SCHEMA} CHARACTER SET utf8mb4"),
+        format!("CREATE DATABASE IF NOT EXISTS {SCHEMA} CHARACTER SET utf8mb4 COLLATE {COLLATION}"),
+        // An existing (older) install may have been created with the server's
+        // default collation.
+        format!("ALTER DATABASE {SCHEMA} CHARACTER SET utf8mb4 COLLATE {COLLATION}"),
         format!(
             "CREATE TABLE IF NOT EXISTS {SCHEMA}.install_info \
              (only_one TINYINT PRIMARY KEY DEFAULT 1, version VARCHAR(64) NOT NULL)"
         ),
     ];
-    out.extend(SESSION_ROUTINES.iter().map(|s| s.to_string()));
-    out.extend(COMPAT_FUNCTIONS.iter().map(|s| s.to_string()));
+    out.extend(SESSION_ROUTINES.iter().map(|s| pin_collation(s)));
+    out.extend(COMPAT_FUNCTIONS.iter().map(|s| pin_collation(s)));
     // The translator's runtime helpers (ORA errors raised at run time, RR
     // dates, TO_DATE validation, date TRUNC/ROUND, number masks).
     out.extend(
         crate::translate::mariadb::HELPERS
             .iter()
-            .map(|(_, ddl)| ddl.replacen(" FUNCTION ", " FUNCTION dbsaci_sys.", 1)),
+            .map(|(_, ddl)| pin_collation(&ddl.replacen(" FUNCTION ", " FUNCTION dbsaci_sys.", 1))),
     );
     for (name, select) in view_definitions() {
         out.push(format!(
@@ -688,6 +748,8 @@ pub fn legacy_object_names() -> (Vec<&'static str>, Vec<&'static str>) {
         "sys_context",
         "sessiontimezone",
         "dbtimezone",
+        "dbms_output.put_line",
+        "dbms_metadata.get_ddl",
     ];
     (views, routines)
 }
@@ -695,6 +757,27 @@ pub fn legacy_object_names() -> (Vec<&'static str>, Vec<&'static str>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn routine_character_types_get_one_collation() {
+        let ddl = pin_collation(
+            "CREATE FUNCTION f(a VARCHAR(10), t TEXT) RETURN VARCHAR(255) AS v TEXT; \
+             BEGIN RETURN CONCAT('TEXT', a); END",
+        );
+        assert_eq!(ddl.matches("COLLATE utf8mb4_bin").count(), 4, "{ddl}");
+        assert!(ddl.contains("'TEXT'"));
+        for stmt in install_statements() {
+            if stmt.contains(" FUNCTION ") || stmt.contains(" PROCEDURE ") {
+                let bare = stmt.to_ascii_uppercase().matches("VARCHAR(").count();
+                let pinned = stmt.matches("COLLATE utf8mb4_bin").count();
+                assert!(
+                    pinned >= bare,
+                    "unpinned type in: {}",
+                    &stmt[..80.min(stmt.len())]
+                );
+            }
+        }
+    }
 
     #[test]
     fn every_listed_relation_is_installed() {

@@ -469,7 +469,18 @@ impl TestBackend {
             .with_exposed_port(ContainerPort::Tcp(3306))
             .with_env_var("MARIADB_ALLOW_EMPTY_ROOT_PASSWORD", "yes")
             .with_env_var("MARIADB_DATABASE", corpus_db.clone())
-            .with_cmd([format!("--lower-case-table-names={lctn}")])
+            // `DBSACI_TEST_MARIADB_ARGS`: extra server options, e.g.
+            // `--collation-server=utf8mb4_unicode_ci` (an older server default
+            // that the dictionary install must cope with).
+            .with_cmd(
+                std::iter::once(format!("--lower-case-table-names={lctn}")).chain(
+                    std::env::var("DBSACI_TEST_MARIADB_ARGS")
+                        .unwrap_or_default()
+                        .split_whitespace()
+                        .map(str::to_string)
+                        .collect::<Vec<_>>(),
+                ),
+            )
             .start()
             .await
             .map_err(|e| format!("start MariaDB container: {e}"))?;

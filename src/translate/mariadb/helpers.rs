@@ -25,7 +25,7 @@ pub const HELPERS: &[(&str, &str)] = &[
         "CREATE OR REPLACE FUNCTION dbsaci_str_to_date(s TEXT, f VARCHAR(255), rr INT) \
            RETURN DATETIME(6) NOT DETERMINISTIC NO SQL AS d DATETIME(6); y INT; m INT; dd INT; BEGIN \
            IF s IS NULL THEN RETURN NULL; END IF; \
-           BEGIN d := STR_TO_DATE(s, f); EXCEPTION WHEN OTHERS THEN d := NULL; END; \
+           BEGIN d := STR_TO_DATE(s COLLATE utf8mb4_general_ci, f COLLATE utf8mb4_general_ci); EXCEPTION WHEN OTHERS THEN d := NULL; END; \
            IF d IS NULL THEN SIGNAL SQLSTATE '45000' \
              SET MESSAGE_TEXT = 'ORA-01861: literal does not match format string'; END IF; \
            y := YEAR(d); m := MONTH(d); dd := DAY(d); \

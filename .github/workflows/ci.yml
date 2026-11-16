@@ -61,7 +61,7 @@ jobs:
           - { image: "mariadb:11.8", lctn: "0", case: upper }
           - { image: "mariadb:11.8", lctn: "0", case: lower }
           - { image: "mariadb:11.8", lctn: "1", case: upper }
-          - { image: "mariadb:12.3", lctn: "0", case: upper }
+          - { image: "mariadb:12.3", lctn: "0", case: upper, args: "--collation-server=utf8mb4_unicode_ci --character-set-server=utf8mb4" }
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -73,6 +73,7 @@ jobs:
           DBSACI_TEST_MARIADB_IMAGE: ${{ matrix.image }}
           DBSACI_TEST_MARIADB_LCTN: ${{ matrix.lctn }}
           DBSACI_IDENTIFIER_CASE: ${{ matrix.case }}
+          DBSACI_TEST_MARIADB_ARGS: ${{ matrix.args }}
         run: cargo test --test corpus -- --test-threads=1
 
   # Real third-party Oracle drivers. Assertions are Oracle-correct; with

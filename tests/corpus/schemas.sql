@@ -82,9 +82,10 @@ SELECT COUNT(*) FROM regions
 -- end
 
 -- case: get_ddl_resolves_in_the_user_schema
-# known-gap (mariadb): tracked in expected-failures.mariadb — no dbms_metadata.get_ddl on MariaDB
+# The DDL names the table in the user's schema (identifier case is the
+# backend's: compare case-insensitively).
 -- setup: CREATE TABLE ddl_probe (id NUMBER PRIMARY KEY, label VARCHAR2(20))
-SELECT CASE WHEN dbms_metadata.get_ddl('TABLE', 'DDL_PROBE', 'CORPUS') LIKE '%corpus.ddl_probe%'
+SELECT CASE WHEN UPPER(dbms_metadata.get_ddl('TABLE', 'DDL_PROBE', 'CORPUS')) LIKE '%CORPUS.DDL_PROBE%'
             THEN 'ok' ELSE 'miss' END FROM dual
 -- expect:
 ok
