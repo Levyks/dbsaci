@@ -454,7 +454,11 @@ impl TestBackend {
     }
 
     async fn start_mariadb(fixtures: Vec<String>) -> Result<Self, String> {
-        let container = GenericImage::new("mariadb", "11.4")
+        // `DBSACI_TEST_MARIADB_IMAGE=mariadb:<tag>` selects the server version.
+        let image = std::env::var("DBSACI_TEST_MARIADB_IMAGE")
+            .unwrap_or_else(|_| "mariadb:11.8".to_string());
+        let (repo, tag) = image.split_once(':').unwrap_or((image.as_str(), "latest"));
+        let container = GenericImage::new(repo, tag)
             .with_wait_for(WaitFor::seconds(8))
             .with_exposed_port(ContainerPort::Tcp(3306))
             .with_env_var("MARIADB_ALLOW_EMPTY_ROOT_PASSWORD", "yes")
