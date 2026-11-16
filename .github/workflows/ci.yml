@@ -45,11 +45,23 @@ jobs:
           DBSACI_CORPUS_LEDGER: "1"
         run: cargo test --test corpus -- --test-threads=1
 
-  # The same end-to-end corpus against MariaDB. Failures must match
-  # tests/corpus/expected-failures.mariadb exactly (ledger mode).
+  # The same end-to-end corpus against MariaDB, across the server settings an
+  # Oracle application can meet: case-sensitive table names (the Linux
+  # default) with both identifier cases, a case-folding server, and the newest
+  # release. One ledger for all of them — a result that depends on the setting
+  # is a bug. The login is a least-privilege account; the dictionary is
+  # installed by an administrator, as `dbsaci install` does.
   corpus-mariadb:
-    name: rust — corpus (MariaDB)
+    name: rust — corpus (MariaDB ${{ matrix.image }}, lctn=${{ matrix.lctn }}, ${{ matrix.case }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { image: "mariadb:11.8", lctn: "0", case: upper }
+          - { image: "mariadb:11.8", lctn: "0", case: lower }
+          - { image: "mariadb:11.8", lctn: "1", case: upper }
+          - { image: "mariadb:12.3", lctn: "0", case: upper }
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -58,6 +70,9 @@ jobs:
         env:
           DBSACI_CORPUS_BACKEND: mariadb
           DBSACI_CORPUS_LEDGER: "1"
+          DBSACI_TEST_MARIADB_IMAGE: ${{ matrix.image }}
+          DBSACI_TEST_MARIADB_LCTN: ${{ matrix.lctn }}
+          DBSACI_IDENTIFIER_CASE: ${{ matrix.case }}
         run: cargo test --test corpus -- --test-threads=1
 
   # Real third-party Oracle drivers. Assertions are Oracle-correct; with
