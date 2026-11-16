@@ -2125,6 +2125,24 @@ fn oracle_error_for_pos(error: &Error) -> (u32, String, u16) {
             detail.clone(),
             position.unwrap_or(0).min(u16::MAX as u32) as u16,
         ),
+        Error::Ora {
+            code,
+            message,
+            position,
+        } => {
+            return (
+                *code,
+                message.clone(),
+                position.unwrap_or(0).min(u16::MAX as u32) as u16,
+            );
+        }
+        Error::SessionLost(detail) => {
+            return (
+                3113,
+                format!("end-of-file on communication channel ({detail})"),
+                0,
+            );
+        }
         other => return (900, other.to_string(), 0),
     };
     let detail = &detail;

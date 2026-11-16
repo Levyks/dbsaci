@@ -28,6 +28,28 @@ pub enum Error {
         position: Option<u32>,
     },
     SqlParse(String),
+    /// An error that already has its Oracle identity: `ORA-<code>: <message>`
+    /// is what the client sees. `position` is the 1-based offset into the
+    /// statement, when known.
+    Ora {
+        code: u32,
+        message: String,
+        position: Option<u32>,
+    },
+    /// The backend connection was lost with uncommitted work: the session
+    /// cannot continue (ORA-03113), and the client connection is closed.
+    SessionLost(String),
+}
+
+impl Error {
+    /// An `Error::Ora` with no position.
+    pub fn ora(code: u32, message: impl Into<String>) -> Self {
+        Error::Ora {
+            code,
+            message: message.into(),
+            position: None,
+        }
+    }
 }
 
 impl fmt::Display for Error {
@@ -52,6 +74,8 @@ impl fmt::Display for Error {
             Error::Postgres(s) => write!(f, "postgres error: {s}"),
             Error::PgStatement { detail, .. } => write!(f, "postgres error: {detail}"),
             Error::SqlParse(s) => write!(f, "sql parse error: {s}"),
+            Error::Ora { code, message, .. } => write!(f, "ORA-{code:05}: {message}"),
+            Error::SessionLost(s) => write!(f, "ORA-03113: end-of-file on communication channel ({s})"),
         }
     }
 }
