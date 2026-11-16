@@ -28,8 +28,11 @@ Instead, use the source code of the open-source client driver [oracle-rs](https:
 ## 4. Backend Strategy: `orafce` and MariaDB Oracle mode
 Do **not** attempt to translate every Oracle function into native Postgres SQL manually. 
 For PostgreSQL, assume the backend has the [orafce extension](https://github.com/orafce/orafce) installed.
-For MariaDB, use MariaDB 11.4+ with `SQL_MODE=ORACLE`; the Rust adapter also
-installs its compatibility facade and applies backend-specific rewrites. Pass
+For MariaDB (the primary backend from 0.3.0), use MariaDB 11.8+ with
+`SQL_MODE=ORACLE`. The adapter (`src/mariadb/`) owns Oracle's transaction
+model, identifier semantics (`src/translate/names.rs`), describe metadata and
+the data dictionary, which is installed once per server in `dbsaci_sys`
+(`src/mariadb/install.rs`, `dbsaci install`) — never in application schemas. Pass
 functions through when the selected backend supports them, and use the AST
 translator for structural dialect differences, type/result metadata, and
 constructs absent from the backend.
@@ -73,14 +76,19 @@ Agents must validate DbSaci's logic against the following open-source test corpo
   The `DBSACI_TEST_PG_IMAGE=dbsaci-test-pg:<major>` env var points the corpus at
   a different PostgreSQL major; a group can set `# requires-pg: N` to run as
   ignored below a hard version floor (`MERGE` needs PG 15).
-  `DBSACI_CORPUS_BACKEND=mariadb` runs the **same** corpus against a
-  `mariadb:11.4` container in `SQL_MODE=ORACLE` (started with
-  `--lower-case-table-names=1`). Backend gaps are **red**, not ignored; known
-  reds are listed in `tests/corpus/expected-failures.<backend>`. With
-  `DBSACI_CORPUS_LEDGER=1` (CI), the job exits 0 iff the failure set matches
-  that file exactly (unexpected fail or unexpected pass → red). MariaDB
-  translation lives in `oracle_to_mariadb` (`src/translate/mod.rs`) + the
-  backend adapter and `information_schema` facade in `src/mariadb.rs`.
+  `DBSACI_CORPUS_BACKEND=mariadb` runs the **same** corpus against MariaDB
+  (`DBSACI_TEST_MARIADB_IMAGE`, default `mariadb:11.8`) with
+  `lower_case_table_names` from `DBSACI_TEST_MARIADB_LCTN` (default `0`,
+  case-sensitive) and `DBSACI_IDENTIFIER_CASE` (`upper` default / `lower`).
+  The corpus login is a least-privilege account; the harness installs the
+  dictionary as an administrator. Fixture/teardown/verify SQL run directly on
+  MariaDB go through the same Oracle identifier pass as client SQL.
+  `-- concurrent: <SQL>` runs a statement on a second, autocommitting session
+  mid-case (read consistency, isolation). Backend gaps are **red**, not
+  ignored; known reds are listed in `tests/corpus/expected-failures.<backend>`
+  — one list for every MariaDB configuration (a config-dependent result is a
+  bug). With `DBSACI_CORPUS_LEDGER=1` (CI), the job exits 0 iff the failure
+  set matches that file exactly (unexpected fail or unexpected pass → red).
 * Porting more of the suites above means adding `tests/corpus/*.sql` groups
   (values authored to the Oracle-correct answer), not new bespoke test binaries.
 * `clients/run.sh <python|java|dotnet> [oracle-version]` — real third-party
