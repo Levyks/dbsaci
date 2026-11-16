@@ -31,6 +31,7 @@ use crate::backend::{DescribeCaps, OracleBackend, OracleCursor};
 use crate::error::{Error, Result};
 use crate::translate::IdentifierCase;
 use crate::translate::names::{Piece, pieces};
+use crate::translate::schema::ValueKind;
 use crate::wire::{BindValue, ColumnMeta};
 use session::{Cmd, Row, SessionParams, Shared};
 
@@ -144,6 +145,55 @@ impl MariaDbBackend {
         })
     }
 
+    /// Column kinds of the tables `oracle_sql` uses, fetched once per table
+    /// (process-wide cache, cleared by DDL).
+    async fn schema_snapshot(&self, oracle_sql: &str) -> schema_cache::Snapshot {
+        let mut tables = Vec::new();
+        for (schema, table) in schema_cache::referenced_tables(oracle_sql) {
+            let canon = |n: &str| {
+                if n.starts_with('"') {
+                    n.trim_matches('"').to_string()
+                } else {
+                    self.case.physical(&n.to_ascii_uppercase())
+                }
+            };
+            let table_p = canon(&table);
+            let schema_p = schema.as_deref().map(canon);
+            let key_schema = schema_p.clone().unwrap_or_else(|| {
+                self.shared
+                    .current_schema
+                    .lock()
+                    .map(|s| s.clone())
+                    .unwrap_or_default()
+            });
+            let cols = match schema_cache::get(&key_schema, &table_p) {
+                Some(c) => c,
+                None => {
+                    let (s2, t2) = (Some(key_schema.clone()), table_p.clone());
+                    match self
+                        .call(|reply| Cmd::Columns {
+                            schema: s2,
+                            table: t2,
+                            reply,
+                        })
+                        .await
+                    {
+                        Ok(rows) if !rows.is_empty() => {
+                            schema_cache::put(&key_schema, &table_p, &rows);
+                            match schema_cache::get(&key_schema, &table_p) {
+                                Some(c) => c,
+                                None => continue,
+                            }
+                        }
+                        _ => continue,
+                    }
+                }
+            };
+            tables.push((schema_p, table_p, cols));
+        }
+        schema_cache::Snapshot::new(tables)
+    }
+
     async fn call<T>(&self, make: impl FnOnce(oneshot::Sender<Result<T>>) -> Cmd) -> Result<T> {
         let (reply, rx) = oneshot::channel();
         self.tx
@@ -190,6 +240,22 @@ async fn server_facts(cfg: &MariaDbConfig, opts: &Opts) -> ServerFacts {
         m.get_or_insert_with(HashMap::new).insert(key, facts);
     }
     facts
+}
+
+/// The translator's view of a bind's type.
+fn bind_kind(b: &BindValue) -> ValueKind {
+    match b {
+        BindValue::Number(_) | BindValue::BinaryDouble(_) | BindValue::Boolean(_) => {
+            ValueKind::Number
+        }
+        BindValue::String(_) => ValueKind::Text,
+        BindValue::Bytes(_) => ValueKind::Binary,
+        BindValue::Temporal(t) if t.trim_start().to_ascii_uppercase().starts_with("DATE") => {
+            ValueKind::Date
+        }
+        BindValue::Temporal(_) => ValueKind::Timestamp,
+        BindValue::Null => ValueKind::Unknown,
+    }
 }
 
 fn params_of(binds: &[BindValue]) -> Result<Vec<mysql_async::Value>> {
@@ -456,97 +522,38 @@ impl OracleBackend for Arc<MariaDbBackend> {
         )
     }
 
-    async fn translate(&self, oracle_sql: &str, _binds: &[BindValue]) -> Result<String> {
+    async fn translate(&self, oracle_sql: &str, binds: &[BindValue]) -> Result<String> {
+        let kinds: Vec<ValueKind> = binds.iter().map(bind_kind).collect();
+        let key = format!(
+            "{}\u{1}{:?}\u{1}{}",
+            schema_cache::version(),
+            kinds,
+            oracle_sql
+        );
         if let Some(hit) = self
             .translations
             .lock()
             .ok()
-            .and_then(|c| c.get(oracle_sql).cloned())
+            .and_then(|c| c.get(&key).cloned())
         {
             return Ok(hit);
         }
-        let out = crate::translate::oracle_to_mariadb_with_case(oracle_sql, self.case)?;
-        let out = route_dictionary(&out);
+        let snapshot = self.schema_snapshot(oracle_sql).await;
+        let cx = crate::translate::MariaDbContext {
+            case: self.case,
+            schema: &snapshot,
+            bind_kinds: &kinds,
+            route_dictionary: true,
+        };
+        let out = crate::translate::oracle_to_mariadb_ctx(oracle_sql, &cx)?;
         if let Ok(mut c) = self.translations.lock() {
             if c.len() >= TRANSLATION_CACHE {
                 c.clear();
             }
-            c.insert(oracle_sql.to_string(), out.clone());
+            c.insert(key, out.clone());
         }
         Ok(out)
     }
-}
-
-/// Route Oracle dictionary relations, built-in functions and package
-/// routines to the objects in `dbsaci_sys` (MariaDB has no public synonyms or
-/// search path): `ALL_TABLES` / `SYS.ALL_TABLES` / `PUBLIC.ALL_TABLES` →
-/// `` `dbsaci_sys`.`all_tables` ``, `MONTHS_BETWEEN(` →
-/// `` `dbsaci_sys`.`months_between`( ``, `DBMS_OUTPUT.PUT_LINE(` →
-/// `` `dbsaci_sys`.`dbms_output__put_line`( ``. Lexical: literals, comments
-/// and quoted identifiers are untouched.
-pub fn route_dictionary(sql: &str) -> String {
-    let ps = pieces(sql);
-    let text = |i: usize| -> &str { ps.get(i).map_or("", |(_, r)| &sql[r.clone()]) };
-    let is_word = |i: usize| ps.get(i).is_some_and(|(p, _)| *p == Piece::Word);
-    let mut out = String::with_capacity(sql.len() + 32);
-    let mut i = 0;
-    while i < ps.len() {
-        let t = text(i);
-        if is_word(i) {
-            let next = text(i + 1);
-            let call = next.trim_start().starts_with('(');
-            let dotted_after = next == ".";
-            let qualified = i >= 2 && text(i - 1) == "." && is_word(i - 2);
-            // PACKAGE.MEMBER(
-            if dotted_after
-                && is_word(i + 2)
-                && text(i + 3).trim_start().starts_with('(')
-                && !qualified
-                && let Some(routine) = dictionary::package_routine(t, text(i + 2))
-            {
-                out.push_str(&format!("`{}`.`{routine}`", dictionary::SCHEMA));
-                i += 3;
-                continue;
-            }
-            // SYS. / PUBLIC. qualifier in front of a dictionary relation.
-            if dotted_after
-                && (t.eq_ignore_ascii_case("SYS") || t.eq_ignore_ascii_case("PUBLIC"))
-                && is_word(i + 2)
-                && dictionary::is_relation(text(i + 2))
-                && !text(i + 3).trim_start().starts_with('(')
-                && !qualified
-            {
-                out.push_str(&format!(
-                    "`{}`.`{}`",
-                    dictionary::SCHEMA,
-                    text(i + 2).to_ascii_lowercase()
-                ));
-                i += 3;
-                continue;
-            }
-            if !qualified && !dotted_after && !call && dictionary::is_relation(t) {
-                out.push_str(&format!(
-                    "`{}`.`{}`",
-                    dictionary::SCHEMA,
-                    t.to_ascii_lowercase()
-                ));
-                i += 1;
-                continue;
-            }
-            if !qualified && call && dictionary::is_function(t) {
-                out.push_str(&format!(
-                    "`{}`.`{}`",
-                    dictionary::SCHEMA,
-                    t.to_ascii_lowercase()
-                ));
-                i += 1;
-                continue;
-            }
-        }
-        out.push_str(t);
-        i += 1;
-    }
-    out
 }
 
 /// `dbsaci install`: create or upgrade `dbsaci_sys` and grant it to everyone.
@@ -830,30 +837,6 @@ pub async fn check(cfg: &MariaDbConfig, login: &str, password: &str) -> Vec<Chec
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn routes_dictionary_names() {
-        assert_eq!(
-            route_dictionary("SELECT SEQUENCE_NAME FROM ALL_SEQUENCES WHERE X = 'ALL_TABLES'"),
-            "SELECT SEQUENCE_NAME FROM `dbsaci_sys`.`all_sequences` WHERE X = 'ALL_TABLES'"
-        );
-        assert_eq!(
-            route_dictionary("select * from sys.all_tables t, user_tables"),
-            "select * from `dbsaci_sys`.`all_tables` t, `dbsaci_sys`.`user_tables`"
-        );
-        assert_eq!(
-            route_dictionary("SELECT MONTHS_BETWEEN(A, B), T.ALL_TABLES FROM T"),
-            "SELECT `dbsaci_sys`.`months_between`(A, B), T.ALL_TABLES FROM T"
-        );
-        assert_eq!(
-            route_dictionary("BEGIN DBMS_OUTPUT.PUT_LINE('x'); END"),
-            "BEGIN `dbsaci_sys`.`dbms_output__put_line`('x'); END"
-        );
-        assert_eq!(
-            route_dictionary("SELECT * FROM V$VERSION"),
-            "SELECT * FROM `dbsaci_sys`.`v$version`"
-        );
-    }
 
     #[test]
     fn alter_session_settings_parse() {

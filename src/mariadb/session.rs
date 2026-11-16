@@ -60,6 +60,8 @@ pub struct Shared {
     pub schema_version: AtomicU64,
     /// Bumped per backend call; a call timeout only fires for its own call.
     pub calls: AtomicU64,
+    /// Physical name of the session's current schema (for the column cache).
+    pub current_schema: std::sync::Mutex<String>,
 }
 
 /// Fixed parameters of the session.
@@ -172,6 +174,9 @@ pub async fn start(params: SessionParams, shared: Arc<Shared>) -> Result<mpsc::S
         next_cursor: 1,
     };
     let conn = establish(&mut state).await?;
+    if let Ok(mut c) = state.shared.current_schema.lock() {
+        c.clone_from(&state.current_schema);
+    }
     let (tx, rx) = mpsc::channel(8);
     tokio::spawn(run(conn, state, rx));
     Ok(tx)
@@ -189,8 +194,10 @@ async fn establish(st: &mut State) -> Result<Conn> {
         "SET SESSION sql_mode = '{SQL_MODE}', autocommit = 0, \
          transaction_isolation = 'READ-COMMITTED', \
          collation_connection = @@collation_database, max_recursive_iterations = 1100000, \
-         @dbsaci_login_user = {login}, @dbsaci_lower_names = {lower}",
+         @dbsaci_login_user = {login}, @dbsaci_lower_names = {lower}, \
+         @dbsaci_current_schema = {current}",
         login = quote(&st.params.login),
+        current = quote(&st.current_schema),
         lower = u8::from(st.params.case == IdentifierCase::Lower),
     );
     if let Some(tz) = &st.time_zone {
@@ -782,6 +789,12 @@ async fn alter_session(
                 conn.query_drop(format!("USE `{}`", physical.replace('`', "``")))
                     .await
                     .map_err(|_| Error::ora(1435, format!("user {oracle} does not exist")))?;
+                conn.query_drop(format!("SET @dbsaci_current_schema = {}", quote(&physical)))
+                    .await
+                    .map_err(|e| mapped(st, e, "SET"))?;
+                if let Ok(mut c) = st.shared.current_schema.lock() {
+                    c.clone_from(&physical);
+                }
                 st.current_schema = physical;
             }
             k if k.starts_with("NLS_") => {

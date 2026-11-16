@@ -471,8 +471,14 @@ async fn migrate(
         let n = i + 1;
         let translated = match &backend {
             Some(b) => b.translate(stmt, &[]).await,
-            None => dbsaci::translate::oracle_to_mariadb_with_case(stmt, cfg.case)
-                .map(|s| dbsaci::mariadb::route_dictionary(&s)),
+            None => dbsaci::translate::oracle_to_mariadb_ctx(
+                stmt,
+                &dbsaci::translate::MariaDbContext {
+                    case: cfg.case,
+                    route_dictionary: true,
+                    ..Default::default()
+                },
+            ),
         };
         let translated = match translated {
             Ok(t) => t,

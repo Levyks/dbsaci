@@ -8,7 +8,7 @@
 use super::dictionary::{RELATIONS, SCHEMA};
 
 /// Bump on any change to the objects below.
-pub const VERSION: &str = "0.3.0-2026-11-16.2";
+pub const VERSION: &str = "0.3.0-2026-11-16.3";
 
 /// Schemas that are MariaDB's own, not Oracle objects; hidden from ALL_*.
 const SYSTEM_SCHEMAS: &str =
@@ -25,9 +25,15 @@ const SESSION_ROUTINES: &[&str] = &[
        IF @dbsaci_lower_names = 1 AND CAST(n AS BINARY) = CAST(LOWER(n) AS BINARY) THEN \
          RETURN UPPER(n); END IF; \
        RETURN n; END",
+    // `DATABASE()` inside a stored routine is the routine's own database, so
+    // the session's current schema comes from the session variable DbSaci
+    // keeps (set on connect and on ALTER SESSION SET CURRENT_SCHEMA).
+    "CREATE OR REPLACE FUNCTION dbsaci_sys.current_schema() RETURN VARCHAR(255) \
+       SQL SECURITY INVOKER AS BEGIN \
+       RETURN COALESCE(@dbsaci_current_schema, DATABASE()); END",
     "CREATE OR REPLACE FUNCTION dbsaci_sys.login_user() RETURN VARCHAR(255) \
        SQL SECURITY INVOKER AS BEGIN \
-       RETURN COALESCE(@dbsaci_login_user, dbsaci_sys.oname(DATABASE())); END",
+       RETURN COALESCE(@dbsaci_login_user, dbsaci_sys.oname(dbsaci_sys.current_schema())); END",
     "CREATE OR REPLACE FUNCTION dbsaci_sys.nls(p VARCHAR(64)) RETURN VARCHAR(255) \
        SQL SECURITY INVOKER AS BEGIN \
        RETURN CASE UPPER(p) \
@@ -52,13 +58,13 @@ const SESSION_ROUTINES: &[&str] = &[
     "CREATE OR REPLACE FUNCTION dbsaci_sys.sys_context(ns VARCHAR(64), p VARCHAR(64)) \
        RETURN VARCHAR(255) SQL SECURITY INVOKER AS BEGIN \
        RETURN CASE UPPER(p) \
-         WHEN 'CURRENT_SCHEMA' THEN dbsaci_sys.oname(DATABASE()) \
-         WHEN 'SESSION_SCHEMA' THEN dbsaci_sys.oname(DATABASE()) \
+         WHEN 'CURRENT_SCHEMA' THEN dbsaci_sys.oname(dbsaci_sys.current_schema()) \
+         WHEN 'SESSION_SCHEMA' THEN dbsaci_sys.oname(dbsaci_sys.current_schema()) \
          WHEN 'CURRENT_USER' THEN dbsaci_sys.login_user() \
          WHEN 'SESSION_USER' THEN dbsaci_sys.login_user() \
-         WHEN 'DB_NAME' THEN dbsaci_sys.oname(DATABASE()) \
-         WHEN 'DB_UNIQUE_NAME' THEN dbsaci_sys.oname(DATABASE()) \
-         WHEN 'INSTANCE_NAME' THEN dbsaci_sys.oname(DATABASE()) \
+         WHEN 'DB_NAME' THEN dbsaci_sys.oname(dbsaci_sys.current_schema()) \
+         WHEN 'DB_UNIQUE_NAME' THEN dbsaci_sys.oname(dbsaci_sys.current_schema()) \
+         WHEN 'INSTANCE_NAME' THEN dbsaci_sys.oname(dbsaci_sys.current_schema()) \
          WHEN 'SERVER_HOST' THEN @@hostname \
          WHEN 'SID' THEN CAST(CONNECTION_ID() AS CHAR) \
          WHEN 'SESSIONID' THEN CAST(CONNECTION_ID() AS CHAR) \
@@ -82,7 +88,7 @@ const SESSION_ROUTINES: &[&str] = &[
     "CREATE OR REPLACE FUNCTION dbsaci_sys.dbms_metadata__get_ddl(object_type VARCHAR(64), \
        name VARCHAR(128), schema VARCHAR(128) DEFAULT NULL) RETURN TEXT SQL SECURITY INVOKER AS \
        nsp VARCHAR(128); cols TEXT; BEGIN \
-       nsp := COALESCE(NULLIF(schema, ''), dbsaci_sys.oname(DATABASE())); \
+       nsp := COALESCE(NULLIF(schema, ''), dbsaci_sys.oname(dbsaci_sys.current_schema())); \
        IF UPPER(object_type) <> 'TABLE' THEN \
          RETURN CONCAT('-- DBMS_METADATA.GET_DDL is not implemented for object type ', object_type); \
        END IF; \
@@ -490,7 +496,7 @@ fn view_definitions() -> Vec<(&'static str, String)> {
         ),
         (
             "global_name",
-            "SELECT dbsaci_sys.oname(DATABASE()) AS global_name FROM DUAL".into(),
+            "SELECT dbsaci_sys.oname(dbsaci_sys.current_schema()) AS global_name FROM DUAL".into(),
         ),
     ];
     let nls_params = [
@@ -636,6 +642,13 @@ pub fn install_statements() -> Vec<String> {
     ];
     out.extend(SESSION_ROUTINES.iter().map(|s| s.to_string()));
     out.extend(COMPAT_FUNCTIONS.iter().map(|s| s.to_string()));
+    // The translator's runtime helpers (ORA errors raised at run time, RR
+    // dates, TO_DATE validation, date TRUNC/ROUND, number masks).
+    out.extend(
+        crate::translate::mariadb::HELPERS
+            .iter()
+            .map(|(_, ddl)| ddl.replacen(" FUNCTION ", " FUNCTION dbsaci_sys.", 1)),
+    );
     for (name, select) in view_definitions() {
         out.push(format!(
             "CREATE OR REPLACE SQL SECURITY INVOKER VIEW {SCHEMA}.`{name}` AS {select}"

@@ -145,7 +145,9 @@ mod tests {
     #[test]
     fn finds_referenced_tables() {
         assert_eq!(
-            referenced_tables("SELECT * FROM ORDERS o JOIN HR.EMP e ON 1=1 WHERE x IN (SELECT 1 FROM DUAL)"),
+            referenced_tables(
+                "SELECT * FROM ORDERS o JOIN HR.EMP e ON 1=1 WHERE x IN (SELECT 1 FROM DUAL)"
+            ),
             vec![(None, "ORDERS".into()), (Some("HR".into()), "EMP".into())]
         );
         assert_eq!(
