@@ -923,77 +923,90 @@ fn connect_by_block(ts: &Ts, blk: &Block, cx: &MariaDbContext) -> Result<String>
     // projection rewriting
     let mut extra_seed = String::new();
     let mut extra_step = String::new();
-    let mut proj = String::new();
     let mut n_extra = 0;
-    let (la, lb) = blk.list;
-    let mut i = la;
-    while i < lb {
-        if ts.is(i, "CONNECT_BY_ROOT") {
-            let c = ts.next(i, lb);
-            let (parts, end) = path(ts, c);
-            let col = ident_text(ts.text(*parts.last().unwrap())).to_string();
-            let h = format!("__root{n_extra}");
-            n_extra += 1;
-            extra_seed.push_str(&format!(", {alias}.{} AS {h}", quote_key(&col)));
-            extra_step.push_str(&format!(", __cb.{h}"));
-            proj.push_str(&format!("{alias}.{h}"));
-            i = end;
-            continue;
-        }
-        if ts.is(i, "SYS_CONNECT_BY_PATH") {
-            let p = ts.next(i, lb);
-            let close = ts.pair[p];
-            let args = ts.split_commas(p + 1, close);
-            if args.len() != 2 {
-                return Err(unimplemented("SYS_CONNECT_BY_PATH arguments"));
+    // rewrite hierarchical pseudo-columns in a select-list / WHERE / ORDER range
+    let mut pseudo = |la: usize, lb: usize| -> Result<String> {
+        let mut proj = String::new();
+        let mut i = la;
+        while i < lb {
+            if ts.is(i, "CONNECT_BY_ROOT") {
+                let c = ts.next(i, lb);
+                let (parts, end) = path(ts, c);
+                let col = ident_text(ts.text(*parts.last().unwrap())).to_string();
+                let h = format!("__root{n_extra}");
+                n_extra += 1;
+                extra_seed.push_str(&format!(", {alias}.{} AS {h}", quote_key(&col)));
+                extra_step.push_str(&format!(", __cb.{h}"));
+                proj.push_str(&format!("{alias}.{h}"));
+                i = end;
+                continue;
             }
-            let col_seed = ts.tslice(args[0].0, args[0].1).to_string();
-            let col_step = rewrite_cond(ts, args[0].0, args[0].1, &tref.key, child, child);
-            let sep = ts.tslice(args[1].0, args[1].1);
-            let h = format!("__path{n_extra}");
-            n_extra += 1;
-            extra_seed.push_str(&format!(
-                ", CAST(CONCAT({sep}, {col_seed}) AS CHAR(4000)) AS {h}"
-            ));
-            extra_step.push_str(&format!(", CONCAT(__cb.{h}, {sep}, {})", col_step.trim()));
-            proj.push_str(&format!("{alias}.{h}"));
-            i = close + 1;
-            continue;
-        }
-        if ts.is(i, "LEVEL") {
-            proj.push_str(&format!("{alias}.__level"));
-            i += 1;
-            continue;
-        }
-        if ts.is(i, "CONNECT_BY_ISLEAF") {
-            proj.push_str(&format!(
-                "(CASE WHEN EXISTS (SELECT 1 FROM {table_txt} __l WHERE {}) THEN 0 ELSE 1 END)",
-                rewrite_cond(ts, a, b, &tref.key, "__l", &alias)
-            ));
-            i += 1;
-            continue;
-        }
-        if ts.is(i, "CONNECT_BY_ISCYCLE") {
-            if !nocycle {
-                return Err(Error::ora(
-                    30930,
-                    "NOCYCLE keyword is required with CONNECT_BY_ISCYCLE pseudo column",
+            if ts.is(i, "SYS_CONNECT_BY_PATH") {
+                let p = ts.next(i, lb);
+                let close = ts.pair[p];
+                let args = ts.split_commas(p + 1, close);
+                if args.len() != 2 {
+                    return Err(unimplemented("SYS_CONNECT_BY_PATH arguments"));
+                }
+                let col_seed = ts.tslice(args[0].0, args[0].1).to_string();
+                let col_step = rewrite_cond(ts, args[0].0, args[0].1, &tref.key, child, child);
+                let sep = ts.tslice(args[1].0, args[1].1);
+                let h = format!("__path{n_extra}");
+                n_extra += 1;
+                extra_seed.push_str(&format!(
+                    ", CAST(CONCAT({sep}, {col_seed}) AS CHAR(4000)) AS {h}"
                 ));
+                extra_step.push_str(&format!(", CONCAT(__cb.{h}, {sep}, {})", col_step.trim()));
+                proj.push_str(&format!("{alias}.{h}"));
+                i = close + 1;
+                continue;
             }
-            proj.push_str(&format!(
+            if ts.is(i, "LEVEL") {
+                proj.push_str(&format!("{alias}.__level"));
+                i += 1;
+                continue;
+            }
+            if ts.is(i, "CONNECT_BY_ISLEAF") {
+                proj.push_str(&format!(
+                    "(CASE WHEN EXISTS (SELECT 1 FROM {table_txt} __l WHERE {}) THEN 0 ELSE 1 END)",
+                    rewrite_cond(ts, a, b, &tref.key, "__l", &alias)
+                ));
+                i += 1;
+                continue;
+            }
+            if ts.is(i, "CONNECT_BY_ISCYCLE") {
+                if !nocycle {
+                    return Err(Error::ora(
+                        30930,
+                        "NOCYCLE keyword is required with CONNECT_BY_ISCYCLE pseudo column",
+                    ));
+                }
+                proj.push_str(&format!(
                 "(CASE WHEN EXISTS (SELECT 1 FROM {table_txt} __l WHERE {} AND INSTR({alias}.__ids, {}) > 0) THEN 1 ELSE 0 END)",
                 rewrite_cond(ts, a, b, &tref.key, "__l", &alias),
                 key_of("__l")
             ));
+                i += 1;
+                continue;
+            }
+            if ts.is(i, "PRIOR") {
+                return Err(unimplemented("PRIOR in the select list"));
+            }
+            proj.push_str(ts.text(i));
             i += 1;
-            continue;
         }
-        if ts.is(i, "PRIOR") {
-            return Err(unimplemented("PRIOR in the select list"));
-        }
-        proj.push_str(ts.text(i));
-        i += 1;
-    }
+        Ok(proj)
+    };
+    let proj = pseudo(blk.list.0, blk.list.1)?;
+    let where_txt = match blk.where_ {
+        Some((_, wa, wb)) => Some(pseudo(wa, wb)?),
+        None => None,
+    };
+    let order_body = match (order_txt, blk.siblings) {
+        (Some((oa, ob)), false) => Some(pseudo(oa, ob)?),
+        _ => None,
+    };
+    drop(pseudo);
     let seed_where = blk
         .start
         .map(|(_, sa, sb)| format!(" WHERE {}", ts.tslice(sa, sb)))
@@ -1020,26 +1033,16 @@ fn connect_by_block(ts: &Ts, blk: &Block, cx: &MariaDbContext) -> Result<String>
         ids_seed = key_of(&alias),
         ids_step = key_of(child),
     );
-    if let Some((_, wa, wb)) = blk.where_ {
+    if let Some(w) = where_txt {
         out.push_str(" WHERE ");
-        out.push_str(&replace_words(
-            ts,
-            wa,
-            wb,
-            &[("LEVEL", &format!("{alias}.__level"))],
-        ));
+        out.push_str(w.trim());
     }
-    match (order_txt, blk.siblings) {
-        (Some((oa, ob)), false) => {
+    match order_body {
+        Some(o) => {
             out.push_str(" ORDER BY ");
-            out.push_str(&replace_words(
-                ts,
-                oa,
-                ob,
-                &[("LEVEL", &format!("{alias}.__level"))],
-            ));
+            out.push_str(o.trim());
         }
-        _ => out.push_str(&format!(" ORDER BY {alias}.__ord")),
+        None => out.push_str(&format!(" ORDER BY {alias}.__ord")),
     }
     if !tail_txt.is_empty() {
         out.push(' ');

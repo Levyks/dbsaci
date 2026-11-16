@@ -1393,6 +1393,16 @@ impl<'a> Render<'a> {
         if is("ORDER") {
             let by = ts.next(i, b);
             if ts.is(by, "BY") {
+                // ordered-set aggregates (PERCENTILE_*, MEDIAN …) take exactly
+                // one sort key and ignore NULLs: no NULL-placement key
+                let p = ts.parent[i];
+                let within_group = p != NONE && {
+                    let g = ts.prev(p, 0);
+                    g != NONE && ts.is(g, "GROUP") && ts.is(ts.prev(g, 0), "WITHIN")
+                };
+                if within_group {
+                    return None;
+                }
                 out.push_str(ts.slice(i, by + 1));
                 let (s, e) = self.order_items_range(by + 1, b);
                 out.push_str(&self.order_items(s, e));
@@ -1646,15 +1656,19 @@ impl<'a> Render<'a> {
             let nulls_first = nulls.unwrap_or(desc);
             // MariaDB default: NULLs first for ASC, last for DESC.
             let native = nulls_first != desc;
+            // positional item: the key is the select-list expression (or alias)
+            let positional = (xb == xa + 1 && ts.k(xa) == K::Num)
+                .then(|| self.select_item_key(s, ts.text(xa)))
+                .flatten();
             let skip = native
                 || frame_range
-                || xb == xa + 1 && matches!(ts.k(xa), K::Num | K::Str)
+                || (xb == xa + 1 && matches!(ts.k(xa), K::Num | K::Str) && positional.is_none())
                 || ts.has(xa, xb, K::Bind)
                 || (xb == xa + 1 && ts.is_any(xa, &["ROWNUM", "LEVEL"]))
                 || self.not_null_expr(xa, xb);
             let mut item = String::from(*lead);
             if !skip {
-                item.push_str(&expr);
+                item.push_str(positional.as_deref().unwrap_or(&expr));
                 item.push_str(if nulls_first {
                     " IS NULL DESC, "
                 } else {
@@ -1677,6 +1691,61 @@ impl<'a> Render<'a> {
             out.insert(0, ' ');
         }
         out
+    }
+
+    /// Sort key for `ORDER BY <n>`: the n-th select item's alias, or its
+    /// expression. `None` for set operations, `*`, binds, or out of range.
+    fn select_item_key(&self, order_items_start: usize, pos: &str) -> Option<String> {
+        let ts = self.ts;
+        let n: usize = pos.parse().ok()?;
+        let sel = super::structural::enclosing_select(ts, order_items_start)?;
+        // a set operation's ORDER BY sorts the combined result
+        let p = ts.parent[sel];
+        let (a, b) = if p == NONE {
+            (0, ts.len())
+        } else {
+            (p + 1, ts.pair[p])
+        };
+        let setop = ts
+            .find_kw(a, b, &["UNION", "MINUS", "INTERSECT", "EXCEPT"])
+            .is_some();
+        // for a set operation the result columns are named by the first branch
+        let sel = if setop {
+            ts.find_kw(a, b, &["SELECT"])?
+        } else {
+            sel
+        };
+        let blk = super::structural::parse_block(ts, sel);
+        let mut la = ts.sig(blk.list.0, blk.list.1);
+        if ts.is_any(la, &["DISTINCT", "UNIQUE", "ALL"]) {
+            la += 1;
+        }
+        let items = ts.split_commas(la, blk.list.1);
+        let (ia, ib) = ts.trim(items.get(n.checked_sub(1)?)?.0, items[n - 1].1);
+        if ia >= ib || ts.has(ia, ib, K::Bind) || ts.is_op(ib - 1, "*") {
+            return None;
+        }
+        let e = self.parse_expr(ia, ib, 0)?;
+        let rest = ts.sig(e.b, ib);
+        if rest < ib {
+            let mut al = rest;
+            if ts.is(al, "AS") {
+                al = ts.next(al, ib);
+            }
+            return (al < ib).then(|| self.token(al));
+        }
+        if setop {
+            // only a plain column names the result column
+            if e.kind != Nk::Path {
+                return None;
+            }
+            let (parts, _) = self.path_parts(e.a);
+            return parts.last().map(|&l| self.token(l));
+        }
+        if self.not_null_expr(ia, ib) {
+            return None;
+        }
+        Some(self.range(ia, ib))
     }
 
     fn not_null_expr(&self, a: usize, b: usize) -> bool {
@@ -2441,7 +2510,9 @@ impl<'a> Render<'a> {
             }
             ("TO_CHAR", 1) => match self.arg_kind(args[0]) {
                 Vk::Text => a(0),
-                Vk::Num => format!("{}({}, 'TM9')", self.fname("dbsaci_to_char_num"), a(0)),
+                Vk::Num if self.cx.route_dictionary => {
+                    format!("{}({}, 'TM9')", self.fname("dbsaci_to_char_num"), a(0))
+                }
                 _ => format!("CAST({} AS CHAR(4000))", a(0)),
             },
             ("TO_CHAR", 2 | 3) => return self.to_char(n, &args, &tail),
