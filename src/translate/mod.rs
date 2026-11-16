@@ -19,49 +19,9 @@ use sqlparser::parser::Parser;
 
 use crate::error::{Error, Result};
 
-/// How the MariaDB backend normalizes Oracle table identifiers so a client
-/// that mixes case (`A_TABLE`, `a_table`, `"A_TABLE"` — all the same object to
-/// Oracle) reaches one consistently-cased MariaDB object regardless of the
-/// server's `lower_case_table_names` setting.
-///
-/// Oracle itself folds *unquoted* identifiers to upper case and leaves *quoted*
-/// ones exactly as written; `Upper` mirrors that (and is what `data.sql`-style
-/// vendored Oracle schemas already look like), so it is the default. Choose
-/// `Lower` when the backend schema was authored in the PostgreSQL/MariaDB
-/// convention of lower-case objects. Either way the point is consistency, not
-/// which case is "correct" — the backend schema must be authored to match.
-///
-/// PostgreSQL is not affected by this setting: it downcases unquoted
-/// identifiers itself, so a quoted-uppercase Oracle identifier already folds
-/// to a lower-case PostgreSQL one via [`fold_uppercase_quoted_identifiers`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum IdentifierCase {
-    #[default]
-    Upper,
-    Lower,
-}
-
-impl IdentifierCase {
-    fn apply(self, s: &str) -> String {
-        match self {
-            IdentifierCase::Upper => s.to_ascii_uppercase(),
-            IdentifierCase::Lower => s.to_ascii_lowercase(),
-        }
-    }
-}
-
-impl std::str::FromStr for IdentifierCase {
-    type Err = String;
-    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
-        match s.to_ascii_lowercase().as_str() {
-            "upper" => Ok(IdentifierCase::Upper),
-            "lower" => Ok(IdentifierCase::Lower),
-            other => Err(format!(
-                "unknown identifier case {other:?} (want upper or lower)"
-            )),
-        }
-    }
-}
+pub mod names;
+pub mod schema;
+pub use names::IdentifierCase;
 
 /// Fold every table/view identifier reachable in table-name position (`FROM`,
 /// `JOIN`, `UPDATE`, `INSERT INTO`, DDL targets, …) to `case`, via
