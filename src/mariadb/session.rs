@@ -195,9 +195,10 @@ async fn establish(st: &mut State) -> Result<Conn> {
          transaction_isolation = 'READ-COMMITTED', \
          collation_connection = @@collation_database, max_recursive_iterations = 1100000, \
          @dbsaci_login_user = {login}, @dbsaci_lower_names = {lower}, \
-         @dbsaci_current_schema = {current}",
+         @dbsaci_current_schema = {current}, @dbsaci_home_schema = {home}",
         login = quote(&st.params.login),
         current = quote(&st.current_schema),
+        home = quote(&st.params.schema),
         lower = u8::from(st.params.case == IdentifierCase::Lower),
     );
     if let Some(tz) = &st.time_zone {

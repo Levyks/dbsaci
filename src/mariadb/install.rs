@@ -8,7 +8,7 @@
 use super::dictionary::{RELATIONS, SCHEMA};
 
 /// Bump on any change to the objects below.
-pub const VERSION: &str = "0.3.4-2026-11-16.1";
+pub const VERSION: &str = "0.3.4-2026-11-16.2";
 
 /// Schemas that are MariaDB's own, not Oracle objects; hidden from ALL_*.
 const SYSTEM_SCHEMAS: &str =
@@ -22,6 +22,8 @@ const SESSION_ROUTINES: &[&str] = &[
     "CREATE OR REPLACE FUNCTION dbsaci_sys.oname(n VARCHAR(255)) RETURN VARCHAR(255) \
        SQL SECURITY INVOKER AS BEGIN \
        IF n IS NULL THEN RETURN NULL; END IF; \
+       IF CAST(n AS BINARY) = CAST(@dbsaci_home_schema AS BINARY) THEN \
+         RETURN @dbsaci_login_user; END IF; \
        IF @dbsaci_lower_names = 1 AND CAST(n AS BINARY) = CAST(LOWER(n) AS BINARY) THEN \
          RETURN UPPER(n); END IF; \
        RETURN n; END",

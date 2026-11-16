@@ -2680,8 +2680,11 @@ impl<'a> Render<'a> {
                         || k.eq_ignore_ascii_case("SESSION_SCHEMA")
                 }) =>
             {
-                "CAST(IF(@dbsaci_lower_names = 1 AND CAST(DATABASE() AS BINARY) = \
-                 CAST(LOWER(DATABASE()) AS BINARY), UPPER(DATABASE()), DATABASE()) AS CHAR(128))"
+                // The session's home schema (possibly a fallback database
+                // with another name) is reported under the login's name.
+                "CAST(IF(CAST(DATABASE() AS BINARY) = CAST(@dbsaci_home_schema AS BINARY), \
+                 @dbsaci_login_user, IF(@dbsaci_lower_names = 1 AND CAST(DATABASE() AS BINARY) = \
+                 CAST(LOWER(DATABASE()) AS BINARY), UPPER(DATABASE()), DATABASE())) AS CHAR(128))"
                     .to_string()
             }
             ("RAISE_APPLICATION_ERROR", 2 | 3) => {

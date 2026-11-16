@@ -131,7 +131,9 @@ impl MariaDbBackend {
             Ok(tx) => tx,
             Err(Error::Ora { code: 1918, .. }) if !cfg.default_db.is_empty() => {
                 params.schema = cfg.default_db.clone();
-                params.login = crate::translate::names::oracle_name(&cfg.default_db, cfg.case);
+                // The login keeps its Oracle name: the fallback database is
+                // its schema for this session (the dictionary reports it
+                // under that name).
                 session::start(params, shared.clone()).await?
             }
             Err(e) => return Err(e),
