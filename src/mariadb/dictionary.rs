@@ -114,6 +114,7 @@ pub const FUNCTIONS: &[&str] = &[
     "dbsaci_num_add",
     "dbsaci_to_date",
     "dbsaci_to_number",
+    "listagg",
 ];
 
 /// `(package, member, routine)`: Oracle package members implemented as a

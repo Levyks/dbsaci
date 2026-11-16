@@ -75,7 +75,9 @@ impl fmt::Display for Error {
             Error::PgStatement { detail, .. } => write!(f, "postgres error: {detail}"),
             Error::SqlParse(s) => write!(f, "sql parse error: {s}"),
             Error::Ora { code, message, .. } => write!(f, "ORA-{code:05}: {message}"),
-            Error::SessionLost(s) => write!(f, "ORA-03113: end-of-file on communication channel ({s})"),
+            Error::SessionLost(s) => {
+                write!(f, "ORA-03113: end-of-file on communication channel ({s})")
+            }
         }
     }
 }

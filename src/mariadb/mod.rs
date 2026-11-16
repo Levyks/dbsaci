@@ -4,7 +4,12 @@
 //! database. The adapter keeps one backend connection per Oracle session so
 //! transactions, temporary objects, and session settings retain their state.
 
+pub mod binds;
 pub mod dictionary;
+pub mod errors;
+pub mod install;
+pub mod instead_of;
+pub mod types;
 
 use std::{
     collections::{HashMap, HashSet},
