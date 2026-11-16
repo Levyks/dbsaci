@@ -3,3 +3,8 @@
 # an exact match against failures. Remove a line when the case goes green.
 #
 mariadb_oracle_mode::oracle_package_function
+# PostgreSQL lane gaps found by the 0.3.0 transaction-model cases (MariaDB-first
+# release): SET TRANSACTION after DML is not rejected (ORA-01453), and
+# ALTER SESSION SET NLS_* lives in a rolled-back temp table.
+transactions_concurrency::set_transaction_after_dml_is_rejected
+transactions_concurrency::alter_session_survives_rollback
