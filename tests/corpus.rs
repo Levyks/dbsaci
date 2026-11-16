@@ -781,6 +781,13 @@ async fn run_case_body(
         // (used to exercise mid-transaction statement errors).
         if let Some(tolerant) = setup.strip_prefix('\u{0}') {
             let _ = oracle.execute(tolerant, &[]).await;
+        } else if let Some(other) = setup.strip_prefix('\u{1}') {
+            // `-- concurrent:` — another session (the direct backend
+            // connection, autocommitting) changes data mid-case.
+            admin
+                .batch_execute(other)
+                .await
+                .map_err(|e| format!("concurrent `{other}` failed: {e}"))?;
         } else {
             oracle
                 .execute(setup, &[])
@@ -1184,6 +1191,8 @@ fn parse_group(name: &str, text: &str) -> Result<Group, String> {
             }
             if let Some(v) = directive(l, "setup?") {
                 setup.push(format!("\u{0}{v}"));
+            } else if let Some(v) = directive(l, "concurrent") {
+                setup.push(format!("\u{1}{v}"));
             } else if let Some(v) = directive(l, "setup") {
                 setup.push(v.to_string());
             } else if let Some(v) = directive(l, "teardown") {
@@ -1279,6 +1288,7 @@ fn is_directive(line: &str) -> bool {
         "-- fixture:",
         "-- setup:",
         "-- setup?:",
+        "-- concurrent:",
         "-- teardown:",
         "-- bind:",
         "-- tag:",
