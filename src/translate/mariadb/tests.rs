@@ -208,10 +208,9 @@ fn lower_case_mode_runs_structural_rules() {
         t("SELECT a.x FROM a, b WHERE a.id = b.id(+)"),
         "select a.x from a left join b on a.id = b.id"
     );
-    assert_eq!(
+    assert!(
         t(r#"SELECT LEVEL AS "MixedCase" FROM dual CONNECT BY LEVEL <= 2"#)
-            .contains(r#""MixedCase""#),
-        true
+            .contains(r#""MixedCase""#)
     );
 }
 
