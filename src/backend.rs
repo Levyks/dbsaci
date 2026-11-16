@@ -47,6 +47,17 @@ pub trait OracleBackend: Send + Sync {
     ) -> Result<(u64, Vec<Vec<Option<Vec<u8>>>>)>;
     async fn cancel(&self);
 
+    /// Run one DML statement for many bind rows (array DML / JDBC batch);
+    /// returns the summed row count. Stops at the first failing row, whose
+    /// error is returned; the rows before it stay applied (Oracle).
+    async fn execute_batch(&self, sql: &str, rows: &[Vec<BindValue>]) -> Result<u64> {
+        let mut total = 0;
+        for row in rows {
+            total += self.execute_simple(sql, row).await?;
+        }
+        Ok(total)
+    }
+
     /// Commit the session's transaction.
     async fn commit(&self) -> Result<()> {
         self.execute_simple("COMMIT", &[]).await.map(|_| ())

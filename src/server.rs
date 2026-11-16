@@ -1484,7 +1484,30 @@ async fn handle_connection(mut tns: TnsStream, session_id: u64, config: Config) 
                         let is_ddl = is_ddl_statement(&pg_sql);
                         let mut total: u64 = 0;
                         let mut failed: Option<Error> = None;
+                        let mut row_binds = Vec::with_capacity(execute.bind_rows.len());
                         for row in &execute.bind_rows {
+                            match wire::bind_parameters(&execute.sql, row, bind_style) {
+                                Ok(b) => row_binds.push(b.binds),
+                                Err(e) => {
+                                    failed = Some(e);
+                                    break;
+                                }
+                            }
+                        }
+                        if !is_ddl && failed.is_none() {
+                            match race_break(
+                                &mut tns,
+                                backend.as_ref(),
+                                backend.execute_batch(&pg_sql, &row_binds),
+                            )
+                            .await?
+                            {
+                                Ok(n) => total = n,
+                                Err(e) => failed = Some(e),
+                            }
+                            row_binds.clear();
+                        }
+                        for row in execute.bind_rows.iter().take(row_binds.len()) {
                             let row_bound =
                                 match wire::bind_parameters(&execute.sql, row, bind_style) {
                                     Ok(b) => b,

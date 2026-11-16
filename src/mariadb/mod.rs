@@ -378,6 +378,15 @@ impl OracleBackend for Arc<MariaDbBackend> {
         Ok((n, per_col))
     }
 
+    async fn execute_batch(&self, sql: &str, rows: &[Vec<BindValue>]) -> Result<u64> {
+        let rows = rows
+            .iter()
+            .map(|r| params_of(r))
+            .collect::<Result<Vec<_>>>()?;
+        let sql = sql.to_string();
+        self.call(|reply| Cmd::Batch { sql, rows, reply }).await
+    }
+
     /// Oracle BREAK: kill the running statement from a side connection
     /// (MariaDB error 1317, which maps to ORA-01013).
     async fn cancel(&self) {

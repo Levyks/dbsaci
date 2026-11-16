@@ -101,6 +101,11 @@ pub enum Cmd {
         params: Vec<Value>,
         reply: oneshot::Sender<Result<(u64, Vec<Row>)>>,
     },
+    Batch {
+        sql: String,
+        rows: Vec<Vec<Value>>,
+        reply: oneshot::Sender<Result<u64>>,
+    },
     Commit {
         reply: oneshot::Sender<Result<()>>,
     },
@@ -302,7 +307,7 @@ fn fail(cmd: Cmd, err: impl Fn() -> Error) {
     match cmd {
         Cmd::Query { reply, .. } => drop(reply.send(Err(err()))),
         Cmd::Fetch { reply, .. } => drop(reply.send(Err(err()))),
-        Cmd::Exec { reply, .. } => drop(reply.send(Err(err()))),
+        Cmd::Exec { reply, .. } | Cmd::Batch { reply, .. } => drop(reply.send(Err(err()))),
         Cmd::Returning { reply, .. } => drop(reply.send(Err(err()))),
         Cmd::Commit { reply } | Cmd::Rollback { reply } => drop(reply.send(Err(err()))),
         Cmd::AlterSession { reply, .. } | Cmd::SetTransaction { reply, .. } => {
@@ -347,6 +352,15 @@ async fn handle(
                     Err(e) => Err(e),
                 };
             }
+            st.shared.in_flight.store(false, Ordering::Relaxed);
+            let _ = reply.send(r);
+            None
+        }
+        Cmd::Batch { sql, rows, reply } => {
+            st.shared.in_flight.store(true, Ordering::Relaxed);
+            let deadline = Deadline::arm(st);
+            let r = batch(conn, st, &sql, &rows).await;
+            drop(deadline);
             st.shared.in_flight.store(false, Ordering::Relaxed);
             let _ = reply.send(r);
             None
@@ -628,6 +642,98 @@ async fn run_batch(conn: &mut Conn, st: &mut State, parts: Vec<BatchPart>) -> Re
     }
     let _ = conn.query_drop("RELEASE SAVEPOINT dbsaci_batch").await;
     Ok(total)
+}
+
+/// Most rows per multi-row INSERT (and at most ~60k placeholders).
+const BATCH_ROWS: usize = 1000;
+
+/// Array DML. A plain `INSERT … VALUES (?, …)` runs as multi-row INSERTs of up
+/// to [`BATCH_ROWS`] rows (one round trip per chunk instead of per row). A
+/// chunk that fails was rolled back as a unit by MariaDB; it is then replayed
+/// row by row so the rows before the failing one are applied and that row's
+/// error is the one reported, as Oracle does.
+async fn batch(conn: &mut Conn, st: &mut State, sql: &str, rows: &[Vec<Value>]) -> Result<u64> {
+    let width = rows.first().map_or(0, Vec::len);
+    let tuple = split_values_tuple(sql)
+        .filter(|(_, t)| width > 0 && binds::count_placeholders(t) == width)
+        .filter(|_| {
+            st.instead_of.is_empty() && !sql.contains(crate::translate::MARIADB_BATCH_SEP.trim())
+        });
+    let Some((head, tuple)) = tuple else {
+        let mut total = 0;
+        for row in rows {
+            total += exec(conn, st, sql, row).await?;
+        }
+        return Ok(total);
+    };
+    let per_chunk = BATCH_ROWS.min((60_000 / width).max(1));
+    let mut total = 0u64;
+    for chunk in rows.chunks(per_chunk) {
+        let multi = format!("{head}{}", vec![tuple.as_str(); chunk.len()].join(", "));
+        let params: Vec<Value> = chunk.iter().flatten().cloned().collect();
+        match run_prepared(conn, &multi, &params).await {
+            Ok(n) => total += n,
+            Err(e) if errors::is_link_error(&e) => return Err(mapped(st, e, sql)),
+            Err(_) => {
+                for row in chunk {
+                    total += exec(conn, st, sql, row).await?;
+                }
+            }
+        }
+    }
+    after_statement(st, sql, true);
+    Ok(total)
+}
+
+/// `INSERT INTO t (a, b) VALUES (?, ?)` → (`INSERT INTO t (a, b) VALUES `,
+/// `(?, ?)`) when the statement is exactly one VALUES tuple at its end.
+fn split_values_tuple(sql: &str) -> Option<(String, String)> {
+    use crate::translate::names::{Piece, pieces};
+    if verb(sql) != "INSERT" {
+        return None;
+    }
+    let ps = pieces(sql);
+    let words: Vec<String> = ps
+        .iter()
+        .filter(|(p, _)| *p == Piece::Word)
+        .map(|(_, r)| sql[r.clone()].to_ascii_uppercase())
+        .collect();
+    if words.iter().filter(|w| *w == "VALUES").count() != 1
+        || words
+            .iter()
+            .any(|w| matches!(w.as_str(), "SELECT" | "RETURNING" | "ALL" | "FIRST"))
+    {
+        return None;
+    }
+    let values_end = ps
+        .iter()
+        .find(|(p, r)| *p == Piece::Word && sql[r.clone()].eq_ignore_ascii_case("VALUES"))?
+        .1
+        .end;
+    let tail = sql[values_end..].trim().trim_end_matches(';').trim_end();
+    if !tail.starts_with('(') || !tail.ends_with(')') {
+        return None;
+    }
+    // One balanced group spanning the whole tail.
+    let mut depth = 0i32;
+    let mut in_lit = false;
+    for (i, ch) in tail.char_indices() {
+        match ch {
+            '\'' => in_lit = !in_lit,
+            '(' if !in_lit => depth += 1,
+            ')' if !in_lit => {
+                depth -= 1;
+                if depth == 0 && i + 1 != tail.len() {
+                    return None;
+                }
+            }
+            _ => {}
+        }
+    }
+    Some((
+        format!("{} ", sql[..values_end].trim_end()),
+        tail.to_string(),
+    ))
 }
 
 async fn end_transaction(conn: &mut Conn, st: &mut State, verb: &str) -> Result<()> {
@@ -1174,6 +1280,17 @@ mod tests {
         ));
         assert!(commits_implicitly("DROP TABLE T"));
         assert!(!commits_implicitly("INSERT INTO T VALUES (1)"));
+    }
+
+    #[test]
+    fn values_tuple_split() {
+        let (h, t) =
+            split_values_tuple("INSERT INTO T (A, B) VALUES (?, CAST(? AS BINARY))").unwrap();
+        assert_eq!(h, "INSERT INTO T (A, B) VALUES ");
+        assert_eq!(t, "(?, CAST(? AS BINARY))");
+        assert!(split_values_tuple("INSERT INTO T SELECT ? FROM DUAL").is_none());
+        assert!(split_values_tuple("INSERT INTO T VALUES (?), (?)").is_none());
+        assert!(split_values_tuple("UPDATE T SET A = ?").is_none());
     }
 
     #[test]
