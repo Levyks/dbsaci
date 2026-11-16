@@ -198,6 +198,24 @@ fn order_by_across_lines_and_in_windows() {
 }
 
 #[test]
+fn lower_case_mode_runs_structural_rules() {
+    let t = |s: &str| oracle_to_mariadb_with_case(s, IdentifierCase::Lower).unwrap();
+    assert_eq!(
+        t("ALTER TABLE m MODIFY (label DEFAULT 'revised')"),
+        "alter table m alter label set default 'revised'"
+    );
+    assert_eq!(
+        t("SELECT a.x FROM a, b WHERE a.id = b.id(+)"),
+        "select a.x from a left join b on a.id = b.id"
+    );
+    assert_eq!(
+        t(r#"SELECT LEVEL AS "MixedCase" FROM dual CONNECT BY LEVEL <= 2"#)
+            .contains(r#""MixedCase""#),
+        true
+    );
+}
+
+#[test]
 fn cast_char_targets_pass_through() {
     assert_eq!(
         tr("SELECT CAST(? AS CHAR) FROM dual"),

@@ -174,7 +174,21 @@ pub fn oracle_to_mariadb_ctx(sql: &str, cx: &MariaDbContext) -> Result<String> {
             return Ok(text);
         }
     }
-    let stmts = lower_statement(canon, cx)?;
+    // Structural lowerings match upper-case keywords: run them on the
+    // upper-case canonical form and map the result to lower case afterwards
+    // (canonicalization round-trips: quoted names keep their physical form).
+    let lower = cx.case == IdentifierCase::Lower;
+    let canon = if lower {
+        names::canonicalize(&canon, IdentifierCase::Upper)
+    } else {
+        canon
+    };
+    let mut stmts = lower_statement(canon, cx)?;
+    if lower {
+        for s in &mut stmts {
+            *s = names::canonicalize(s, IdentifierCase::Lower);
+        }
+    }
     let mut out = Vec::with_capacity(stmts.len());
     let mut bind_base = 0u32;
     for s in &stmts {
