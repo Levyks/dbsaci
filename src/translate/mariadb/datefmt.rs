@@ -300,10 +300,21 @@ pub fn compile_to_char(model: &str) -> Option<Vec<Piece>> {
         if rest.starts_with("TZH") || rest.starts_with("TZM") || rest.starts_with("TZR") {
             // No time-zone datatypes on MariaDB: render the session offset.
             let part = &rest[..3];
+            // The session's UTC offset in minutes, from the server clock (works
+            // for named zones and needs no helper routine).
             let e = match part {
-                "TZH" => "SUBSTRING(sessiontimezone(), 1, 3)",
-                "TZM" => "SUBSTRING(sessiontimezone(), 5, 2)",
-                _ => "sessiontimezone()",
+                "TZH" => {
+                    "CONCAT(IF(TIMESTAMPDIFF(SECOND, UTC_TIMESTAMP(), NOW()) < 0, '-', '+'), \
+                     LPAD(FLOOR(ABS(ROUND(TIMESTAMPDIFF(SECOND, UTC_TIMESTAMP(), NOW()) / 60)) / 60), 2, '0'))"
+                }
+                "TZM" => {
+                    "LPAD(MOD(ABS(ROUND(TIMESTAMPDIFF(SECOND, UTC_TIMESTAMP(), NOW()) / 60)), 60), 2, '0')"
+                }
+                _ => {
+                    "CONCAT(IF(TIMESTAMPDIFF(SECOND, UTC_TIMESTAMP(), NOW()) < 0, '-', '+'), \
+                     LPAD(FLOOR(ABS(ROUND(TIMESTAMPDIFF(SECOND, UTC_TIMESTAMP(), NOW()) / 60)) / 60), 2, '0'), ':', \
+                     LPAD(MOD(ABS(ROUND(TIMESTAMPDIFF(SECOND, UTC_TIMESTAMP(), NOW()) / 60)), 60), 2, '0'))"
+                }
             };
             expr!(3, e)
         }
