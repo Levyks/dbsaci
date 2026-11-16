@@ -355,9 +355,7 @@ impl<'a> Render<'a> {
                 }
                 if is("SELECT") {
                     top.1 = Clause::Select;
-                } else if is("FROM") && top.2 {
-                    top.1 = Clause::From;
-                } else if is("JOIN") && top.1 == Clause::On {
+                } else if (is("FROM") && top.2) || (is("JOIN") && top.1 == Clause::On) {
                     top.1 = Clause::From;
                 } else if is("ON") && top.1 == Clause::From {
                     top.1 = Clause::On;
@@ -1212,11 +1210,11 @@ impl<'a> Render<'a> {
                 i += 1;
                 continue;
             }
-            if k == K::Word {
-                if let Some(next) = self.word_rule(i, b, &mut out) {
-                    i = next;
-                    continue;
-                }
+            if k == K::Word
+                && let Some(next) = self.word_rule(i, b, &mut out)
+            {
+                i = next;
+                continue;
             }
             if matches!(k, K::Word | K::Quoted | K::Back) && self.table_position(i) {
                 i = self.relation(i, b, &mut out);
@@ -1370,12 +1368,7 @@ impl<'a> Render<'a> {
             ));
             if self.alias_after(end).is_none() {
                 out.push(' ');
-                out.push_str(&ts.text(*parts.last().unwrap()).replace('$', "$"));
-                if ts.k(*parts.last().unwrap()) == K::Word && last.contains('$') {
-                    // `V$VERSION` alias needs quoting
-                    out.truncate(out.len() - last.len());
-                    out.push_str(&format!("`{last}`"));
-                }
+                out.push_str(ts.text(*parts.last().unwrap()));
             }
             return end;
         }
@@ -2477,15 +2470,13 @@ impl<'a> Render<'a> {
             ),
             ("TO_DATE" | "TO_TIMESTAMP", 1..=3) => {
                 let spec = if args.len() >= 2 {
-                    match self.str_arg(args[1]) {
-                        Some(m) => match datefmt::compile_to_date(&m) {
-                            Some(s) => s,
-                            None => {
-                                self.fail(Error::ora(1821, "date format not recognized"));
-                                return None;
-                            }
-                        },
-                        None => return None,
+                    let m = self.str_arg(args[1])?;
+                    match datefmt::compile_to_date(&m) {
+                        Some(s) => s,
+                        None => {
+                            self.fail(Error::ora(1821, "date format not recognized"));
+                            return None;
+                        }
                     }
                 } else if name == "TO_TIMESTAMP" {
                     ("%d-%b-%y %h.%i.%s.%f %p".to_string(), true)

@@ -231,7 +231,7 @@ fn trim_statement(sql: &str) -> &str {
         let toks = lex::lex(t);
         if toks.last().is_some_and(|x| x.k == K::Semi) {
             // a PL/SQL block keeps its END; MariaDB accepts both
-            return t[..t.len() - 1].trim_end();
+            return t.strip_suffix(';').unwrap_or(t).trim_end();
         }
     }
     t
@@ -438,7 +438,7 @@ fn sequence_options(sql: &str) -> String {
             let num = if neg { ts.next(v, n) } else { v };
             if num < n && ts.k(num) == K::Num && ts.text(num).parse::<i64>().is_err() {
                 out.push_str(if ts.is(i, "MAXVALUE") {
-                    if neg { "NOMAXVALUE" } else { "NOMAXVALUE" }
+                    "NOMAXVALUE"
                 } else {
                     "NOMINVALUE"
                 });
@@ -516,11 +516,7 @@ fn alter_session(ts: &Ts) -> Option<String> {
     Some(match key.as_str() {
         "TIME_ZONE" => format!("SET time_zone = '{}'", unq.replace('\'', "''")),
         "CURRENT_SCHEMA" => {
-            let schema = if value.starts_with('"') {
-                unq.to_string()
-            } else {
-                unq.to_string()
-            };
+            let schema = unq.to_string();
             format!(
                 "SET @dbsaci_current_schema = '{}'{sep}USE `{}`",
                 schema.replace('\'', "''"),

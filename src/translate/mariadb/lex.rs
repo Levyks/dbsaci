@@ -360,6 +360,10 @@ impl<'a> Ts<'a> {
         self.t.len()
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.t.is_empty()
+    }
+
     pub fn text(&self, i: usize) -> &'a str {
         let t = self.t[i];
         &self.src[t.s as usize..t.e as usize]

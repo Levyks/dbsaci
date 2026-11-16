@@ -22,9 +22,9 @@ pub fn bind_marker(n: usize) -> String {
 fn frag(ts: &Ts, a: usize, b: usize, ord: &[usize]) -> String {
     let mut out = String::new();
     let (a, b) = ts.trim(a, b);
-    for i in a..b {
+    for (i, o) in ord.iter().enumerate().take(b).skip(a) {
         if ts.k(i) == K::Bind {
-            out.push_str(&bind_marker(ord[i]));
+            out.push_str(&bind_marker(*o));
         } else {
             out.push_str(ts.text(i));
         }
@@ -33,15 +33,17 @@ fn frag(ts: &Ts, a: usize, b: usize, ord: &[usize]) -> String {
 }
 
 fn bind_ordinals(ts: &Ts) -> Vec<usize> {
-    let mut v = vec![usize::MAX; ts.len()];
     let mut k = 0;
-    for i in 0..ts.len() {
-        if ts.k(i) == K::Bind {
-            v[i] = k;
-            k += 1;
-        }
-    }
-    v
+    (0..ts.len())
+        .map(|i| {
+            if ts.k(i) == K::Bind {
+                k += 1;
+                k - 1
+            } else {
+                usize::MAX
+            }
+        })
+        .collect()
 }
 
 /// Replace bind markers: in order once each → `?`; otherwise hoist every bind
@@ -172,11 +174,7 @@ pub fn parse_block(ts: &Ts, sel: usize) -> Block {
                 b.order = r;
                 b.siblings = true;
             }
-            "TAIL" => {
-                if b.tail.is_none() {
-                    b.tail = Some(kw);
-                }
-            }
+            "TAIL" if b.tail.is_none() => b.tail = Some(kw),
             _ => {}
         }
     }
@@ -748,11 +746,7 @@ pub fn lower_connect_by(sql: String, cx: &MariaDbContext) -> Result<String> {
         let sel = enclosing_select(&ts, cb).ok_or_else(|| unimplemented("CONNECT BY"))?;
         let blk = parse_block(&ts, sel);
         let text = connect_by_block(&ts, &blk, cx)?;
-        let start = if ts.prev(sel, 0) != NONE && ts.parent[sel] == NONE {
-            sel
-        } else {
-            sel
-        };
+        let start = sel;
         let sep = if blk.end < ts.len() { " " } else { "" };
         sql = replace_range(&ts, start, blk.end, &format!("{text}{sep}"));
     }
@@ -1006,7 +1000,6 @@ fn connect_by_block(ts: &Ts, blk: &Block, cx: &MariaDbContext) -> Result<String>
         (Some((oa, ob)), false) => Some(pseudo(oa, ob)?),
         _ => None,
     };
-    drop(pseudo);
     let seed_where = blk
         .start
         .map(|(_, sa, sb)| format!(" WHERE {}", ts.tslice(sa, sb)))
@@ -1146,6 +1139,15 @@ fn rewrite_cond(ts: &Ts, a: usize, b: usize, key: &str, child: &str, parent: &st
 // MERGE
 // ---------------------------------------------------------------------------
 
+/// `(lhs, column, rhs)` assignments, UPDATE WHERE, DELETE WHERE.
+type MergeUpdate = (
+    Vec<(String, String, String)>,
+    Option<String>,
+    Option<String>,
+);
+/// Target table, column list, VALUES list, condition.
+type InsertTarget = (String, Option<String>, Option<String>, Option<String>);
+
 pub fn lower_merge(sql: &str, cx: &MariaDbContext) -> Result<Option<Vec<String>>> {
     let ts = Ts::new(sql);
     let n = ts.len();
@@ -1180,11 +1182,7 @@ pub fn lower_merge(sql: &str, cx: &MariaDbContext) -> Result<Option<Vec<String>>
     let source_name = strip_alias(&ts, &source);
     let cond = frag(&ts, ca, cb, &ord);
 
-    let mut update: Option<(
-        Vec<(String, String, String)>,
-        Option<String>,
-        Option<String>,
-    )> = None;
+    let mut update: Option<MergeUpdate> = None;
     let mut update_where_range: Option<(usize, usize)> = None;
     let mut insert: Option<(Option<String>, String, Option<String>)> = None;
     let mut j = ts.sig(after_cond, n);
@@ -1385,7 +1383,7 @@ pub fn lower_insert_multi(sql: &str) -> Result<Option<Vec<String>>> {
     let ord = bind_ordinals(&ts);
     // source subquery: the top-level SELECT/WITH after the last INTO clause
     let mut i = ts.next(mode, n);
-    let mut targets: Vec<(String, Option<String>, Option<String>, Option<String>)> = vec![];
+    let mut targets: Vec<InsertTarget> = vec![];
     let mut cond: Option<String> = None;
     let mut prior: Vec<String> = vec![];
     let src_start;
